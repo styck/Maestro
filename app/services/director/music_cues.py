@@ -66,13 +66,13 @@ def detect_percussion(y, sr):
     return intervals or None, cues
 
 
-def format_music_cues(clip, *, performers=False):
+def format_music_cues(clip, *, performers=True):
     """Give the writer absolute song time and local shot time.
 
-    When ``performers`` is True (the scene concept references a band,
-    musicians, or a stage), emit performer-centric guidance (drummer,
-    instrumentalist, etc.). Otherwise emit timing-only cues for
-    narrative / no-performer music videos.
+    When ``performers`` is True (the default; the scene concept references a
+    band, musicians, or a stage), emit performer-centric guidance (drummer,
+    instrumentalist, etc.). When False, emit timing-only cues for narrative /
+    no-performer music videos.
     """
     if 'percussion_activity' not in clip:
         return ''

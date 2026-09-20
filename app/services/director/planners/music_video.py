@@ -630,7 +630,7 @@ class MusicVideoPlanner(BasePlanner):
         *,
         source_audio_drives_vocals: bool = False,
         vocal_activity: Optional[list[str]] = None,
-        performers: bool = False,
+        performers: bool = True,
     ) -> list[str]:
         """Build text descriptions for each clip (context for LLM)."""
         if source_audio_drives_vocals and vocal_activity is None:
@@ -1146,8 +1146,13 @@ Write {len(clips)} structured shot plans. Go:"""
             # The 4B planner occasionally returns an empty image_prompt (just
             # the "Preserve character identity..." boilerplate). Fall back to a
             # description built from the shot metadata so the image model still
-            # has a real subject instead of inventing one.
-            if _minimal_image_prompt(raw.get("image_prompt")):
+            # has a real subject instead of inventing one. Only when images are
+            # actually requested — prompt_only / direct_references shots keep
+            # image_prompt as None by design.
+            if (
+                getattr(self, "_uses_generated_shot_images", True)
+                and _minimal_image_prompt(raw.get("image_prompt"))
+            ):
                 raw["image_prompt"] = _fallback_image_prompt(raw, section)
 
             shot = ShotPlan(
