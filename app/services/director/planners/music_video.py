@@ -326,15 +326,35 @@ class MusicVideoPlanner(BasePlanner):
             and shot_image_policy in {"prompt_only", "direct_references"}
         )
         performer_map = _parse_performer_map(scene_description)
+        scene_text = scene_description or ""
+        # Explicit negation ("no singer", "no people", "no characters", ...)
+        # wins over any performer keyword. "no singer, no hero" must NOT be
+        # read as a performer concept — the singer keyword would otherwise flip
+        # the video to performer-centric and invent a whole band.
+        _no_performer_patterns = (
+            r"\bno\s+(?:people|person|characters?|performers?|singers?|vocalists?|"
+            r"musicians?|band|drummers?|guitarists?|rappers?|hero(?:es)?|crowd|"
+            r"faces?|danc(?:ing|ers?)|lip[- ]?sync|vocals?|singing)\b",
+            r"\bwithout\s+(?:people|characters?|performers?|singers?|musicians?|band|vocals?)\b",
+            r"\b(?:no[ -]one|nobody)\b",
+        )
+        explicit_no_performers = any(
+            re.search(pattern, scene_text, re.IGNORECASE)
+            for pattern in _no_performer_patterns
+        )
         # A band/performer concept gets performer-centric cue text; a narrative
         # (no-performer) concept gets timing-only cues so the writer never
         # invents a drummer or instrument.
-        performers = bool(performer_map) or bool(
-            re.search(
-                r"\b(band|drummer|singer|vocalist|musician|guitar|bass|piano|"
-                r"keyboard|stage|concert|venue|performs?|raps?|sings?|mic|microphone)\b",
-                scene_description or "",
-                re.IGNORECASE,
+        performers = (
+            False
+            if explicit_no_performers
+            else bool(performer_map) or bool(
+                re.search(
+                    r"\b(band|drummer|singer|vocalist|musician|guitar|bass|piano|"
+                    r"keyboard|stage|concert|venue|performs?|raps?|sings?|mic|microphone)\b",
+                    scene_text,
+                    re.IGNORECASE,
+                )
             )
         )
         self._performers = performers
@@ -727,7 +747,19 @@ class MusicVideoPlanner(BasePlanner):
                     if lyrics_snippet else "instrumental"
                 )
 
-            ctx = f"Clip {i + 1} of {total}: {section}, {beat_count} beats, {vocal_info}.{performer_hint}"
+            # Put the lyrics excerpt FIRST and label it as the primary visual
+            # source. The 4B planner otherwise ignores the excerpt buried later
+            # in the line and falls back on the Scene Concept's recurring
+            # objects, producing the same image (e.g. an empty throne) for most
+            # clips instead of telling the lyric story.
+            if lyrics_snippet and not source_audio_drives_vocals:
+                ctx = (
+                    f"Clip {i + 1} of {total}: {section}, {beat_count} beats. "
+                    f"LYRICS — build this clip's image_prompt from this excerpt: "
+                    f'"{lyrics_snippet}".{performer_hint}'
+                )
+            else:
+                ctx = f"Clip {i + 1} of {total}: {section}, {beat_count} beats, {vocal_info}.{performer_hint}"
             section_hints = _SECTION_VISUAL_STRATEGY.get(section, {}).get("hints", "")
             if section_hints:
                 ctx += f" Section direction: {section_hints}."
@@ -790,15 +822,24 @@ class MusicVideoPlanner(BasePlanner):
                     str((previous or {}).get("ending_beat") or "").strip()
                     or "No prior clip; establish the opening cleanly."
                 )
+                timeline_continuity = (
+                    "Preserve performer identity, wardrobe, world, and "
+                    "established visual grammar unless the song section "
+                    "motivates a visible change."
+                    if getattr(self, "_performers", True)
+                    else "Preserve the established world, environment, and "
+                    "visual grammar unless the song section motivates a "
+                    "visible change. No lead performer, singer, musician, or "
+                    "dancer ever appears; carry the no-performer visual "
+                    "language through every remaining clip."
+                )
                 batch_concept = (
                     f"{scene_description}\n\n"
                     "LONG-FORM TIMELINE CONTRACT:\n"
                     f"This is planning batch {batch_number}, covering global "
                     f"clips {start + 1}-{end} of {len(clips)}. Continue the "
                     "same music video; do not restart its visual premise or "
-                    "repeat completed clip ideas. Preserve performer identity, "
-                    "wardrobe, world, and established visual grammar unless "
-                    "the song section motivates a visible change.\n"
+                    f"repeat completed clip ideas. {timeline_continuity}\n"
                     f"Previous planned ending: {previous_ending}"
                 )
                 return self._plan_with_llm(
@@ -856,11 +897,36 @@ class MusicVideoPlanner(BasePlanner):
         uses_generated_images = bool(
             getattr(self, "_uses_generated_shot_images", True)
         )
-        char_rules = build_character_rules_block(
-            has_reference or bool(num_character_refs),
-            char_profiles if char_profiles else None,
-            preserve_names=preserve_names,
-        )
+        if (
+            getattr(self, "_performers", True)
+            or char_profiles
+            or has_reference
+            or num_character_refs
+        ):
+            char_rules = build_character_rules_block(
+                has_reference or bool(num_character_refs),
+                char_profiles if char_profiles else None,
+                preserve_names=preserve_names,
+            )
+        else:
+            # No performers, characters, or references — a narrative / scenery
+            # music video. The character-identification guide is all about
+            # people and reference images, which pushes the LLM to invent
+            # lead performers. Replace it with an explicit no-lead rule that
+            # still permits anonymous background figures when the concept
+            # calls for them (distant, faceless, never a lead).
+            char_rules = (
+                "NO LEAD PERFORMERS:\n"
+                "- The Scene Concept calls for no lead performer, singer, "
+                "musician, or dancer. Never show a named or lead character, "
+                "and never lip-sync.\n"
+                "- Anonymous background figures are allowed ONLY when the "
+                "Scene Concept calls for them: distant, faceless, at the "
+                "edge of frame, never close, never a lead, never singing or "
+                "lip-syncing.\n"
+                "- Otherwise, show only environment, scenery, vehicles, "
+                "objects, and atmosphere that fit the Scene Concept."
+            )
         camera_block = build_camera_style_block()
         # video_guide now merged into ltx2_music_video_rules.md — no separate load needed
 
@@ -935,8 +1001,12 @@ The user's main reference is visual ground truth. Every image_prompt and video_p
             scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
 Character references define identity and location references define the setting. Follow their labels and the Scene Concept in every self-contained video prompt; do not invent conflicting identities or settings."""
         else:
-            scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
+            if getattr(self, "_performers", True):
+                scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
 No visual reference was provided. Invent consistent performers and a setting that fit the Scene Concept, then reuse the same artists, roles and world across every clip. Show the assigned singer delivering vocals in singer-focused shots; instrument cutaways keep that voice off screen."""
+            else:
+                scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
+No visual reference was provided and the Scene Concept calls for no lead performer. Invent only a consistent environment, setting, props and atmosphere that fit the Scene Concept, then reuse that same world across every clip. No lead performer, singer, musician, or dancer ever appears. Anonymous background figures are allowed only when the Scene Concept calls for them — distant, faceless, at the edge of frame, never close, never a lead, never lip-syncing."""
 
         system_prompt = f"""You are a music video director. Plan each clip AND write its prompts. Output ONLY the JSON array.
 
@@ -951,6 +1021,18 @@ No visual reference was provided. Invent consistent performers and a setting tha
 MUSIC VIDEO RULES:
 - Chorus = high energy, bold framing. Verse = intimate, character focus.
 - Instrumental = environment, textures. Bridge = contrasting, unexpected.
+- CRITICAL: build each image_prompt from THAT clip's own lyrics excerpt — the
+  subject, mood, and metaphor the lyrics describe. Do not let one recurring
+  prop/object from the Scene Concept (a throne, crown, etc.) dominate clips
+  whose lyrics are about something else.
+- RESERVE the song's central object: if one object (throne, crown, etc.) is
+  the focus of the chorus/empire imagery, show it prominently ONLY in that
+  section. In verses, intro, bridge, and outro, depict the lyric's mood and
+  atmosphere instead (shadows, corridors, cracks, quiet details) — do not
+  place the central object in every shot.
+- No single object may be the main subject of more clips than its own lyrics
+  justify. Change the central subject from clip to clip so the frames tell the
+  lyric story rather than repeating one object.
 - Vary visuals across clips. Consecutive clips in the SAME section (a multi-clip
   intro, instrumental, or long chorus) must each use a distinct image_prompt that
   progresses the section; never repeat the same starting frame. Performer must be

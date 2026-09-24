@@ -1803,6 +1803,16 @@ def polish_prompts_third_pass(
         "Output ONLY the refined prompt. No explanation, no labels."
     )
 
+    # "Preserve character identity ... reference image" only applies when the
+    # project actually has a character/reference to preserve. A no-character /
+    # narrative music video has none, and this instruction otherwise makes the
+    # polish LLM append identity boilerplate and invent anonymous extras.
+    _preserve_identity_line = (
+        "- Ensure the prompt ends with: 'Preserve character identity, attire, body attributes, and the art style of the reference image.'\n"
+        if characters
+        else ""
+    )
+
     _image_system_base = (
         "You are refining an already-detailed image prompt for the generation model. "
         "The prompt was written by a Director AI and is already complete. "
@@ -1813,7 +1823,7 @@ def polish_prompts_third_pass(
         "YOUR JOB:\n"
         + _image_lora_line +
         "- Fix any awkward phrasing in NARRATIVE PROSE ONLY (never inside quotes)\n"
-        "- Ensure the prompt ends with: 'Preserve character identity, attire, body attributes, and the art style of the reference image.'\n"
+        + _preserve_identity_line +
         "- When a character name listed in the CHARACTER NAME REPLACEMENT block below appears in the input, replace it with the matching descriptor IN NARRATIVE PROSE ONLY; never default to generic 'the woman' / 'the man' for non-human characters\n\n"
         "DO NOT:\n"
         "- Invent character names that aren't in the input or in the mapping block\n"

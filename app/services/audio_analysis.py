@@ -1240,6 +1240,39 @@ def _tag_label(raw: str) -> str:
     return "verse"
 
 
+def _proportional_structure(parsed: list, duration: float) -> list:
+    """Distribute section start times proportionally by lyric line count.
+
+    Fallback used when transcription alignment fails (a dropped section, or a
+    section aligned to the wrong part of the song). Line-count proportions
+    always preserve the correct section order and labels, since the user's
+    tagged lyrics are the ground truth.
+    """
+    total_lines = sum(n for (_, _, n) in parsed)
+    if total_lines <= 0 or duration <= 0:
+        return []
+    structure = []
+    verse_num = 0
+    chorus_num = 0
+    elapsed = 0.0
+    for label, _first, n in parsed:
+        if label == "verse":
+            verse_num += 1
+            disp = f"Verse {verse_num}"
+        elif label == "chorus":
+            chorus_num += 1
+            disp = f"Chorus {chorus_num}"
+        else:
+            disp = label.title()
+        structure.append({
+            "label": label,
+            "display_label": disp,
+            "start": round(elapsed, 3),
+        })
+        elapsed += (n / total_lines) * duration
+    return structure
+
+
 def build_structure_from_tagged_lyrics(
     tagged_lyrics: Optional[str],
     lyrics: Optional[list],
@@ -1261,14 +1294,15 @@ def build_structure_from_tagged_lyrics(
     if not tagged_lyrics or not lyrics:
         return []
 
-    parsed = []
+    parsed = []  # (label, first_line, line_count)
     cur_label = None
     cur_lines = []
 
     def _flush():
         if cur_label is not None:
             first = next((ln.strip() for ln in cur_lines if ln.strip()), "")
-            parsed.append((cur_label, first))
+            n_lines = sum(1 for ln in cur_lines if ln.strip())
+            parsed.append((cur_label, first, n_lines))
 
     for raw in str(tagged_lyrics).splitlines():
         line = raw.strip()
@@ -1300,7 +1334,7 @@ def build_structure_from_tagged_lyrics(
         default=0.0,
     )
 
-    for idx, (label, first) in enumerate(parsed):
+    for idx, (label, first, _n) in enumerate(parsed):
         first_key = _norm(first)
 
         if not first_key:
@@ -1347,6 +1381,22 @@ def build_structure_from_tagged_lyrics(
             disp = label.title()
         structure.append({"label": label, "display_label": disp, "start": start})
         cursor = best_idx + 1
+
+    # ── Robustness guard ─────────────────────────────────────────────
+    # Transcription of heavily-effected vocals (trap, auto-tune, ad-libs) is
+    # unreliable: a section's first line can be dropped or matched far from
+    # where it actually lands, which stretches a neighboring section into a
+    # huge gap (e.g. "Chorus" spanning minutes) and shifts every downstream
+    # clip's label. If any section failed to align, or a gap is absurdly
+    # large, fall back to proportional timing from lyric line counts.
+    if len(structure) < len(parsed):
+        return _proportional_structure(parsed, duration)
+    starts = [s["start"] for s in structure]
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    if gaps:
+        median_gap = sorted(gaps)[len(gaps) // 2]
+        if median_gap > 0 and max(gaps) > median_gap * 3 + 5:
+            return _proportional_structure(parsed, duration)
 
     return structure
 
