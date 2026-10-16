@@ -66,8 +66,50 @@ def detect_percussion(y, sr):
     return intervals or None, cues
 
 
-def format_music_cues(clip):
-    """Give the writer both absolute song time and local shot time."""
+def _format_timing_only_cues(clip):
+    """Timing-only cues for narrative / no-performer music videos."""
+    if 'percussion_activity' not in clip:
+        return ''
+    status = clip.get('percussion_activity', 'unknown')
+    cues = [c for c in clip.get('music_cues') or [] if c.get('type') == 'percussion_entry']
+    parts = []
+    for cue in clip.get('music_cues') or []:
+        if cue.get('type') == 'section_change':
+            song_time = float(cue['time'])
+            local_time = max(0, song_time - float(clip.get('start', 0)))
+            parts.append(f'Music section changes to {cue.get("label", "the next section")} '
+                         f'at song {song_time:.2f}s, shot +{local_time:.2f}s. '
+                         'Reflect this within the clip through framing, lighting, or a camera change '
+                         'where appropriate; preserve the full planned clip duration.')
+    for cue in cues:
+        song_time = float(cue['time'])
+        local_time = max(0, song_time - float(clip.get('start', 0)))
+        parts.append(f'A rhythmic emphasis enters at song {song_time:.2f}s, shot +{local_time:.2f}s. '
+                     'Time a visual accent or cut to this beat using the supplied audio.')
+    if status == 'quiet':
+        parts.append('The audio is rhythmically sparse here. Favor calm imagery, wide frames, '
+                     'or the environment; avoid sudden action or an invented rhythmic peak.')
+    elif status == 'active' and not cues:
+        parts.append('The rhythm is already driving. Let the imagery match the steady energy '
+                     'rather than signaling a new entrance.')
+    elif status == 'unknown':
+        parts.append('The rhythmic timing is unclear; do not invent a beat-driven accent '
+                     'from the beat grid.')
+    parts.append('These timing cues are audio estimates and imply no specific on-screen subject. '
+                 'Do not infer people, instruments, or props from them. Keep imagery grounded '
+                 'in these cues and the user’s requested direction.')
+    return ' '.join(parts)
+
+
+def format_music_cues(clip, *, performers=True):
+    """Give the writer absolute song time and local shot time.
+
+    When ``performers`` is True (a band/performer concept), emit
+    performer-centric guidance (drummer, instrumentalist, ensemble). When
+    False, emit timing-only cues for narrative / no-performer music videos.
+    """
+    if not performers:
+        return _format_timing_only_cues(clip)
     if 'percussion_activity' not in clip:
         return ''
     status = clip.get('percussion_activity', 'unknown')

@@ -190,7 +190,14 @@ def prepare_music_timeline(plans, clips, *, fps, minimum_frames, maximum_frames,
 
 
 def music_output_trim(generation_frames, output_frames):
-    """Validate an explicit editorial duration before queueing or rerunning."""
-    if isinstance(output_frames, bool) or not isinstance(output_frames, int) or not 1 <= output_frames <= generation_frames:
+    """Validate an explicit editorial duration before queueing or rerunning.
+
+    The generated clip is the hard ceiling. A frame-lattice mismatch between
+    the planning step and the runtime's latent size can leave the editorial
+    cut a few frames longer than what the model actually generates; clamp
+    instead of failing the whole job (the overshoot is under one latent step).
+    """
+    if isinstance(output_frames, bool) or not isinstance(output_frames, int) or output_frames < 1:
         raise ValueError('Music output duration must fit inside its generated clip.')
+    output_frames = min(output_frames, generation_frames)
     return generation_frames - output_frames

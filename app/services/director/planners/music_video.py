@@ -253,6 +253,42 @@ def _parse_performer_map(scene_description: str) -> dict[str, str]:
     return result
 
 
+_PERFORMER_KEYWORDS = re.compile(
+    r"\b(band|drummer|singer|vocalist|musician|guitar|bass|piano|"
+    r"keyboard|stage|concert|venue|perform\w*|raps?|sings?|mic|microphone|"
+    r"danc\w*|duets?|choreograph\w*|dj|headbang\w*)",
+    re.IGNORECASE,
+)
+
+_NO_PERFORMER_PATTERNS = (
+    r"\bno\s+(?:people|person|characters?|performers?|singers?|vocalists?|"
+    r"musicians?|band|drummers?|guitarists?|rappers?|hero(?:es)?|crowd|"
+    r"faces?|danc(?:ing|ers?)|lip[- ]?sync|vocals?|singing)\b",
+    r"\bwithout\s+(?:people|characters?|performers?|singers?|musicians?|band|vocals?)\b",
+    r"\b(?:no[ -]one|nobody)\b",
+)
+
+
+def _detect_performers(scene_description: str, performer_map: dict) -> bool:
+    """Decide performer-centric vs no-performer planning from the scene concept.
+
+    Explicit negation ("no singer", "no people", "nobody") wins over any
+    performer keyword — "no singer, no hero" must NOT be read as a performer
+    concept. Otherwise a performer map or a performer keyword marks the
+    project performer-centric.
+    """
+    text = str(scene_description or "")
+    if any(re.search(p, text, re.IGNORECASE) for p in _NO_PERFORMER_PATTERNS):
+        return False
+    if performer_map:
+        return True
+    if not text:
+        # No scene concept: default performer-centric (the pre-existing
+        # behavior and the most common music-video case).
+        return True
+    return bool(_PERFORMER_KEYWORDS.search(text))
+
+
 class MusicVideoPlanner(BasePlanner):
     skill_type = "music_video"
 
@@ -292,6 +328,17 @@ class MusicVideoPlanner(BasePlanner):
             and shot_image_policy in {"prompt_only", "direct_references"}
         )
         performer_map = _parse_performer_map(scene_description)
+
+        # Explicit mode wins; "auto" falls back to keyword/negation detection.
+        music_video_mode = str(kwargs.get("music_video_mode") or "auto").lower()
+        if music_video_mode == "cinematic":
+            self._performers = False
+            performer_map = {}
+        elif music_video_mode == "performer":
+            self._performers = True
+        else:
+            self._performers = _detect_performers(scene_description, performer_map)
+
         source_audio_drives_vocals = video_model.lower().startswith(
             ("minimax_h3", "ltx2_25")
         )
@@ -322,7 +369,8 @@ class MusicVideoPlanner(BasePlanner):
             kwargs,
             kind="music_video",
             fingerprint_payload={
-                "planner_revision": 5,
+                "planner_revision": 6,
+                "music_video_mode": music_video_mode,
                 "scene_description": scene_description,
                 "clips": clips,
                 "lyrics": lyrics or [],
@@ -660,7 +708,7 @@ class MusicVideoPlanner(BasePlanner):
 
             ctx = f"Clip {i + 1}: {section}, {beat_count} beats, {vocal_info}.{performer_hint}"
             from services.director.music_cues import format_music_cues
-            cue_context = format_music_cues(clip)
+            cue_context = format_music_cues(clip, performers=getattr(self, "_performers", True))
             if cue_context:
                 ctx += f" Music timing: {cue_context}"
             contexts.append(ctx)
@@ -777,11 +825,30 @@ class MusicVideoPlanner(BasePlanner):
         uses_generated_images = bool(
             getattr(self, "_uses_generated_shot_images", True)
         )
-        char_rules = build_character_rules_block(
-            has_reference or bool(num_character_refs),
-            char_profiles if char_profiles else None,
-            preserve_names=preserve_names,
-        )
+        if (
+            getattr(self, "_performers", True)
+            or char_profiles
+            or has_reference
+            or num_character_refs
+        ):
+            char_rules = build_character_rules_block(
+                has_reference or bool(num_character_refs),
+                char_profiles if char_profiles else None,
+                preserve_names=preserve_names,
+            )
+        else:
+            char_rules = (
+                "NO LEAD PERFORMERS:\n"
+                "- The Scene Concept calls for no lead performer, singer, "
+                "musician, or dancer. Never show a named or lead character, "
+                "and never lip-sync.\n"
+                "- Anonymous background figures are allowed ONLY when the "
+                "Scene Concept calls for them: distant, faceless, at the "
+                "edge of frame, never close, never a lead, never singing or "
+                "lip-syncing.\n"
+                "- Otherwise, show only environment, scenery, vehicles, "
+                "objects, and atmosphere that fit the Scene Concept."
+            )
         camera_block = build_camera_style_block()
         # video_guide now merged into ltx2_music_video_rules.md — no separate load needed
 
@@ -876,7 +943,7 @@ MUSIC VIDEO RULES:
 
 {music_video_rules}
 
-{MUSIC_PERFORMANCE_RULES}
+{MUSIC_PERFORMANCE_RULES if getattr(self, "_performers", True) else ""}
 
 {h3_direct_rules}
 
@@ -1044,7 +1111,7 @@ Write {len(clips)} structured shot plans. Go:"""
                         if isinstance(value, str) else value for value in raw[key]
                     ]
             if audio.mode == "music_driven":
-                direction = music_performance_direction(subjects, audio.vocal_activity, project_context=project_context)
+                direction = music_performance_direction(subjects, audio.vocal_activity, project_context=project_context, performers=getattr(self, "_performers", True))
                 if direction and raw.get("video_prompt") and direction not in raw["video_prompt"]:
                     raw["video_prompt"] = f"{raw['video_prompt']} {direction}"
                 if direction and raw.get("window_prompts"):

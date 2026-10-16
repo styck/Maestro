@@ -14,7 +14,7 @@ import { formatSeconds, recommendedWindowProfile } from './DurationSlider'
 import { DurationPresetControl } from './DurationPresetControl'
 import { LONG_FORM_MAX_SECONDS, formatDuration } from '../../lib/durationPlanning'
 import { formatEstimatedClock, formatEtaDuration } from '../../lib/format'
-import type { DirectorPipelineType, DirectorShotImageGuidance, DirectorSkill, ModelOptions, ShortFilmCharacter, ShortFilmPath } from '../../types'
+import type { DirectorPipelineType, DirectorShotImageGuidance, DirectorSkill, ModelOptions, ShortFilmCharacter, ShortFilmPath, MusicVideoMode } from '../../types'
 
 // AUDIO_ACCEPT lists both audio formats AND video formats. When a video
 // file is uploaded, the backend's /api/v1/upload-audio endpoint extracts
@@ -464,6 +464,8 @@ export function DirectorChat() {
         ?.director?.video_strategy === 'omni_reference'
   })
   const directorShotImageGuidance = useStore(s => s.directorShotImageGuidance)
+  const directorMusicVideoMode = useStore(s => s.directorMusicVideoMode)
+  const setDirectorMusicVideoMode = useStore(s => s.setDirectorMusicVideoMode)
   const directorHasVisualReferences = useStore(s => Boolean(
     s.directorReferenceImage
     || s.directorReferenceImagePath
@@ -1100,6 +1102,32 @@ export function DirectorChat() {
                   <span>{shortFilmTargetDuration}s film</span>
                 </div>
               </UserBubble>
+            )}
+            {isMusicVideo && atStep('style') && (
+              <SystemBubble>
+                <div className="space-y-2">
+                  <span className="text-xs text-text-secondary">Music video style</span>
+                  <div className="flex rounded-lg overflow-hidden border border-border">
+                    {(['auto', 'performer', 'cinematic'] as MusicVideoMode[]).map(mode => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setDirectorMusicVideoMode(mode)}
+                        className={`flex-1 px-2 py-1.5 text-[10px] ${directorMusicVideoMode === mode ? 'bg-accent-blue text-white' : 'bg-bg-tertiary text-text-secondary hover:text-text-primary'}`}
+                      >
+                        {mode === 'auto' ? 'Auto' : mode === 'performer' ? 'Performer' : 'Cinematic'}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[9px] text-text-muted leading-tight">
+                    {directorMusicVideoMode === 'cinematic'
+                      ? 'No lead performer or singer — scenery, atmosphere, and story.'
+                      : directorMusicVideoMode === 'performer'
+                        ? 'Band or performer-focused, with vocals and stage presence.'
+                        : 'Auto-detect from your scene description.'}
+                  </p>
+                </div>
+              </SystemBubble>
             )}
             <SystemBubble>
               <StyleForm

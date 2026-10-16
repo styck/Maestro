@@ -120,8 +120,22 @@ def strip_legacy_music_performance_direction(
     return text.strip()
 
 
-def music_performance_direction(subjects=(), vocal_activity=None, *, project_context=""):
-    """Compile concise directions only for people explicitly visible in this shot."""
+_NO_PERFORMERS_VOCAL_DIRECTION = (
+    "No one sings or lip-syncs; the lyrics are the soundtrack only. "
+    "Any visible figure keeps their lips relaxed and closed, moving "
+    "naturally through the scene without mouthing any words."
+)
+
+
+def music_performance_direction(subjects=(), vocal_activity=None, *, project_context="", performers=True):
+    """Compile concise directions only for people explicitly visible in this shot.
+
+    When ``performers`` is False (a narrative / no-performer concept) and no
+    subject is on screen, return a neutral no-singing direction. Explicit
+    subjects (characters) are still honored through the role-aware path below.
+    """
+    if not performers and not subjects:
+        return _NO_PERFORMERS_VOCAL_DIRECTION
     parts = []
     for subject in subjects or ():
         def field(key):

@@ -2118,6 +2118,32 @@ class TestDirectorCancellation(unittest.TestCase):
             [1, 2],
         )
 
+    def test_saved_media_validation_accepts_subdirectory_paths_inside_root(self):
+        # Prepared start images live under `_director_assets/<pid>/...`; those
+        # relative subdirectory paths must validate (regression: they were
+        # rejected because of the `os.path.basename(filename) != filename` and
+        # direct-child dirname checks).
+        rel = os.path.join("_director_assets", "abc123", "prepared_1.jpg")
+        os.makedirs(os.path.dirname(os.path.join(self.temp_dir.name, rel)), exist_ok=True)
+        with open(os.path.join(self.temp_dir.name, rel), "wb") as handle:
+            handle.write(b"media")
+
+        self.assertEqual(
+            pipeline._invalid_saved_media_numbers(
+                [rel], 1, self.temp_dir.name, "image",
+            ),
+            [],
+        )
+
+    def test_saved_media_validation_rejects_paths_outside_root(self):
+        # `..` escapes and paths resolving outside the output root are invalid.
+        self.assertEqual(
+            pipeline._invalid_saved_media_numbers(
+                ["../outside.jpg"], 1, self.temp_dir.name, "image",
+            ),
+            [1],
+        )
+
     def test_duplicate_start_waits_through_atomic_repair_reservation(self):
         pid = "pipe-repair-start-handshake"
         record = self._add_pipeline(pid, "completed")

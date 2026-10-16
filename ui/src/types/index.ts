@@ -268,6 +268,7 @@ export interface GenerateParams {
 
 export type WindowPromptMode = 'auto' | 'creative' | 'adaptive' | 'manual'
 export type WindowPlanningStyle = 'faithful' | 'creative' | 'adaptive'
+export type MusicVideoMode = 'auto' | 'performer' | 'cinematic'
 
 export interface LTXWindowPlan {
   source_prompt: string

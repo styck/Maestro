@@ -4,7 +4,7 @@ import { isKreaIdentityEdit, normalizeKreaIdentitySettings, type KreaIdentitySet
 import type { SavedOmniCharacter, TtsVoice } from '../types'
 import { applyTtsVoices, ttsAudioModeForCount, ttsCharacterEnhancePrompt, ttsSpeakingVoiceCount, ttsVoiceLimit, ttsVoicePaths } from '../lib/ttsVoices'
 import { vigglePreparationKey, viggleTimeline } from '../lib/viggle'
-import type { GenerateParams, OutputFile, MediaFilter, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, ModelFamily, ModelDef, GenerationMode, StudioVideoWorkflow, StudioVideoCreateRoute, StudioVideoEffectiveCreateRoute, StudioImageWorkflow, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineClipState, PipelineRepairState, SavedPipelineState, DirectorQueueState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, H3WindowPlan, MiniMaxH3Reference, AppMode } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, ModelFamily, ModelDef, GenerationMode, StudioVideoWorkflow, StudioVideoCreateRoute, StudioVideoEffectiveCreateRoute, StudioImageWorkflow, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, MusicVideoMode, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineClipState, PipelineRepairState, SavedPipelineState, DirectorQueueState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, H3WindowPlan, MiniMaxH3Reference, AppMode } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import {
@@ -2067,6 +2067,7 @@ interface AppState {
   directorAutoMode: boolean
   directorSeamless: boolean
   directorShotImageGuidance: DirectorShotImageGuidance
+  directorMusicVideoMode: MusicVideoMode
   /** Completed LLM stream outputs, kept so the thinking/output boxes stay
    *  in the chat history after each stage finishes instead of vanishing. */
   directorLlmLog: { stage: string; text: string }[]
@@ -2093,6 +2094,7 @@ interface AppState {
   setDirectorAutoMode: (v: boolean) => void
   setDirectorSeamless: (v: boolean) => void
   setDirectorShotImageGuidance: (v: DirectorShotImageGuidance) => void
+  setDirectorMusicVideoMode: (m: MusicVideoMode) => void
   setDirectorSkill: (skill: DirectorSkill) => void
   setDirectorResolution: (preset: ResolutionPreset) => void
   setDirectorAspectRatio: (ratio: AspectRatio) => void
@@ -2500,6 +2502,7 @@ async function _buildDirectorRestorePatch(
     shortFilmTargetDuration: Number(ui.shortFilmTargetDuration || params.target_duration || 30),
     shortFilmNarrative: ui.shortFilmNarrative == null
       ? Boolean(params.narrative_mode) : Boolean(ui.shortFilmNarrative),
+    directorMusicVideoMode: (ui.directorMusicVideoMode || 'auto') as MusicVideoMode,
     directorLoading: false,
     directorLoadingMessage: null,
     directorError: null,
@@ -9980,6 +9983,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorAutoMode: true,
   directorSeamless: false,
   directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
+  directorMusicVideoMode: 'auto',
   directorLlmLog: [],
   directorSkill: null,
   directorMusicSource: null,
@@ -10028,6 +10032,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorProjectId: null,
   setDirectorAutoMode: (v) => set({ directorAutoMode: v }),
   setDirectorSeamless: (v) => set({ directorSeamless: v }),
+  setDirectorMusicVideoMode: (m) => set({ directorMusicVideoMode: m }),
   setDirectorShotImageGuidance: (v) => set({
     directorShotImageGuidance: v,
     // Selecting "None" must not leave generated images from an earlier
@@ -11122,6 +11127,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorAutoMode: true,
       directorSeamless: false,
       directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
+      directorMusicVideoMode: 'auto',
       directorLlmLog: [],
       directorSkill: null,
       directorMusicSource: null,
@@ -13365,6 +13371,7 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorPlannedClips, directorSceneDescription,
             directorAudioPath, directorAnalysis, directorReferenceImagePath,
             directorAutoMode, directorSeamless, directorShotImageGuidance,
+            directorMusicVideoMode,
             directorResolution, directorAspectRatio,
             directorVideoMaxShotFramesByModel, directorH3TurboModeByModel,
             directorH3TurboPresetByModel, directorH3SolModeByModel,
@@ -13698,6 +13705,7 @@ export const useStore = create<AppState>((set, get) => ({
       characters: shortFilmCharacters,
       target_duration: shortFilmTargetDuration,
       narrative_mode: shortFilmNarrative,
+      music_video_mode: directorMusicVideoMode,
 
       // Image gen settings
       image_model: selectedImageModel,
@@ -13811,6 +13819,7 @@ export const useStore = create<AppState>((set, get) => ({
         shortFilmCharacters: state.shortFilmCharacters,
         shortFilmTargetDuration: state.shortFilmTargetDuration,
         shortFilmNarrative: state.shortFilmNarrative,
+        directorMusicVideoMode: state.directorMusicVideoMode,
       },
     }
 

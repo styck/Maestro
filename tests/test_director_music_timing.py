@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'app'))
-from services.director_music_timing import resolve_clip_limits, plan_capped_music_clips, prepare_music_timeline
+from services.director_music_timing import resolve_clip_limits, plan_capped_music_clips, prepare_music_timeline, music_output_trim
 from services.director_video_strategy import adapt_bounded_timeline
 from services import director_pipeline
 
@@ -36,6 +36,18 @@ class DirectorMusicTimingTests(unittest.TestCase):
         for invalid in [True, float('nan'), float('inf'), -1, 0]:
             with self.assertRaises(ValueError):
                 resolve_clip_limits(self.H3, invalid)
+
+    def test_music_output_trim_clamps_lattice_overshoot(self):
+        # Normal trim: 100 generation, 80 output → 20 frames trimmed.
+        self.assertEqual(music_output_trim(100, 80), 20)
+        # A frame-lattice mismatch can leave the editorial cut a few frames
+        # longer than the generated clip; clamp instead of raising.
+        self.assertEqual(music_output_trim(97, 100), 0)
+        self.assertEqual(music_output_trim(100, 100), 0)
+        # Genuinely invalid output frame counts still raise.
+        for invalid in (True, 0, -1, 2.5, '80'):
+            with self.assertRaises(ValueError):
+                music_output_trim(100, invalid)
 
     def test_gpu_override_can_raise_auto_without_changing_recommendation(self):
         profile = {'recommended_max_frames': 243, 'effective_max_frames': 345, 'manual_max_frames': 345}
