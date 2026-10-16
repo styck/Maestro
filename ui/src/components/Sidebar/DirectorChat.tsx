@@ -8,6 +8,7 @@ import { DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
 import { DirectorSongSetup } from './DirectorSongSetup'
 import { DirectorH3Optimizations } from './DirectorH3Optimizations'
 import { OmniReferenceSection } from './OmniReferenceSection'
+import { GalleryInput } from '../shared/GalleryInput'
 import { InfoTooltip } from './InfoTooltip'
 import { formatSeconds, recommendedWindowProfile } from './DurationSlider'
 import { DurationPresetControl } from './DurationPresetControl'
@@ -1656,6 +1657,8 @@ function UploadZone({
         dragOver ? 'border-accent-blue bg-accent-blue/10' : 'border-border hover:border-border-light'
       }`}
     >
+      {!loading && !audioFile && <GalleryInput kind="audio"
+        label={isShortFilm ? 'Director dialogue audio' : 'Director music track'} onFile={handleFile} />}
       {loading ? (
         <div className="flex flex-col items-center gap-2 py-2">
           <Loader2 size={20} className="animate-spin text-accent-blue" />
@@ -1692,11 +1695,12 @@ function UploadZone({
 }
 
 function ReferenceImageUpload({
-  referenceImage, refImagePreview, setReferenceImage,
+  referenceImage, refImagePreview, setReferenceImage, disabled = false,
 }: {
   referenceImage: File | null
   refImagePreview: string | null
   setReferenceImage: (file: File | null) => void
+  disabled?: boolean
 }) {
   const fixedMediaStrength = useStore(s => {
     const selected = s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'
@@ -1717,6 +1721,9 @@ function ReferenceImageUpload({
 
   return (
     <div className="space-y-2">
+      <GalleryInput kind="image" label="Director reference image" onFile={setReferenceImage}
+        getImages={() => referenceImage ? [referenceImage] : refImagePreview ? [{url: refImagePreview, name: 'Director reference'}] : []}
+        disabledReason={disabled ? 'References are currently locked.' : undefined} />
       {referenceImage && refImagePreview ? (
         <div className="relative">
           <label className="cursor-pointer block">
@@ -1809,8 +1816,9 @@ function DirectorReferenceInputs({
         referenceImage={referenceImage}
         refImagePreview={refImagePreview}
         setReferenceImage={setReferenceImage}
+        disabled={disabled}
       />
-      <AdditionalRefsSection />
+      <AdditionalRefsSection disabled={disabled} />
     </>
   )
 }
@@ -1861,7 +1869,7 @@ function DraggableRefRow({ file, label, index, onRemove, onLabelChange, onReorde
   )
 }
 
-function AdditionalRefsSection() {
+function AdditionalRefsSection({ disabled = false }: { disabled?: boolean }) {
   const charRefs = useStore(s => s.directorCharacterRefs)
   const charLabels = useStore(s => s.directorCharacterRefLabels)
   const locRefs = useStore(s => s.directorLocationRefs)
@@ -1914,6 +1922,12 @@ function AdditionalRefsSection() {
       </button>
       {expanded && (
         <div className="mt-1.5 space-y-2 pl-1">
+          <GalleryInput kind="image" label="Director character reference" onFile={addCharRef}
+            getImages={() => charRefs}
+            disabledReason={disabled ? 'References are currently locked.' : undefined} />
+          <GalleryInput kind="image" label="Director location reference" onFile={addLocRef}
+            getImages={() => locRefs}
+            disabledReason={disabled ? 'References are currently locked.' : undefined} />
           {/* Character References */}
           <div>
             <div className="flex items-center justify-between mb-1">
@@ -1963,6 +1977,9 @@ function AdditionalRefsSection() {
           {/* LTX uses an ID-LoRA; H3 Omni maps the sample as a native voice
               reference in each shot's Ref2VA manifest. */}
           {showVoiceReference && <div>
+            {!voiceRef && <GalleryInput kind="audio" label="Director voice reference"
+              onFile={setVoiceRef}
+              disabledReason={disabled ? 'References are currently locked.' : undefined} />}
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10px] text-text-secondary"><Mic size={9} className="inline mr-0.5" />Voice ref</span>
               {!voiceRef ? (

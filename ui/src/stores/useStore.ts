@@ -1,18 +1,22 @@
-import { galleryOutput, outputIdentity } from '../lib/galleryIdentity'
+import { galleryOutput, galleryOutputIsOlder, outputIdentity } from '../lib/galleryIdentity'
 import { create } from 'zustand'
+import { isKreaIdentityEdit, normalizeKreaIdentitySettings, type KreaIdentitySettings } from '../lib/kreaIdentityControls'
 import type { SavedOmniCharacter, TtsVoice } from '../types'
 import { applyTtsVoices, ttsAudioModeForCount, ttsCharacterEnhancePrompt, ttsSpeakingVoiceCount, ttsVoiceLimit, ttsVoicePaths } from '../lib/ttsVoices'
 import { vigglePreparationKey, viggleTimeline } from '../lib/viggle'
+import { DEFAULT_AVATAR_SPEAKER_LOCATIONS, isLongCatAvatarModel, isMultiSpeakerAvatarModel, parseAvatarSpeakerRegions } from '../lib/avatarWorkflow'
 import type { GenerateParams, OutputFile, MediaFilter, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, ModelFamily, ModelDef, GenerationMode, StudioVideoWorkflow, StudioVideoCreateRoute, StudioVideoEffectiveCreateRoute, StudioImageWorkflow, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineClipState, PipelineRepairState, SavedPipelineState, DirectorQueueState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, H3WindowPlan, MiniMaxH3Reference, AppMode } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import {
   effectiveH3OmniSequenceFrames,
+  h3MaximumFrames,
+  h3TimelineFrames,
+  supportsH3ExtendedDuration,
   h3WindowOverrideKey,
   h3OmniSequenceWindowCount,
   h3SlidingWindowCount,
   normalizeH3ClipFrameSchedule,
-  normalizeH3ClipFrames,
   normalizeH3NativeFrames,
   recommendedH3PassProfile,
   recommendedH3OmniSequenceProfile,
@@ -20,7 +24,16 @@ import {
 import {
   continuationFirstWindowFrames,
   durationWindowPlan,
+  wholeWindowDuration,
 } from '../lib/durationPlanning'
+import {
+  isH3RollingFramesTimeline,
+  h3SlidingWindowPlanMatchesTiming,
+  normalizeH3TimelineFramesForSubmission,
+  normalizeSlidingWindowFrames,
+  normalizeSlidingWindowOverlap,
+  resolveH3StoryboardDiscardFrames,
+} from '../lib/h3WindowTiming'
 
 const CIVIT_DOWNLOAD_POLL_MS = 2000
 const CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS = 30_000
@@ -50,6 +63,7 @@ let _studioPreferencesSaveTask: Promise<void> = Promise.resolve()
 let _directorMusicClipChanged = false
 let _directorGpuLimitsChanged = false
 let _enhancementDefaultChanged = false
+let _kreaIdentitySettingsChanged = false
 const STUDIO_VIDEO_CREATE_ROUTE_KEY = 'maestro_studio_video_create_route_v1'
 
 type StudioVideoRoutePreferences = {
@@ -100,6 +114,22 @@ function _adaptiveEtaJobFields(status: api.ApiJobStatus): Partial<GenerationJob>
   }
 }
 
+function _previewJobFields(status: api.ApiJobStatus): Partial<GenerationJob> {
+  if (status.status === 'completed' || status.status === 'failed' || status.status === 'cancelled') {
+    return { preview: null, previewNotice: null }
+  }
+  if (status.preview !== undefined) {
+    return {
+      preview: status.preview,
+      previewNotice: status.preview_notice ?? null,
+    }
+  }
+  if (status.preview_notice !== undefined) return { previewNotice: status.preview_notice }
+  // An older backend omits preview fields. Keep any current preview while
+  // it is running, and let terminal state clear it even without the field.
+  return {}
+}
+
 function _saveH3WindowOverrides(overrides: Record<string, number>) {
   _h3WindowOverrideSaveTask = _h3WindowOverrideSaveTask
     .catch(() => { /* a later save should still run */ })
@@ -117,13 +147,7 @@ function _normalizeSlidingWindowOverlap(
   value: number,
   defaults?: Record<string, number> | null,
 ): number {
-  if (!defaults) return Math.max(0, Math.round(value))
-  const minimum = defaults.overlap_min ?? 1
-  const maximum = defaults.overlap_max ?? Math.max(minimum, value)
-  const step = Math.max(1, defaults.overlap_step ?? 1)
-  const offset = defaults.overlap_offset ?? minimum
-  const normalized = offset + Math.round((value - offset) / step) * step
-  return Math.max(minimum, Math.min(maximum, normalized))
+  return normalizeSlidingWindowOverlap(value, defaults)
 }
 
 const _OUTPAINT_ASPECT_RATIOS: Array<[Exclude<OutpaintAspect, 'source'>, number]> = [
@@ -192,6 +216,9 @@ function _omniEnhanceInventory(references: MiniMaxH3Reference[]): {
       const intent = reference.audio_intent ?? 'voice'
       if (intent === 'drive') {
         labelLines.push(`Exact target soundtrack: ${note}; intent=AUDIO REUSE / PERFORMANCE DRIVER; retention=fully_preserved; preserve its waveform and audible timeline exactly and synchronize visible action and lip movement to it; this is target conditioning rather than a numbered Omni audio reference`)
+      } else if (intent === 'sound') {
+        const label = `<Audio ${++audioIndex}>`
+        labelLines.push(`${label}: ${note}; intent=SOUND EFFECT REFERENCE; retention=reference; use only as timbre guidance to generate the explicitly requested sound effect attached to its named action; reuse the clip from its beginning in each window; do not play, copy, or loop its waveform or words; do not treat it as voice identity, music, or a performance driver; synchronize the effect to its requested action rather than the recording’s original timing`)
       } else if (intent === 'style') {
         const label = `<Audio ${++audioIndex}>`
         labelLines.push(`${label}: ${note}; intent=AUDIO REFERENCE; retention=weak_reference; borrow only rhythm/style/texture and do not copy the source signal or words`)
@@ -202,8 +229,12 @@ function _omniEnhanceInventory(references: MiniMaxH3Reference[]): {
       }
     } else if (reference.type === 'image') {
       const label = `<Picture ${++pictureIndex}>`
-      labelLines.push(`${label}: visual identity/appearance reference for ${note}; retention=reference for identity only; do not reproduce its background, framing, composition, or pose`)
-      bindSavedCharacter(reference, label)
+      if (reference.image_intent === 'object') {
+        labelLines.push(`${label}: object design reference for ${note}; intent=OBJECT REFERENCE; image_intent=object; retention=fully_preserved; preserve the object's design, shape, proportions, materials, colors, and visible details from this Picture; ignore its source scene, framing, background, and pose; follow the prompt for placement, scale, action, and count`)
+      } else {
+        labelLines.push(`${label}: visual identity/appearance reference for ${note}; retention=reference for identity only; do not reproduce its background, framing, composition, or pose`)
+        bindSavedCharacter(reference, label)
+      }
       if (reference.path) imagePaths.push(reference.path)
     } else {
       const nextVideoIndex = videoIndex + 1
@@ -309,7 +340,7 @@ function _downloadTimestampMs(value: number | null | undefined): number | null {
 }
 
 function _downloadNeedsPolling(download: CivitAIDownload, now: number): boolean {
-  if (download.status === 'downloading') return true
+  if (download.status === 'downloading' || download.status === 'cancelling') return true
   if (download.status !== 'completed') return false
   const completedAt = _downloadTimestampMs(download.completed_at)
   return completedAt !== null && now - completedAt < CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS
@@ -416,6 +447,7 @@ interface PersistedModeSettings {
   audioSubMode?: import('../types').AudioSubMode
   selectedModelPerAudioSubMode?: Partial<Record<import('../types').AudioSubMode, string>>
   inferenceStepsPerModel?: Record<string, number>
+  kreaIdentitySettingsPerModel?: Record<string, KreaIdentitySettings>
   enhanceOnGenerationDefault?: boolean
   h3OptimizationPreferences?: {
     override_attention?: '' | 'sol' | 'sla' | 'sdpa'
@@ -587,6 +619,7 @@ function _saveSettings(
       audioSubMode: state.audioSubMode ?? previous.audioSubMode,
       selectedModelPerAudioSubMode: state.selectedModelPerAudioSubMode ?? previous.selectedModelPerAudioSubMode,
       inferenceStepsPerModel: state.inferenceStepsPerModel ?? previous.inferenceStepsPerModel,
+      kreaIdentitySettingsPerModel: state.kreaIdentitySettingsPerModel ?? previous.kreaIdentitySettingsPerModel,
       enhanceOnGenerationDefault: state.enhanceOnGenerationDefault ?? previous.enhanceOnGenerationDefault,
       h3OptimizationPreferences: state.h3OptimizationPreferences ?? previous.h3OptimizationPreferences,
     }
@@ -661,6 +694,7 @@ function _loadSettings(): PersistedModeSettings | null {
         audioSubMode: parsed.audioSubMode,
         selectedModelPerAudioSubMode: parsed.selectedModelPerAudioSubMode || {},
         inferenceStepsPerModel: _normalizeRememberedSteps(parsed.inferenceStepsPerModel),
+        kreaIdentitySettingsPerModel: _normalizeRememberedKreaSettings(parsed.kreaIdentitySettingsPerModel),
         enhanceOnGenerationDefault: parsed.enhanceOnGenerationDefault === true,
         h3OptimizationPreferences: parsed.h3OptimizationPreferences || {},
         _loraFilenameSnapshot: snapshot,
@@ -767,6 +801,29 @@ function _normalizeRememberedSteps(values: unknown): Record<string, number> {
   )).slice(0, 1000))
 }
 
+function _normalizeRememberedKreaSettings(values: unknown): Record<string, KreaIdentitySettings> {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) return {}
+  return Object.fromEntries(Object.entries(values)
+    .filter(([model, settings]) => isKreaIdentityEdit(model)
+      && settings && typeof settings === 'object' && !Array.isArray(settings))
+    .map(([model, settings]) => [model, normalizeKreaIdentitySettings(settings)]))
+}
+
+function _kreaCustomSettingsForModel(
+  existing: GenerateParams['custom_settings'],
+  modelType: string,
+  remembered: Record<string, KreaIdentitySettings>,
+): GenerateParams['custom_settings'] {
+  const settings = { ...existing }
+  delete settings.krea2_ref_boost
+  delete settings.krea2_ref_boost_a
+  delete settings.krea2_grounding_px
+  if (isKreaIdentityEdit(modelType)) {
+    Object.assign(settings, normalizeKreaIdentitySettings(remembered[modelType]))
+  }
+  return Object.keys(settings).length ? settings : undefined
+}
+
 function _rememberedModelSteps(
   state: Pick<AppState, 'inferenceStepsPerModel'>,
   modelType: string,
@@ -781,7 +838,7 @@ function _rememberedModelSteps(
 }
 
 function _applyModelDefaults(
-  storeGet: () => Pick<AppState, 'selectedModelPerMode' | 'generationMode' | 'params' | 'inferenceStepsPerModel' | 'modelOptions'>,
+  storeGet: () => Pick<AppState, 'selectedModelPerMode' | 'generationMode' | 'params' | 'inferenceStepsPerModel' | 'kreaIdentitySettingsPerModel' | 'modelOptions'>,
   storeSet: (fn: (s: { params: GenerateParams }) => { params: GenerateParams }) => void,
   modelType: string,
 ): void {
@@ -812,11 +869,19 @@ function _applyModelDefaults(
           overrides.num_inference_steps = remembered
           continue
         }
+        const turbo = state.modelOptions?.model_type === modelType
+          ? state.modelOptions.minimax_h3_turbo : null
+        if (state.params.minimax_h3_turbo_mode === false && turbo?.default_enabled
+          && turbo.unaccelerated_steps != null) {
+          overrides.num_inference_steps = turbo.unaccelerated_steps
+          continue
+        }
       }
       if ((d as Record<string, unknown>)[field] !== undefined) {
         overrides[field] = (d as Record<string, unknown>)[field]
       }
     }
+    overrides.custom_settings = _kreaCustomSettingsForModel(state.params.custom_settings, modelType, state.kreaIdentitySettingsPerModel)
     if (Object.keys(overrides).length > 0) {
       storeSet(s => ({ params: { ...s.params, ...overrides } as GenerateParams }))
     }
@@ -839,7 +904,9 @@ const familyModeMap: Record<string, GenerationMode> = {
   ltx2: 'video',
   kandinsky5: 'video',
   tts: 'audio',
-  longcat: 'avatar',
+  // LongCat Video and image-and-voice Avatar are both Studio Video generators.
+  // Their user-facing workflows are distinct from the legacy editing engine.
+  longcat: 'video',
 }
 
 // Model types classified as Avatar even though their family is primarily Video
@@ -910,6 +977,7 @@ const DEFAULT_ENABLED_MODELS = new Set([
   // base RAW/Turbo generation and their identity-preserving Edit variants.
   // Other image models remain opt-in through Model Visibility.
   'flux2_klein_9b',
+  'qwen_image_21_7B',
   'krea2_raw',
   'krea2_turbo',
   'krea2_raw_edit',
@@ -935,6 +1003,8 @@ const DEFAULT_ENABLED_MODELS = new Set([
   'minimax_h3_vdn',
   'minimax_h3_vdn_full',
   'minimax_h3_voice_audio',
+  // Frames-side workflow ID paired with the Singularity Ref2VA entry below.
+  'minimax_h3_singularity',
   'viggle_animate',
   // Experimental fused four-step Frames checkpoint. It is visible by
   // default, but the ordinary H3/LTX selections below remain the active
@@ -944,6 +1014,7 @@ const DEFAULT_ENABLED_MODELS = new Set([
   'minimax_h3_ref2va',
   'minimax_h3_ref2va_full',
   'minimax_h3_ref2va_fused_turbo',
+  'minimax_h3_ref2va_singularity',
   // Audio — Speech
   'kugelaudio_0_open',
   'qwen3_tts_base',
@@ -970,7 +1041,7 @@ const DEFAULT_ENABLED_MODELS = new Set([
  * a user who then disables them stays disabled forever. (This is
  * deliberately narrower than auto-enabling every unknown model — only
  * the curated list's own additions are pushed.) */
-const DEFAULTS_VERSION = 15
+const DEFAULTS_VERSION = 19
 const DEFAULTS_ADDED_IN: Record<number, string[]> = {
   // v1.2.0: the ACE-Step XL SFT pair; LM_4B becomes the music default.
   2: ['ace_step_v1_5_xl_sft', 'ace_step_v1_5_xl_sft_lm_4b'],
@@ -996,6 +1067,13 @@ const DEFAULTS_ADDED_IN: Record<number, string[]> = {
   13: ['viggle_animate'],
   14: ['yue2'],
   15: ['yue2'], // v2.2 music default; enable once, then preserve user changes.
+  16: ['qwen_image_21_7B'],
+  17: ['minimax_h3_ref2va_singularity'],
+  // MiniMax H3 Singularity Frames companion; preserve existing visibility choices.
+  18: ['minimax_h3_singularity'],
+  // Reserved: DaSiWa checkpoints are user imports, without curated additions.
+  // Keep the version so earlier local visibility preferences remain valid.
+  19: [],
 }
 const DEFAULTS_VERSION_KEY = 'maestro_defaults_version'
 
@@ -1094,7 +1172,6 @@ export function getFamilyMode(familyId: string): GenerationMode {
 /** Get the effective generation mode for a specific model (respects per-model overrides) */
 export function getModelMode(modelType: string, familyId: string): GenerationMode {
   if (avatarModelTypes.has(modelType)) return 'avatar'
-  if (familyId === 'longcat') return 'avatar'
   return getFamilyMode(familyId)
 }
 
@@ -1200,10 +1277,13 @@ function _normalizeStudioVideoWorkflow(
   value: unknown,
   model?: ModelDef,
 ): StudioVideoWorkflow | null {
+  // Older LongCat output recipes used Frames before the dedicated inputs existed.
+  if (isLongCatAvatarModel(model)) return 'avatar'
   if (value === 'generate') return 'frames'
   if (value === 'animate' || model?.model_type === 'viggle_animate') return 'animate'
   if (
     value === 'frames'
+    || value === 'avatar'
     || value === 'references'
     || value === 'extend'
     || value === 'blend'
@@ -1530,6 +1610,7 @@ interface AppState {
   selectedModelPerAudioSubMode: Partial<Record<import('../types').AudioSubMode, string>>
   /** Step choices are independent for each model and survive restarts. */
   inferenceStepsPerModel: Record<string, number>
+  kreaIdentitySettingsPerModel: Record<string, KreaIdentitySettings>
   /** H3 accelerations live outside per-mode params so visiting Audio/Image
    *  cannot erase the user's Video optimization choices. */
   h3OptimizationPreferences: {
@@ -1641,7 +1722,7 @@ interface AppState {
   // Models & families (from API)
   families: ModelFamily[]
   models: ModelDef[]
-  loadModels: () => Promise<void>
+  loadModels: (options?: { catalogOnly?: boolean }) => Promise<void>
   modelsLoaded: boolean
 
   // Model visibility (favorites)
@@ -1673,6 +1754,7 @@ interface AppState {
   setSlidingWindowOverlap: (frames: number) => void
   slidingWindowLocked: boolean
   setSlidingWindowLocked: (locked: boolean) => void
+  setH3ExtendedDuration: (enabled: boolean) => void
   /** Durable H3 pass lengths keyed by exact model type and resolution. */
   h3WindowOverrides: Record<string, number>
   saveH3WindowOverride: (modelType: string, resolution: string, frames: number) => void
@@ -1932,14 +2014,14 @@ interface AppState {
   loadOutputMetadata: (name: string, workspace?: string) => Promise<void>
   loadSettingsFromOutput: () => Promise<void>
   rerollGeneration: () => Promise<void>
-  deleteSelectedOutput: (target?: OutputFile) => Promise<void>
+  deleteSelectedOutput: (target?: OutputFile) => Promise<{ ok: boolean; error?: string }>
   rejoinClipGroup: (groupId: string, workspace?: string) => Promise<void>
 
   // Services config
   servicesConfig: ServicesConfig | null
   servicesConfigLoading: boolean
   loadServicesConfig: () => Promise<void>
-  updateServicesConfig: (partial: Partial<ServicesConfig>) => Promise<void>
+  updateServicesConfig: (partial: Partial<ServicesConfig>, options?: { throwOnError?: boolean }) => Promise<void>
 
   // LLM state
   llmStatus: LlmStatus | null
@@ -1959,7 +2041,7 @@ interface AppState {
   enhanceOnGenerationRevision: number
   setEnhanceOnGeneration: (enabled: boolean) => void
   setEnhanceOnGenerationDefault: (enabled: boolean) => void
-  enhancePrompt: (ttsMode?: string, planningStyle?: 'faithful' | 'creative' | 'adaptive') => Promise<void>
+  enhancePrompt: (ttsMode?: string, planningStyle?: 'faithful' | 'creative' | 'adaptive', retryFlaggedWindows?: boolean) => Promise<void>
   h3WindowPlan: H3WindowPlan | null
   updateH3WindowPrompt: (index: number, prompt: string) => void
   clearH3WindowPlan: () => void
@@ -2055,6 +2137,7 @@ interface AppState {
   setDirectorVideoMaxShotFrames: (modelType: string, frames: number | null) => void
   setDirectorH3TurboMode: (modelType: string, enabled: boolean) => void
   setDirectorH3TurboPreset: (modelType: string, presetId: string) => void
+  initializeDirectorH3Turbo: (modelType: string, options: ModelOptions) => void
   setDirectorH3SolMode: (modelType: string, enabled: boolean) => void
   setDirectorH3FirstBlockCache: (modelType: string, enabled: boolean) => void
   setDirectorH3FirstBlockCacheMultiplier: (modelType: string, value: number) => void
@@ -2554,7 +2637,7 @@ const BLANK_VIDEO_INPUT_PARAMS: Partial<GenerateParams> = {
   input_video_strength: undefined,
 }
 
-const resolutionMap: Record<ResolutionPreset, Record<AspectRatio, string>> = {
+const resolutionMap: Partial<Record<ResolutionPreset, Record<AspectRatio, string>>> = {
   'auto': {
     'auto': 'auto',
     '21:9': 'auto',
@@ -2653,6 +2736,8 @@ function findResolutionSelection(
 let _galleryRevision = 0
 let _galleryMetadataRevision = 0
 let _galleryMorePending = false
+let _galleryRefreshRequest = 0
+let _galleryRefreshApplied = 0
 
 function galleryQuery(state: AppState) {
   return {
@@ -2767,10 +2852,56 @@ function _isH3FirstLastVideoModel(model: ModelDef | undefined): boolean {
 }
 
 export interface StudioVideoMediaIntent {
-  workflow: 'frames' | 'references'
+  workflow: 'frames' | 'references' | 'avatar'
   hasFrameGuidance: boolean
   hasOmniReferences: boolean
   hasAudioDrive: boolean
+}
+
+export function hasLongCatAvatarAnchorImage(
+  state: Pick<AppState, 'startImage' | 'params' | 'imageRefs' | 'imageRefType' | 'modelOptions'>,
+): boolean {
+  const startPaths = Array.isArray(state.params.image_start)
+    ? state.params.image_start : [state.params.image_start]
+  if (state.startImage || startPaths.some(path => typeof path === 'string' && path.trim())) return true
+
+  const referencePromptType = String(state.params.video_prompt_type || '')
+  if (referencePromptType.includes('F') || String(state.params.frames_positions || '').trim()) return false
+
+  const referenceChoices = state.modelOptions?.image_ref_choices?.choices ?? []
+  const effectiveImageRefType = state.imageRefType || (
+    referenceChoices.some(([, value]) => value.includes('K'))
+      ? 'KI'
+      : referenceChoices.some(([, value]) => value === 'I')
+        ? 'I'
+        : referenceChoices[0]?.[1] || ''
+  )
+  if (state.imageRefs.length > 0 && effectiveImageRefType.includes('I')) return true
+
+  return Array.isArray(state.params.image_refs)
+    && state.params.image_refs.some(path => typeof path === 'string' && path.trim())
+    && String(state.params.video_prompt_type || '').includes('I')
+    && !String(state.params.video_prompt_type || '').includes('F')
+    && !String(state.params.frames_positions || '').trim()
+}
+
+/** Shared by the visible Generate button and queued/shortcut submissions. */
+export function studioAvatarInputError(
+  state: Pick<AppState, 'models' | 'params' | 'startImage' | 'imageRefs' | 'imageRefType' | 'modelOptions'>,
+): string | null {
+  const model = state.models.find(item => item.model_type === state.params.model_type)
+  if (!isLongCatAvatarModel(model)) return 'Enable or select a LongCat Avatar model.'
+  const missing = [
+    !hasLongCatAvatarAnchorImage(state) ? 'an anchor image' : null,
+    !state.params.audio_guide ? 'Voice audio 1' : null,
+    isMultiSpeakerAvatarModel(model) && !state.params.audio_guide2 ? 'Voice audio 2' : null,
+  ].filter(Boolean)
+  if (missing.length) return `Avatar needs ${missing.join(' and ')} before generation.`
+  if (isMultiSpeakerAvatarModel(model)
+    && !parseAvatarSpeakerRegions(state.params.speakers_locations ?? DEFAULT_AVATAR_SPEAKER_LOCATIONS)) {
+    return 'Choose two valid speaker regions with Left < Right and Top < Bottom.'
+  }
+  return null
 }
 
 /**
@@ -2787,6 +2918,11 @@ export function modelSupportsStudioVideoMediaIntent(
   const isOmni = _isOmniVideoModel(model)
   const isLtx = _isStudioLtxVideoModel(model)
   const isFirstLast = _isH3FirstLastVideoModel(model)
+  if (intent.workflow === 'avatar') {
+    // Selection exposes the required inputs before any media has been uploaded.
+    return isLongCatAvatarModel(model) && model.is_i2v && model.supports_audio_input === true
+  }
+  if (isLongCatAvatarModel(model)) return false
   const supportsTextGeneration = model.is_t2v || isLtx || isFirstLast
   const supportsFrameGeneration = model.is_i2v || isLtx || isFirstLast
   if (!isOmni && !supportsTextGeneration && !supportsFrameGeneration) return false
@@ -2813,7 +2949,10 @@ export function modelSupportsStudioVideoMediaIntent(
 function _pairedH3CreateModel(
   modelType: string,
   route: StudioVideoEffectiveCreateRoute,
+  models: ModelDef[],
 ): string | null {
+  const companion = models.find(model => model.model_type === modelType)?.h3_companion_models
+  if (companion) return (route === 'omni' ? companion.references : companion.frames) || null
   const pairs: Record<string, { firstLast: string; omni: string }> = {
     minimax_h3: { firstLast: 'minimax_h3', omni: 'minimax_h3_ref2va' },
     minimax_h3_ref2va: { firstLast: 'minimax_h3', omni: 'minimax_h3_ref2va' },
@@ -2821,6 +2960,12 @@ function _pairedH3CreateModel(
     minimax_h3_ref2va_full: { firstLast: 'minimax_h3_full', omni: 'minimax_h3_ref2va_full' },
     minimax_h3_fused_turbo: { firstLast: 'minimax_h3_fused_turbo', omni: 'minimax_h3_ref2va_fused_turbo' },
     minimax_h3_ref2va_fused_turbo: { firstLast: 'minimax_h3_fused_turbo', omni: 'minimax_h3_ref2va_fused_turbo' },
+    minimax_h3_singularity: { firstLast: 'minimax_h3_singularity', omni: 'minimax_h3_ref2va_singularity' },
+    minimax_h3_ref2va_singularity: { firstLast: 'minimax_h3_singularity', omni: 'minimax_h3_ref2va_singularity' },
+    minimax_h3_dasiwa: { firstLast: 'minimax_h3_dasiwa', omni: 'minimax_h3_ref2va_dasiwa' },
+    minimax_h3_ref2va_dasiwa: { firstLast: 'minimax_h3_dasiwa', omni: 'minimax_h3_ref2va_dasiwa' },
+    minimax_h3_dasiwa_turbo: { firstLast: 'minimax_h3_dasiwa_turbo', omni: 'minimax_h3_ref2va_dasiwa_turbo' },
+    minimax_h3_ref2va_dasiwa_turbo: { firstLast: 'minimax_h3_dasiwa_turbo', omni: 'minimax_h3_ref2va_dasiwa_turbo' },
   }
   const pair = pairs[modelType]
   if (!pair) return null
@@ -2844,7 +2989,7 @@ function _resolveStudioCreateModel(
     && modelSupportsStudioVideoMediaIntent(remembered, inputState)
   ) return rememberedType
 
-  const pairedType = _pairedH3CreateModel(currentType, route)
+  const pairedType = _pairedH3CreateModel(currentType, route, state.models)
   const paired = state.models.find(model => model.model_type === pairedType)
   if (
     pairedType
@@ -2867,7 +3012,8 @@ function _studioCreateInputState(state: AppState): {
   desired: StudioVideoEffectiveCreateRoute
   conflict: boolean
 } & StudioVideoMediaIntent {
-  const workflow = state.studioVideoWorkflow === 'references' ? 'references' : 'frames'
+  const workflow = state.studioVideoWorkflow === 'references' ? 'references'
+    : state.studioVideoWorkflow === 'avatar' ? 'avatar' : 'frames'
   const references = state.params.minimax_h3_references ?? []
   // An exact music/performance timeline is accepted by LTX or H3 Omni.
   // Every identity/scene/motion/voice/style reference is native Ref2VA intent.
@@ -2875,13 +3021,13 @@ function _studioCreateInputState(state: AppState): {
     reference.type === 'audio' && reference.audio_intent === 'drive'
   ))
   const hasAudioDrive = Boolean(
-    workflow === 'frames'
+    workflow !== 'references'
       ? state.params.audio_guide
       : references.some(reference => (
       reference.type === 'audio' && reference.audio_intent === 'drive'
       ))
   )
-  const hasFrameGuidance = workflow === 'frames' && Boolean(
+  const hasFrameGuidance = workflow === 'avatar' ? hasLongCatAvatarAnchorImage(state) : workflow === 'frames' && Boolean(
     state.startImage
     || state.endImage
     || state.params.image_start
@@ -2895,7 +3041,7 @@ function _studioCreateInputState(state: AppState): {
   )
   return {
     workflow,
-    desired: workflow === 'references'
+    desired: workflow === 'avatar' ? 'avatar' : workflow === 'references'
       ? 'omni'
       : hasFrameGuidance
         ? 'guided'
@@ -2916,7 +3062,7 @@ function _audioSubModeForModel(modelType: string): import('../types').AudioSubMo
 }
 
 export function canEnhanceOnGeneration(state: Pick<AppState, 'generationMode' | 'studioVideoWorkflow' | 'studioImageWorkflow'>): boolean {
-  return (state.generationMode === 'video' && ['frames', 'references'].includes(state.studioVideoWorkflow))
+  return (state.generationMode === 'video' && ['frames', 'references', 'avatar'].includes(state.studioVideoWorkflow))
     || (state.generationMode === 'image' && state.studioImageWorkflow === 'generate')
 }
 
@@ -2933,7 +3079,7 @@ export function shouldEnhanceOnGeneration(state: Pick<AppState,
   return state.enhanceOnGenerationDefault && !hasEnhancedPrompt && !hasEnhancedWindows
 }
 
-/** Persist navigation/model choices, step counts, enhancement and H3 acceleration preferences.
+/** Persist navigation/model choices, step counts, Krea identity, enhancement and H3 acceleration preferences.
  *  This deliberately does not restore project state, prompts, uploads,
  *  seeds, LoRAs, or other Advanced controls. The server mirror makes the
  *  choices survive Pinokio assigning a different browser origin/port. */
@@ -2948,6 +3094,8 @@ function _persistStickyStudioPreferences(state: AppState) {
   // Do not replace a saved opt-in with the store's initial false value.
   const enhancementDefault = _studioPreferencesHydrated || _enhancementDefaultChanged
     ? state.enhanceOnGenerationDefault : undefined
+  const kreaIdentitySettings = _studioPreferencesHydrated || _kreaIdentitySettingsChanged
+    ? state.kreaIdentitySettingsPerModel : undefined
   _saveSettings({
     generationMode: durableGenerationMode,
     selectedModelPerMode: state.selectedModelPerMode,
@@ -2959,6 +3107,7 @@ function _persistStickyStudioPreferences(state: AppState) {
     audioSubMode: state.audioSubMode,
     selectedModelPerAudioSubMode: state.selectedModelPerAudioSubMode,
     inferenceStepsPerModel: state.inferenceStepsPerModel,
+    kreaIdentitySettingsPerModel: kreaIdentitySettings,
     enhanceOnGenerationDefault: enhancementDefault,
     h3OptimizationPreferences,
   }, state.loraIdByFilename)
@@ -2976,6 +3125,7 @@ function _persistStickyStudioPreferences(state: AppState) {
     ),
     h3_optimizations: h3OptimizationPreferences,
     inference_steps_per_model: state.inferenceStepsPerModel,
+    krea_identity_settings_per_model: kreaIdentitySettings,
     enhance_on_generation_default: enhancementDefault,
     ...(_musicDefaultsVersion > 0 ? {music_defaults_version: _musicDefaultsVersion} : {}),
     ...(_studioPreferencesHydrated ? {director_music_model: state.directorMusicModel} : {}),
@@ -2992,6 +3142,22 @@ function _persistStickyStudioPreferences(state: AppState) {
     .catch(error => {
       console.warn('Failed to save Studio preferences:', error)
     })
+}
+
+function _rememberKreaIdentitySettings(
+  storeGet: () => AppState,
+  storeSet: (update: Pick<AppState, 'kreaIdentitySettingsPerModel'>) => void,
+  modelType: string,
+  value: unknown,
+) {
+  if (!isKreaIdentityEdit(modelType)) return
+  const state = storeGet()
+  const settings = normalizeKreaIdentitySettings(value)
+  const previous = state.kreaIdentitySettingsPerModel[modelType]
+  if (previous && Object.entries(settings).every(([key, setting]) => previous[key as keyof KreaIdentitySettings] === setting)) return
+  _kreaIdentitySettingsChanged = true
+  storeSet({ kreaIdentitySettingsPerModel: { ...state.kreaIdentitySettingsPerModel, [modelType]: settings } })
+  _persistStickyStudioPreferences(storeGet())
 }
 
 function _rememberInferenceSteps(
@@ -3037,7 +3203,7 @@ export const useStore = create<AppState>((set, get) => ({
     const state = get()
     if (
       state.generationMode !== 'video'
-      || (state.studioVideoWorkflow !== 'frames' && state.studioVideoWorkflow !== 'references')
+      || !['frames', 'references', 'avatar'].includes(state.studioVideoWorkflow)
       || Number(state.params.image_mode) !== 0
     ) return
     const inputState = _studioCreateInputState(state)
@@ -3105,7 +3271,13 @@ export const useStore = create<AppState>((set, get) => ({
     get().selectModel(modelType)
   },
   setStudioVideoWorkflow: (workflow) => {
-    set({ studioVideoWorkflow: workflow })
+    const previousWorkflow = get().studioVideoWorkflow
+    set(state => ({
+      studioVideoWorkflow: workflow,
+      ...(previousWorkflow === 'avatar' && workflow !== 'avatar' ? {
+        params: { ...state.params, audio_prompt_type: String(state.params.audio_prompt_type || '').replace(/B/g, '') },
+      } : {}),
+    }))
     const persist = () => _persistStickyStudioPreferences(get())
 
     if (workflow === 'animate') {
@@ -3123,8 +3295,15 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
 
-    if (workflow === 'frames' || workflow === 'references' || workflow === 'extend' || workflow === 'blend') {
+    if (workflow === 'frames' || workflow === 'references' || workflow === 'avatar' || workflow === 'extend' || workflow === 'blend') {
       if (get().generationMode !== 'video') get().setGenerationMode('video')
+      if (previousWorkflow === 'avatar' && (workflow === 'extend' || workflow === 'blend')) {
+        const targetModel = _resolveStudioCreateModel(get(), {
+          workflow: 'frames', desired: 'guided', hasFrameGuidance: true,
+          hasOmniReferences: false, hasAudioDrive: false,
+        })
+        if (targetModel && !isLongCatAvatarModel({ model_type: targetModel })) get().selectModel(targetModel)
+      }
       if (get().params.model_type === 'viggle_animate') {
         const restore = [_preViggleVideoModel, get().studioVideoModelPerCreateRoute.omni,
           'minimax_h3_ref2va_fused_turbo', 'minimax_h3_ref2va'].find(type =>
@@ -3142,8 +3321,8 @@ export const useStore = create<AppState>((set, get) => ({
           _studio_video_workflow: workflow,
         },
       }))
-      if (workflow === 'frames' || workflow === 'references') {
-        get().reconcileStudioVideoCreateRoute(`${workflow === 'references' ? 'References' : 'Frames'} workflow opened`)
+      if (workflow === 'frames' || workflow === 'references' || workflow === 'avatar') {
+        get().reconcileStudioVideoCreateRoute(`${workflow === 'references' ? 'References' : workflow === 'avatar' ? 'Avatar' : 'Frames'} workflow opened`)
       }
       persist()
       return
@@ -3643,10 +3822,17 @@ export const useStore = create<AppState>((set, get) => ({
   musicDescription: '',
   setMusicDescription: (s) => set({ musicDescription: s }),
   musicInstrumental: false,
-  setMusicInstrumental: (b) => set({ musicInstrumental: b }),
+  setMusicInstrumental: (b) => set(s => {
+    const custom = s.params.custom_settings
+    const artists = Array.isArray(custom?.artist_loras) ? custom.artist_loras.length > 0 : !!custom?.artist_id
+    const resumeArtists = !b && artists && (s.params.model_type === 'yue2' || s.modelOptions?.yue2_composition)
+    return {musicInstrumental: b, ...(resumeArtists ? {params: {...s.params, model_mode: 2,
+      custom_settings: {...custom, instrumental: false, abc: ''}, audio_prompt_type: '', audio_guide: undefined}} : {})}
+  }),
   audioSubMode: 'speech' as import('../types').AudioSubMode,
   selectedModelPerAudioSubMode: {} as Partial<Record<import('../types').AudioSubMode, string>>,
   inferenceStepsPerModel: {},
+  kreaIdentitySettingsPerModel: {},
   h3OptimizationPreferences: {
     override_attention: '',
     skip_steps_cache_type: '',
@@ -3843,7 +4029,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     if (
       mode === 'video'
-      && (get().studioVideoWorkflow === 'frames' || get().studioVideoWorkflow === 'references')
+      && ['frames', 'references', 'avatar'].includes(get().studioVideoWorkflow)
     ) {
       get().setStudioVideoCreateRoute(get().studioVideoCreateRoute)
     }
@@ -3873,9 +4059,15 @@ export const useStore = create<AppState>((set, get) => ({
       'minimax_h3_sequence_continuity',
       'minimax_h3_sequence_clip_frames',
       'minimax_h3_sequence_memory_override',
+      'minimax_h3_extended_duration',
     ].includes(String(key))
     set(s => {
       const nextParams = { ...s.params, [key]: value }
+      if (key === 'video_guide' && value !== s.params.video_guide) {
+        // Loaded clip settings may seek into a shared control source. A new
+        // source begins at zero; retaining that hidden origin skips its head.
+        nextParams.video_frame_offset = 0
+      }
       if (key === 'video_guide' && value !== s.params.video_guide && s.params.model_type === 'viggle_animate') {
         Object.assign(nextParams, {_viggle_source_seconds: undefined, _viggle_trim_start: undefined,
           _viggle_trim_end: undefined, _viggle_frame_seconds: 0,
@@ -4022,6 +4214,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({ savedParamsPerMode: updatedSavedParams })
     }
     if (key === 'num_inference_steps') _rememberInferenceSteps(get, set, get().params.model_type, value)
+    if (key === 'custom_settings') _rememberKreaIdentitySettings(get, set, get().params.model_type, value)
     if (
       key === 'minimax_h3_references'
       || key === 'image_start'
@@ -4745,6 +4938,7 @@ export const useStore = create<AppState>((set, get) => ({
     await api.startCivitAIDownload({
       download_url: lora.source_url,
       filename: lora.filename,
+      version_name: lora.version_name,
       // architecture (not family) is what the backend's get_lora_dir keys on,
       // so the LoRA lands in the same per-model dir the model loads from.
       target_arch: (model?.architecture as string) || '',
@@ -4866,6 +5060,7 @@ export const useStore = create<AppState>((set, get) => ({
       get().pollCivitAIDownloads()
     } catch (e) {
       console.error('Download failed:', e)
+      throw e
     }
   },
 
@@ -4899,8 +5094,20 @@ export const useStore = create<AppState>((set, get) => ({
             )
             if (completedCheckpoints.length > 0) {
               try {
+                const knownModels = new Set(get().models.map(model => model.model_type))
                 await api.reloadModels()
-                await get().loadModels()
+                await get().loadModels({ catalogOnly: true })
+                const availableModels = new Set(get().models.map(model => model.model_type))
+                const imported = completedCheckpoints
+                  .flatMap(download => download.model_types || [download.model_type!])
+                  .filter(modelType => !knownModels.has(modelType) && availableModels.has(modelType))
+                set(state => {
+                  if (imported.length === 0) return state
+                  const enabledModels = new Set(state.enabledModels)
+                  imported.forEach(modelType => enabledModels.add(modelType))
+                  _saveEnabledModels(enabledModels)
+                  return { enabledModels }
+                })
                 completedCheckpoints.forEach(download => {
                   _civitRefreshedCheckpointDownloads.add(download.id)
                 })
@@ -5003,7 +5210,7 @@ export const useStore = create<AppState>((set, get) => ({
     modelVisibilityFocus: mode,
   }),
   clearModelVisibilityFocus: () => set({ modelVisibilityFocus: null }),
-  loadModels: async () => {
+  loadModels: async (options) => {
     try {
       const shouldHydrateVisibility = !_modelVisibilityHydrated
       const shouldHydrateH3WindowOverrides = !_h3WindowOverridesHydrated
@@ -5043,6 +5250,14 @@ export const useStore = create<AppState>((set, get) => ({
       }))
       // Inject virtual SFX (MMAudio) models alongside backend models
       const models = [...backendModels, ...SFX_VIRTUAL_MODELS]
+
+      // Installing a checkpoint refreshes the catalog while a user may be
+      // composing or generating. Boot-time preference/default hydration
+      // would overwrite those current inputs and re-enable old selections.
+      if (options?.catalogOnly && get().modelsLoaded) {
+        set({ families, models })
+        return
+      }
 
       if (shouldHydrateH3WindowOverrides && h3WindowPreferences) {
         _h3WindowOverridesHydrated = true
@@ -5153,6 +5368,11 @@ export const useStore = create<AppState>((set, get) => ({
         studioPreferences?.inference_steps_per_model ?? saved?.inferenceStepsPerModel,
       )
       set({ inferenceStepsPerModel: restoredInferenceSteps })
+      if (shouldHydrateStudioPreferences && !_kreaIdentitySettingsChanged) {
+        set({ kreaIdentitySettingsPerModel: _normalizeRememberedKreaSettings(
+          studioPreferences?.krea_identity_settings_per_model ?? saved?.kreaIdentitySettingsPerModel,
+        ) })
+      }
       const selectedModelPerMode: Partial<Record<GenerationMode, string>> = {
         ...(saved?.selectedModelPerMode || {}),
         ...(durableConfigured
@@ -5325,7 +5545,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       if (
         mode === 'video'
-        && (get().studioVideoWorkflow === 'frames' || get().studioVideoWorkflow === 'references')
+        && ['frames', 'references', 'avatar'].includes(get().studioVideoWorkflow)
       ) {
         get().setStudioVideoCreateRoute(get().studioVideoCreateRoute)
       }
@@ -5355,6 +5575,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
     } catch (e) {
       console.error('Failed to load models:', e)
+      if (options?.catalogOnly) throw e
     }
   },
 
@@ -5414,7 +5635,7 @@ export const useStore = create<AppState>((set, get) => ({
     const isLtx = options?.multi_window_sequence_controls === true
     const sw = options?.sliding_window_defaults
     const minimumFrames = options?.frames_minimum || fps
-    const maximumFrames = options?.frames_maximum || Math.round(3600 * fps)
+    const maximumFrames = h3MaximumFrames(options, state.params.minimax_h3_extended_duration) || Math.round(3600 * fps)
     const step = Math.max(1, options?.frames_steps || 1)
     const context = state.studioVideoWorkflow === 'extend' && options?.sliding_window
       ? Math.max(0, state.slidingWindowOverlap - 1) : 0
@@ -5432,11 +5653,12 @@ export const useStore = create<AppState>((set, get) => ({
           state.systemStats?.gpu.vram_total_gb ?? 0, minimumFrames, maximumFrames, step)
       : recommendedH3PassProfile(policy, state.params.resolution, state.systemStats?.gpu.vram_total_gb ?? 0)
     const windowMin = sw?.window_min ?? minimumFrames
-    const windowMax = sw?.window_max ?? maximumFrames
+    const windowMax = state.params.minimax_h3_extended_duration && supportsH3ExtendedDuration(options)
+      ? maximumFrames : sw?.window_max ?? maximumFrames
     const capFrames = Math.max(windowMin, Math.min(windowMax,
       state.slidingWindowLocked ? Math.round(state.slidingWindowSeconds * fps)
         : recommendation?.frames ?? (recommendation?.supported === false ? windowMin : windowMax)))
-    if (isH3 && frames + context <= capFrames) {
+    if (isH3 && frames + context <= capFrames + 1) {
       frames = Math.max(Math.round(minimum * fps), normalizeH3NativeFrames(
         frames + context, minimumFrames, maximumFrames, step) - context)
       seconds = frames / fps
@@ -5467,7 +5689,9 @@ export const useStore = create<AppState>((set, get) => ({
       ...(options?.omni_reference ? { minimax_h3_sequence_clip_frames: windowFrames } : {}) }
     delete nextParams.ltx_window_prompts
     set({ durationSeconds: seconds, slidingWindowSeconds: windowFrames / fps,
-      params: nextParams, h3WindowPlan: null, promptEnhanceError: null })
+      params: nextParams,
+      h3WindowPlan: null,
+      promptEnhanceError: null })
     get().syncClipCount()
   },
 
@@ -5476,15 +5700,22 @@ export const useStore = create<AppState>((set, get) => ({
 
   slidingWindowSeconds: 5,
   setSlidingWindowSeconds: (s) => {
-    const options = get().modelOptions
+    const state = get()
+    const options = state.modelOptions
     const fps = options?.fps ?? 16
     const swDefaults = options?.sliding_window_defaults
+    const isH3 = String(options?.architecture || '').startsWith('minimax_h3')
+    const isLtxSequence = options?.multi_window_sequence_controls === true
+    const h3Maximum = h3MaximumFrames(
+      options,
+      state.params.minimax_h3_extended_duration,
+    ) ?? 345
     let frames = Math.round(s * fps)
-    if (String(options?.architecture || '').startsWith('minimax_h3')) {
+    if (isH3) {
       frames = normalizeH3NativeFrames(
         frames,
         options?.frames_minimum ?? 124,
-        options?.frames_maximum ?? 345,
+        h3Maximum,
         options?.frames_steps ?? 17,
       )
     } else if (swDefaults) {
@@ -5495,26 +5726,100 @@ export const useStore = create<AppState>((set, get) => ({
       frames = Math.max(minimum, Math.min(maximum, frames))
     }
     const seconds = frames / fps
-    if (Math.abs(get().slidingWindowSeconds - seconds) < 1e-8
-      && get().params.sliding_window_size === frames) return
-    set(state => {
-      const nextParams = {
-        ...state.params,
-        sliding_window_size: frames,
-        ...(
-          state.modelOptions?.omni_reference === true
-          && state.params.minimax_h3_reference_sequence === true
-            ? { minimax_h3_sequence_clip_frames: frames }
-            : {}
-        ),
+    if (Math.abs(state.slidingWindowSeconds - seconds) < 1e-8
+      && state.params.sliding_window_size === frames) return
+
+    const preserveWindowCount = state.generationMode === 'video'
+      && state.params._duration_planning_mode === 'windows'
+      && (isH3 || isLtxSequence || options?.sliding_window === true)
+    let nextDuration: number | undefined
+    let nextWindowCount: number | undefined
+    if (preserveWindowCount) {
+      const hardCutOmni = options?.omni_reference === true
+        && state.params.minimax_h3_sequence_continuity === false
+      const overlapFrames = hardCutOmni
+        ? 0
+        : _normalizeSlidingWindowOverlap(state.slidingWindowOverlap, swDefaults)
+      const discardFrames = hardCutOmni
+        ? 0
+        : swDefaults?.discard_last_frames ?? 0
+      const normalizeWindowFrames = (value: number) => {
+        if (isH3) {
+          return normalizeH3NativeFrames(
+            value,
+            options?.frames_minimum ?? 124,
+            // The experiment may have just been disabled. Count the old
+            // timeline with its actual capacity before applying the new cap.
+            Math.max(h3Maximum, value),
+            options?.frames_steps ?? 17,
+          )
+        }
+        return normalizeSlidingWindowFrames(value, swDefaults)
       }
-      delete nextParams.ltx_window_prompts
-      return {
-        slidingWindowSeconds: seconds,
-        params: nextParams,
-        h3WindowPlan: null,
-        promptEnhanceError: null,
-      }
+      const oldWindowFrames = normalizeWindowFrames(
+        Math.round(state.slidingWindowSeconds * fps),
+      )
+      const firstWindowFrames = (state.studioVideoWorkflow === 'extend'
+        && options?.sliding_window === true
+        && !hardCutOmni)
+        ? continuationFirstWindowFrames(oldWindowFrames, overlapFrames)
+        : oldWindowFrames
+      const durationFrames = isH3
+        ? h3TimelineFrames(state.durationSeconds, fps, h3Maximum)
+        : Math.max(1, Math.round(state.durationSeconds * fps))
+      const currentPlan = durationWindowPlan(
+        durationFrames / fps,
+        oldWindowFrames / fps,
+        overlapFrames / fps,
+        discardFrames / fps,
+        firstWindowFrames / fps,
+      )
+      const nextFirstWindowFrames = (state.studioVideoWorkflow === 'extend'
+        && options?.sliding_window === true
+        && !hardCutOmni)
+        ? continuationFirstWindowFrames(frames, overlapFrames)
+        : frames
+      const nextPlan = wholeWindowDuration(
+        currentPlan.windowCount,
+        seconds,
+        overlapFrames / fps,
+        discardFrames / fps,
+        3600,
+        nextFirstWindowFrames / fps,
+      )
+      const totalFrames = Math.max(1, Math.round(nextPlan.generatedSeconds * fps))
+      nextDuration = totalFrames / fps
+      nextWindowCount = nextPlan.windowCount
+    }
+
+    const nextParams = {
+      ...state.params,
+      sliding_window_size: frames,
+      ...(nextDuration == null ? {} : {
+        video_length: Math.max(1, Math.round(nextDuration * fps)),
+      }),
+      ...(
+        options?.omni_reference === true
+        && (state.params.minimax_h3_reference_sequence === true || preserveWindowCount)
+          ? { minimax_h3_sequence_clip_frames: frames }
+          : {}
+      ),
+      ...(preserveWindowCount && (isH3 || isLtxSequence)
+        ? {
+            [options?.omni_reference === true
+              ? 'minimax_h3_reference_sequence'
+              : isLtxSequence ? 'ltx_multi_window' : 'minimax_h3_multi_window']:
+              (nextWindowCount ?? 1) > 1,
+          }
+        : {}),
+    }
+    delete nextParams.ltx_window_prompts
+    set({
+      slidingWindowSeconds: seconds,
+      ...(nextDuration == null ? {} : { durationSeconds: nextDuration }),
+      params: nextParams,
+      h3WindowPlan: null,
+      promptEnhanceError: null,
     })
     get().syncClipCount()
   },
@@ -5537,6 +5842,32 @@ export const useStore = create<AppState>((set, get) => ({
     })
   },
   slidingWindowLocked: false,
+  setH3ExtendedDuration: (enabled) => {
+    const state = get()
+    if (!supportsH3ExtendedDuration(state.modelOptions)) return
+    const fps = state.modelOptions?.fps ?? 24
+    const frames = h3MaximumFrames(state.modelOptions, enabled) ?? 345
+    const preserveWindowCount = state.generationMode === 'video'
+      && state.params._duration_planning_mode === 'windows'
+    const manualWindow = enabled || preserveWindowCount
+    set({
+      slidingWindowLocked: manualWindow,
+      h3WindowPlan: null,
+      promptEnhanceError: null,
+      params: { ...state.params,
+        minimax_h3_extended_duration: enabled,
+        sliding_window_memory_override: manualWindow,
+        minimax_h3_sequence_memory_override: manualWindow,
+        minimax_h3_sequence_clip_frames: frames,
+        // Time keeps its target; Window keeps its count. Auto exits when
+        // enabling an experimental manual limit.
+        ...(enabled && !preserveWindowCount
+          ? { _duration_planning_mode: 'duration' as const } : {}),
+      },
+    })
+    get().setSlidingWindowSeconds(frames / fps)
+    get().setDurationSeconds(get().durationSeconds)
+  },
   setSlidingWindowLocked: (locked) => set(state => {
     const isH3 = String(state.modelOptions?.architecture || '').startsWith('minimax_h3')
     return {
@@ -6135,7 +6466,7 @@ export const useStore = create<AppState>((set, get) => ({
     let state = get()
     const primaryStudioCreate = (
       state.generationMode === 'video'
-      && (state.studioVideoWorkflow === 'frames' || state.studioVideoWorkflow === 'references')
+      && ['frames', 'references', 'avatar'].includes(state.studioVideoWorkflow)
       && Number(state.params.image_mode) === 0
     )
     if (primaryStudioCreate) {
@@ -6164,6 +6495,11 @@ export const useStore = create<AppState>((set, get) => ({
     const selectedModelDefinition = state.models.find(
       model => model.model_type === state.params.model_type,
     )
+    if (state.generationMode === 'video' && state.studioVideoWorkflow !== 'avatar'
+      && isLongCatAvatarModel(selectedModelDefinition)) {
+      set({ promptEnhanceError: 'Choose a video model for this workflow. LongCat Avatar uses the Avatar workflow.' })
+      return
+    }
     const activeCreateInput = primaryStudioCreate
       ? _studioCreateInputState(state)
       : null
@@ -6177,7 +6513,8 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         promptEnhanceError: activeCreateInput.conflict
           ? 'Fixed start/end/keyframes cannot be combined with Omni references. Remove one of those input roles to continue.'
-          : `No enabled model can use the current ${activeCreateRoute === 'omni' ? 'reference' : activeCreateRoute === 'guided' ? 'frame-guided' : activeCreateRoute === 'audio' ? 'audio-driven' : 'text'} inputs.`,
+          : activeCreateRoute === 'avatar' ? 'Enable or select a LongCat Avatar model.'
+            : `No enabled model can use the current ${activeCreateRoute === 'omni' ? 'reference' : activeCreateRoute === 'guided' ? 'frame-guided' : activeCreateRoute === 'audio' ? 'audio-driven' : 'text'} inputs.`,
       })
       return
     }
@@ -6194,6 +6531,10 @@ export const useStore = create<AppState>((set, get) => ({
         && state.params.frames_positions
       )
     )
+    if (primaryStudioCreate && state.studioVideoWorkflow === 'avatar') {
+      const error = studioAvatarInputError(state)
+      if (error) { set({ promptEnhanceError: error }); return }
+    }
     if (activeCreateRoute === 'guided' && !hasGuidedCreateInput) {
       set({ promptEnhanceError: 'Guided video needs a start frame, end frame, or timed frame.' })
       return
@@ -6888,7 +7229,7 @@ export const useStore = create<AppState>((set, get) => ({
       params._studio_video_workflow = state.studioVideoWorkflow
     }
     const useStudioFrameInputs = state.studioVideoWorkflow !== 'animate'
-      && (!primaryStudioCreate || activeCreateRoute === 'guided')
+      && (!primaryStudioCreate || activeCreateRoute === 'guided' || activeCreateRoute === 'avatar')
     if (primaryStudioCreate && activeCreateRoute === 'generate') {
       // Generate is deliberately text-only. Preserve any hidden Guided inputs
       // in Studio state so switching back restores them, but never let those
@@ -6943,7 +7284,7 @@ export const useStore = create<AppState>((set, get) => ({
       const fps = state.modelOptions?.fps ?? 16
       const supportsSlidingWindows = state.modelOptions?.sliding_window === true
       const minimumFrames = state.modelOptions?.frames_minimum ?? 1
-      const maximumFrames = state.modelOptions?.frames_maximum ?? null
+      const maximumFrames = h3MaximumFrames(state.modelOptions, params.minimax_h3_extended_duration)
       const h3ReferenceSequenceRequested = (
         isOmniReference
         && params.minimax_h3_reference_sequence === true
@@ -7004,6 +7345,22 @@ export const useStore = create<AppState>((set, get) => ({
         requestedMinimumFrames,
         Math.round(state.durationSeconds * fps),
       )
+      const preserveRollingFramesTimeline = isH3RollingFramesTimeline({
+        framesWorkflow: state.studioVideoWorkflow === 'frames',
+        multiWindowRequested: h3FirstLastMultiWindowRequested,
+        omniReference: isOmniReference,
+        requestedFrames,
+        continuationContextFrames: continuationSourceContextFrames,
+        selectedWindowFrames: supportsSlidingWindows
+          ? normalizeSlidingWindowFrames(selectedWindowFrames, {
+              ...state.modelOptions?.sliding_window_defaults,
+              window_max: params.minimax_h3_extended_duration === true
+                && supportsH3ExtendedDuration(state.modelOptions)
+                ? maximumFrames ?? state.modelOptions?.sliding_window_defaults?.window_max
+                : state.modelOptions?.sliding_window_defaults?.window_max,
+            })
+          : selectedWindowFrames,
+      })
       if (h3DirectOmniPass && maximumFrames != null) {
         // Ordinary Omni generation is one native pass. Duration is the
         // user's requested pass length; Window Length is only the VRAM-aware
@@ -7030,27 +7387,26 @@ export const useStore = create<AppState>((set, get) => ({
         supportsSlidingWindows
         && maximumFrames != null
         && requestedFrames + continuationSourceContextFrames <= maximumFrames + 1
+        && !preserveRollingFramesTimeline
       ) {
         requestedFrames = Math.min(
           maximumFrames - continuationSourceContextFrames,
           requestedFrames,
         )
       }
-      if (
-        isH3Model
-        && maximumFrames != null
-        && requestedFrames + continuationSourceContextFrames <= maximumFrames + 1
-      ) {
-        // Uploaded audio/video and old sidecars describe ordinary seconds.
-        // Convert values such as 5.0s = 120 frames to H3's first legal clip
-        // (124), and do this after all single-pass clamps so an old 5.0s
-        // window preference cannot reintroduce the invalid value.
-        requestedFrames = normalizeH3ClipFrames(
-          requestedFrames + continuationSourceContextFrames,
+      if (isH3Model && maximumFrames != null) {
+        // A rolling Frames storyboard can end on a partial continuation span;
+        // snapping its total timeline onto the native clip lattice creates an
+        // extra window (for example 336 becomes 345 at 24 fps). Single-pass,
+        // References, and continuation jobs keep their existing native repair.
+        requestedFrames = normalizeH3TimelineFramesForSubmission({
+          requestedFrames,
           minimumFrames,
           maximumFrames,
-          state.modelOptions?.frames_steps ?? 17,
-        ) - continuationSourceContextFrames
+          frameStep: state.modelOptions?.frames_steps ?? 17,
+          continuationContextFrames: continuationSourceContextFrames,
+          preserveRollingFramesTimeline,
+        })
       }
       params.video_length = requestedFrames
       if (h3ReferenceSequenceRequested && effectiveH3SequenceClipFrames != null
@@ -7066,22 +7422,26 @@ export const useStore = create<AppState>((set, get) => ({
           ? requestedFrames
           : Math.round(state.slidingWindowSeconds * fps)
         if (swDefaults) {
-          const windowMinimum = swDefaults.window_min ?? 1
-          const windowMaximum = swDefaults.window_max ?? windowFrames
-          const windowStep = Math.max(1, swDefaults.window_step ?? 1)
-          windowFrames = windowMinimum
-            + Math.round((windowFrames - windowMinimum) / windowStep) * windowStep
-          windowFrames = Math.max(
-            windowMinimum,
-            Math.min(windowMaximum, windowFrames),
-          )
+          const windowMaximum = params.minimax_h3_extended_duration && supportsH3ExtendedDuration(state.modelOptions)
+            ? maximumFrames ?? windowFrames : swDefaults.window_max ?? windowFrames
+          windowFrames = normalizeSlidingWindowFrames(windowFrames, {
+            ...swDefaults,
+            window_max: windowMaximum,
+          })
         }
         params.sliding_window_size = windowFrames
         params.sliding_window_overlap = _normalizeSlidingWindowOverlap(
           state.slidingWindowOverlap,
           swDefaults,
         )
-        params.sliding_window_discard_last_frames = swDefaults?.discard_last_frames ?? 0
+        const h3FramesStoryboardRequested = (
+          state.studioVideoWorkflow === 'frames'
+          && h3FirstLastMultiWindowRequested
+          && !isOmniReference
+        )
+        params.sliding_window_discard_last_frames = h3FramesStoryboardRequested
+          ? resolveH3StoryboardDiscardFrames(swDefaults, params.custom_settings)
+          : swDefaults?.discard_last_frames ?? 0
         if (isH3Model) {
           const nativeRecommendation = h3DirectOmniPass
             ? recommendedH3PassProfile(
@@ -7251,11 +7611,11 @@ export const useStore = create<AppState>((set, get) => ({
       params.override_attention = (
         params.override_attention === 'sdpa' ? 'sdpa' : 'sla'
       )
-    } else if (
-      state.modelOptions?.sol_attention
-      && state.modelOptions.sol_attention_status?.supported
-    ) {
-      params.override_attention = params.override_attention === 'sol' ? 'sol' : ''
+    } else if (state.modelOptions?.sol_attention) {
+      params.override_attention = params.override_attention === 'sdpa'
+        ? 'sdpa'
+        : params.override_attention === 'sol'
+          && state.modelOptions.sol_attention_status?.supported ? 'sol' : ''
     } else {
       delete params.override_attention
     }
@@ -7448,6 +7808,9 @@ export const useStore = create<AppState>((set, get) => ({
           ? state.imageWorkflowMaskPath
           : undefined
         params.video_prompt_type = state.modelOptions?.inpaint_video_prompt_type || 'VAG'
+        if (state.modelOptions?.image_ref_inpaint && state.imageRefs.length > 0) {
+          params.video_prompt_type += 'I'
+        }
         params.video_guide_outpainting = workflow === 'outpaint'
           ? [
               state.imageOutpaintPadding.top,
@@ -7456,16 +7819,17 @@ export const useStore = create<AppState>((set, get) => ({
               state.imageOutpaintPadding.right,
             ].join(' ')
           : ''
-        delete params.image_refs
+        if (!state.modelOptions?.image_ref_inpaint) delete params.image_refs
         params.remove_background_images_ref = 0
       } else {
-        delete params.image_guide
+        if (!String(params.video_prompt_type || '').includes('V')) delete params.image_guide
         delete params.image_mask
         delete params.video_guide_outpainting
         if (workflow === 'generate' && state.imageRefs.length === 0) {
           delete params.image_refs
           params.remove_background_images_ref = 0
-          params.video_prompt_type = ''
+          // Control-image transfer can be used without reference images.
+          params.video_prompt_type = String(params.video_prompt_type || '').replace(/[KI]/g, '')
         }
       }
     }
@@ -7481,6 +7845,16 @@ export const useStore = create<AppState>((set, get) => ({
       if (state.audioSubMode === 'music') {
         params._music_description = state.musicDescription || ''
         params._music_instrumental = !!state.musicInstrumental
+        if (params.model_type === 'yue2' || state.modelOptions?.yue2_composition) {
+          const musicSettings = {...(params.custom_settings as Record<string, unknown> | undefined), instrumental: !!state.musicInstrumental}
+          params.custom_settings = musicSettings
+          if (state.musicInstrumental) {
+            params.model_mode = 0
+            params.custom_settings = {...musicSettings, abc: ''}
+            params.audio_prompt_type = ''
+            delete params.audio_guide
+          }
+        }
       }
       if (state.audioSubMode === 'sfx') {
         // SFX mode: use MMAudio to generate sound effects
@@ -7667,6 +8041,10 @@ export const useStore = create<AppState>((set, get) => ({
         if (params.input_video_strength == null) params.input_video_strength = _defaultIVS
       } catch (e) {
         console.error('Failed to upload start image:', e)
+        if (state.studioVideoWorkflow === 'avatar') {
+          set({ promptEnhanceError: 'The Avatar anchor image could not be uploaded. Try selecting it again.' })
+          return
+        }
       }
     } else if (!isOmniReference && useStudioFrameInputs && params.image_start && state.generationMode !== 'image') {
       // Re-roll case: image_start is already an absolute path from sidecar metadata
@@ -7675,7 +8053,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (!ipt.includes('S')) params.image_prompt_type = 'S' + ipt
       if (params.input_video_strength == null) params.input_video_strength = _defaultIVS
     }
-    if (!isOmniReference && useStudioFrameInputs && state.endImage) {
+    if (!isOmniReference && useStudioFrameInputs && state.studioVideoWorkflow !== 'avatar' && state.endImage) {
       try {
         const result = await api.uploadImage(state.endImage)
         params.image_end = result.path
@@ -7684,7 +8062,7 @@ export const useStore = create<AppState>((set, get) => ({
       } catch (e) {
         console.error('Failed to upload end image:', e)
       }
-    } else if (!isOmniReference && useStudioFrameInputs && params.image_end) {
+    } else if (!isOmniReference && useStudioFrameInputs && state.studioVideoWorkflow !== 'avatar' && params.image_end) {
       const ipt = (params.image_prompt_type as string) || ''
       if (!ipt.includes('E')) params.image_prompt_type = ipt + 'E'
     }
@@ -7744,7 +8122,7 @@ export const useStore = create<AppState>((set, get) => ({
     ) && (
       state.generationMode !== 'image'
       || state.studioImageWorkflow === 'generate'
-      || !!state.modelOptions?.image_ref_choices
+      || !!state.modelOptions?.image_ref_inpaint
     )
     const imageReferenceChoices = state.modelOptions?.image_ref_choices?.choices ?? []
     const effectiveImageRefType = state.imageRefType || (
@@ -7754,7 +8132,8 @@ export const useStore = create<AppState>((set, get) => ({
           ? 'I'
           : imageReferenceChoices[0]?.[1] || ''
     )
-    if (imageReferenceWorkflowActive && effectiveImageRefType && state.imageRefs.length > 0) {
+    if (imageReferenceWorkflowActive && effectiveImageRefType && state.imageRefs.length > 0
+      && !(state.studioVideoWorkflow === 'avatar' && params.image_start)) {
       const refPaths: string[] = []
       for (const file of state.imageRefs) {
         try {
@@ -7762,6 +8141,10 @@ export const useStore = create<AppState>((set, get) => ({
           refPaths.push(result.path)
         } catch (e) {
           console.error('Failed to upload reference image:', e)
+          if (state.studioVideoWorkflow === 'avatar') {
+            set({ promptEnhanceError: 'The Avatar anchor image could not be uploaded. Try selecting it again.' })
+            return
+          }
         }
       }
       if (refPaths.length > 0) {
@@ -7806,6 +8189,30 @@ export const useStore = create<AppState>((set, get) => ({
       if (params.image_refs !== undefined && (!params.image_refs || (params.image_refs as string[]).length === 0)) {
         delete params.image_refs
       }
+    }
+
+    if (state.generationMode === 'video' && state.studioVideoWorkflow === 'avatar') {
+      const startPaths = Array.isArray(params.image_start) ? params.image_start : [params.image_start]
+      const referencePaths = Array.isArray(params.image_refs) ? params.image_refs : []
+      const anchorPath = [...startPaths, ...referencePaths].find(path => typeof path === 'string' && path.trim())
+      if (!anchorPath) {
+        set({ promptEnhanceError: 'Avatar needs an uploaded anchor image before generation.' })
+        return
+      }
+      const multiSpeaker = isMultiSpeakerAvatarModel(selectedModelDefinition)
+      // The model's native Anchor Reference Image contract, rather than hidden
+      // Frames/end/control inputs inherited from a previously opened workflow.
+      Object.assign(params, {
+        image_refs: [anchorPath], video_prompt_type: 'KI', image_prompt_type: '',
+        image_start: undefined, image_end: undefined, frames_positions: undefined,
+        video_source: undefined, video_guide: undefined, video_mask: undefined,
+        remove_background_images_ref: 0,
+        audio_prompt_type: multiSpeaker ? 'AB' : 'A',
+        audio_guide2: multiSpeaker ? params.audio_guide2 : undefined,
+        speakers_locations: multiSpeaker
+          ? params.speakers_locations ?? DEFAULT_AVATAR_SPEAKER_LOCATIONS : undefined,
+        audio_guide3: undefined, audio_guide4: undefined, audio_guide5: undefined, audio_guide6: undefined,
+      })
     }
 
     // Optional LTX ID-LoRA voice reference. H3 Omni audio references use
@@ -7873,6 +8280,26 @@ export const useStore = create<AppState>((set, get) => ({
     const h3PlanActive = h3WindowStoryboardActive || (
       h3ReferenceSequenceActive && !h3ManualReferenceSequence
     )
+    if (
+      h3WindowStoryboardActive
+      && state.studioVideoWorkflow === 'frames'
+      && isH3Model
+      && !isOmniReference
+      && state.h3WindowPlan
+      && !h3SlidingWindowPlanMatchesTiming(state.h3WindowPlan, {
+        sourcePrompt: String(params.prompt || ''),
+        modelType: String(params.model_type || ''),
+        resolution: String(params.resolution || ''),
+        totalFrames: Number(params.video_length || 0),
+        windowFrames: Number(params.sliding_window_size || 0),
+        overlapFrames: Number(params.sliding_window_overlap || 0),
+        discardFrames: Number(params.sliding_window_discard_last_frames || 0),
+        cameraCoverage: String(params.minimax_h3_camera_coverage || 'auto'),
+      })
+    ) {
+      set({promptEnhanceError: 'The reviewed H3 window prompts no longer match the current Frames timing. Press Enhance to rebuild the plan before generating.'})
+      return
+    }
     if (h3ManualFirstLastSequence) {
       params.minimax_h3_window_storyboard = false
       params.h3_window_prompts = h3ManualFirstLastPrompts ?? []
@@ -7964,6 +8391,8 @@ export const useStore = create<AppState>((set, get) => ({
       outputFiles: [],
       error: null,
       oomInfo: null,
+      preview: null,
+      previewNotice: null,
     }
 
     set(s => ({
@@ -8067,6 +8496,7 @@ export const useStore = create<AppState>((set, get) => ({
               h3WindowPlan: status.h3_window_plan ?? j.h3WindowPlan ?? null,
               enhancement: status.enhancement ?? j.enhancement,
               ..._adaptiveEtaJobFields(status),
+              ..._previewJobFields(status),
             }),
           }))
 
@@ -8223,7 +8653,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   reconnectJobs: async (confirmedJob) => {
-    // On page load, check backend for any active jobs and restore them
+    // Restore active work and saved enhancement history without replaying
+    // notifications for jobs that already ended before this browser connected.
     try {
       // A retry response is already authoritative. Do not delay its visible
       // acceptance or polling behind another request for queue history.
@@ -8234,6 +8665,7 @@ export const useStore = create<AppState>((set, get) => ({
           .filter(j => !existingIds.has(j.job_id))
           .map(j => ({
             id: j.job_id,
+            restoredFromHistory: true,
             showInGallery: j.show_in_gallery === true,
             kind: j.kind || 'generation',
             status: j.status as GenerationJob['status'],
@@ -8248,6 +8680,7 @@ export const useStore = create<AppState>((set, get) => ({
             h3WindowPlan: j.h3_window_plan ?? null,
             enhancement: j.enhancement,
             ..._adaptiveEtaJobFields(j),
+            ..._previewJobFields(j),
           }))
         // A successful retry is already accepted even if the history refresh
         // fails or is briefly stale. Publish and poll that confirmed job too.
@@ -8261,8 +8694,11 @@ export const useStore = create<AppState>((set, get) => ({
               j => j.status === 'queued' || j.status === 'running',
             ),
           }))
-          // Start polling for each reconnected job
-          newJobs.forEach(job => {
+          // Saved terminal entries remain available for review, but only
+          // unfinished work needs polling (and future terminal notifications).
+          const activeJobs = newJobs.filter(job =>
+            job.status === 'held' || job.status === 'queued' || job.status === 'running')
+          activeJobs.forEach(job => {
             const pollInterval = setInterval(async () => {
               try {
                 const status = await api.fetchJobStatus(job.id)
@@ -8283,6 +8719,7 @@ export const useStore = create<AppState>((set, get) => ({
                     h3WindowPlan: status.h3_window_plan ?? j.h3WindowPlan ?? null,
               enhancement: status.enhancement ?? j.enhancement,
                     ..._adaptiveEtaJobFields(status),
+                    ..._previewJobFields(status),
                   }),
                 }))
                 if (status.status === 'completed' || status.status === 'failed' || status.status === 'cancelled') {
@@ -8313,7 +8750,7 @@ export const useStore = create<AppState>((set, get) => ({
               }
             }, 2000)
           })
-          console.log(`[Queue] Reconnected to ${newJobs.length} active job(s)`)
+          console.log(`[Queue] Restored ${newJobs.length} job(s), ${activeJobs.length} active`)
         }
       }
     } catch {
@@ -8698,6 +9135,9 @@ export const useStore = create<AppState>((set, get) => ({
           flow_shift: params.flow_shift,
           self_refiner_setting: params.self_refiner_setting,
           stage2_steps: params.stage2_steps,
+          ...(isKreaIdentityEdit(params.model_type)
+            ? { custom_settings: { ...normalizeKreaIdentitySettings(params.custom_settings) } }
+            : {}),
         },
       })
       set(s => ({ presets: [...s.presets, preset] }))
@@ -8717,6 +9157,7 @@ export const useStore = create<AppState>((set, get) => ({
       loraWeights: preset.lora_weights || {},
     }))
     _rememberInferenceSteps(get, set, get().params.model_type, newParams.num_inference_steps)
+    if (newParams.custom_settings) _rememberKreaIdentitySettings(get, set, get().params.model_type, newParams.custom_settings)
   },
 
   deletePreset: async (id) => {
@@ -8744,15 +9185,30 @@ export const useStore = create<AppState>((set, get) => ({
       // model's values — last requested wins.
       if (seq !== _modelOptionsSeq) return
       const activeState = get()
+      const sameH3FramesRefresh = activeState.modelOptions?.model_type === modelType
+        && activeState.params.model_type === modelType
+        && activeState.studioVideoWorkflow === 'frames'
+        && String(activeState.modelOptions?.architecture || '').startsWith('minimax_h3')
+        && activeState.modelOptions?.omni_reference !== true
+        && String(options.architecture || '').startsWith('minimax_h3')
+        && options.omni_reference !== true
       const { durationSeconds, slidingWindowSeconds } = activeState
       const fps = options.fps || 16
       // Set overlap from model defaults
       const swDefaults = (options as unknown as Record<string, unknown>).sliding_window_defaults as Record<string, number> | undefined
-      const overlapDefault = swDefaults?.overlap_default ?? 5
-      const discardDefault = swDefaults?.discard_last_frames ?? 0
+      const overlapDefault = sameH3FramesRefresh
+        ? _normalizeSlidingWindowOverlap(activeState.slidingWindowOverlap, swDefaults)
+        : swDefaults?.overlap_default ?? 5
+      const storedDiscard = Number(activeState.params.sliding_window_discard_last_frames)
+      const discardDefault = sameH3FramesRefresh && Number.isFinite(storedDiscard)
+        ? Math.max(0, storedDiscard)
+        : swDefaults?.discard_last_frames ?? 0
       const minimumDuration = Math.max(1, (options.frames_minimum || fps) / fps)
-      const nativeMaximumDuration = options.frames_maximum
-        ? options.frames_maximum / fps
+      const extendedDuration = activeState.params.minimax_h3_extended_duration === true
+        && supportsH3ExtendedDuration(options)
+      const effectiveMaximumFrames = h3MaximumFrames(options, extendedDuration)
+      const nativeMaximumDuration = effectiveMaximumFrames
+        ? effectiveMaximumFrames / fps
         : null
       const h3ReferenceSequence = (
         options.omni_reference === true
@@ -8766,11 +9222,15 @@ export const useStore = create<AppState>((set, get) => ({
         : (!options.sliding_window && nativeMaximumDuration
             ? nativeMaximumDuration
             : Number.POSITIVE_INFINITY)
-      let nextDurationSeconds = Math.min(
-        maximumDuration,
-        Math.max(minimumDuration, durationSeconds),
-      )
+      let nextDurationSeconds = sameH3FramesRefresh
+        ? durationSeconds
+        : Math.min(
+            maximumDuration,
+            Math.max(minimumDuration, durationSeconds),
+          )
       if (
+        !sameH3FramesRefresh
+        &&
         options.sliding_window
         && nativeMaximumDuration
         && nextDurationSeconds <= Math.round(nativeMaximumDuration * 10) / 10
@@ -8784,7 +9244,7 @@ export const useStore = create<AppState>((set, get) => ({
         )
       }
       let nextWindowFrames = Math.round(slidingWindowSeconds * fps)
-      if (options.sliding_window && swDefaults?.window_default != null) {
+      if (options.sliding_window && swDefaults?.window_default != null && !sameH3FramesRefresh) {
         nextWindowFrames = swDefaults.window_default
       }
       if (options.sliding_window && swDefaults) {
@@ -8809,6 +9269,10 @@ export const useStore = create<AppState>((set, get) => ({
       let nextResolutionPreset = activeState.resolutionPreset
       let nextAspectRatio = activeState.aspectRatio
       const modelPresetOrder = options.resolution_preset_order || []
+      if (nextResolutionPreset === '2k' && !modelPresetOrder.includes('2k')) {
+        nextResolutionPreset = '720p'
+        paramUpdates.resolution = resolveResolution(options, nextResolutionPreset, nextAspectRatio)
+      }
       if (modelPresetOrder.length > 0) {
         if (!modelPresetOrder.includes(nextResolutionPreset)) {
           // A model-specific list can contain an expensive experimental tier
@@ -8866,18 +9330,21 @@ export const useStore = create<AppState>((set, get) => ({
               selectedResolution,
               activeState.systemStats?.gpu.vram_total_gb ?? 0,
             )
-        const selectedFrames = savedOverride ?? recommendation?.frames
+        const selectedFrames = sameH3FramesRefresh || extendedDuration
+          ? Math.round(slidingWindowSeconds * fps) : savedOverride ?? recommendation?.frames
         if (selectedFrames != null) {
           nextWindowFrames = normalizeH3NativeFrames(
             selectedFrames,
             options.frames_minimum ?? 124,
-            options.frames_maximum ?? 345,
+            effectiveMaximumFrames ?? 345,
             options.frames_steps ?? 17,
           )
           nextWindowSeconds = nextWindowFrames / fps
           paramUpdates.sliding_window_size = nextWindowFrames
         }
-        nextWindowLocked = savedOverride != null
+        nextWindowLocked = sameH3FramesRefresh
+          ? activeState.slidingWindowLocked
+          : extendedDuration || savedOverride != null
         paramUpdates.sliding_window_memory_override = nextWindowLocked
         if (options.omni_reference === true) {
           paramUpdates.minimax_h3_sequence_memory_override = nextWindowLocked
@@ -8888,17 +9355,22 @@ export const useStore = create<AppState>((set, get) => ({
         const multiWindowEnabled = options.omni_reference === true
           ? h3ReferenceSequence
           : activeState.params.minimax_h3_multi_window === true
-        if (!multiWindowEnabled) {
+        if (!multiWindowEnabled && !sameH3FramesRefresh) {
           nextDurationSeconds = Math.min(nextDurationSeconds, nextWindowSeconds)
           paramUpdates.video_length = Math.round(nextDurationSeconds * fps)
         }
       }
       // Apply model defaults for inference steps and guidance scale
       if (options.default_num_inference_steps != null) {
-        paramUpdates.num_inference_steps = options.default_num_inference_steps
+        paramUpdates.num_inference_steps = activeState.params.minimax_h3_turbo_mode === false
+          && options.minimax_h3_turbo?.default_enabled
+          ? options.minimax_h3_turbo.unaccelerated_steps ?? options.default_num_inference_steps
+          : options.default_num_inference_steps
       }
       const rememberedSteps = _rememberedModelSteps(activeState, modelType, options)
       if (rememberedSteps != null) paramUpdates.num_inference_steps = rememberedSteps
+      const modelCustomSettings = _kreaCustomSettingsForModel(activeState.params.custom_settings, modelType, activeState.kreaIdentitySettingsPerModel)
+      paramUpdates.custom_settings = modelCustomSettings
       if (options.default_guidance_scale != null) {
         paramUpdates.guidance_scale = options.default_guidance_scale
       }
@@ -8941,7 +9413,22 @@ export const useStore = create<AppState>((set, get) => ({
       ) {
         paramUpdates.override_attention = ''
       }
+      if (options.minimax_h3_baked_turbo) {
+        const requestedAttention = get().params.override_attention
+        paramUpdates.override_attention = requestedAttention === 'sdpa'
+          ? 'sdpa'
+          : requestedAttention === 'sol' && options.sol_attention
+            && options.sol_attention_status?.supported ? 'sol' : ''
+        paramUpdates.skip_steps_cache_type = ''
+        paramUpdates.custom_settings = { ...modelCustomSettings, audio_refinement: 'none' }
+      }
       if (options.minimax_h3_turbo) {
+        // Undefined means a fresh model selection; an explicit false is a
+        // user opt-out (including restored settings) and must remain off.
+        const turboEnabled = get().params.minimax_h3_turbo_mode
+          ?? (activeState.params.model_type === modelType
+            && options.minimax_h3_turbo.default_enabled === true)
+        paramUpdates.minimax_h3_turbo_mode = turboEnabled
         const turboPresets = options.minimax_h3_turbo.presets?.length
           ? options.minimax_h3_turbo.presets
           : [{
@@ -8959,7 +9446,7 @@ export const useStore = create<AppState>((set, get) => ({
         // A restored Turbo preset always displays the same step count the
         // backend will enforce. This also closes a race where model defaults
         // (20 steps) arrive after the user checks Turbo (currently 8-step PDD).
-        if (get().params.minimax_h3_turbo_mode === true) {
+        if (turboEnabled) {
           paramUpdates.num_inference_steps = selectedPreset.steps
           const selectedRecipe = options.minimax_h3_turbo.presets?.find(preset => preset.id === selectedPreset.id)
           if (selectedRecipe?.generation_settings?.guidance_scale != null) {
@@ -9024,6 +9511,24 @@ export const useStore = create<AppState>((set, get) => ({
           ...paramUpdates,
         },
       }))
+      if (
+        options.minimax_h3_turbo?.default_enabled
+        && activeState.params.model_type === modelType
+        && activeState.params.minimax_h3_turbo_mode == null
+      ) {
+        const preset = options.minimax_h3_turbo.presets.find(
+          item => item.id === paramUpdates.minimax_h3_turbo_preset,
+        )
+        if (preset) {
+          // Use the same visible LoRA/weight state as the Turbo checkbox.
+          if (!get().params.activated_loras.includes(preset.filename)) {
+            get().toggleLora(preset.filename)
+          }
+          get().setLoraWeight(preset.filename, 0, preset.weight)
+          get().setParam('minimax_h3_turbo_preset', preset.id)
+          get().setParam('minimax_h3_turbo_mode', true)
+        }
+      }
     } catch {
       // Same staleness rule as the success path — a superseded request's
       // failure must not null out the newer request's options.
@@ -9116,10 +9621,12 @@ export const useStore = create<AppState>((set, get) => ({
       set({ servicesConfigLoading: false })
     }
   },
-  updateServicesConfig: async (partial) => {
+  updateServicesConfig: async (partial, options) => {
     try {
       await api.updateServicesConfig(partial)
-      get().loadServicesConfig()
+      // A field awaiting save must see the new masked value before closing.
+      const config = await api.fetchServicesConfig()
+      set({ servicesConfig: config })
       // Newly-discovered Mature models appear once when Mature Mode is
       // enabled. Previously initialized models retain the user's whitelist.
       if (partial.nsfw_mode === true && _modelVisibilityHydrated) {
@@ -9134,6 +9641,7 @@ export const useStore = create<AppState>((set, get) => ({
         })
       }
     } catch (e) {
+      if (options?.throwOnError) throw e
       console.error('Failed to update services config:', e)
       get().loadServicesConfig()
     }
@@ -9202,17 +9710,21 @@ export const useStore = create<AppState>((set, get) => ({
     return {
       h3WindowPlan: {
         ...s.h3WindowPlan,
+        // Manual edits may change the entry/exit state used by neighbouring
+        // windows. Keep the edited prompts, but don't repair from an old clock.
+        camera_checkpoint: null,
+        retryable_windows: [],
         windows,
         window_prompts: windows.map(window => window.prompt),
       },
     }
   }),
   clearH3WindowPlan: () => set({ h3WindowPlan: null }),
-  enhancePrompt: async (ttsMode?: string, requestedStyle: 'faithful' | 'creative' | 'adaptive' = 'adaptive') => {
+  enhancePrompt: async (ttsMode?: string, requestedStyle: 'faithful' | 'creative' | 'adaptive' = 'adaptive', retryFlaggedWindows = false) => {
     let state = get()
     const primaryStudioCreate = (
       state.generationMode === 'video'
-      && (state.studioVideoWorkflow === 'frames' || state.studioVideoWorkflow === 'references')
+      && ['frames', 'references', 'avatar'].includes(state.studioVideoWorkflow)
       && Number(state.params.image_mode) === 0
     )
     if (primaryStudioCreate) {
@@ -9254,6 +9766,11 @@ export const useStore = create<AppState>((set, get) => ({
     }
     const { generationMode, startImage, endImage, imageRefs } = state
     const isH3Writer = String(state.modelOptions?.architecture || selectedModelDefinition?.architecture || '').startsWith('minimax_h3')
+    const retryContext = state.h3WindowPlan?.camera_checkpoint?.context as {image_paths?: string[]} | undefined
+    if (retryFlaggedWindows && !state.h3WindowPlan?.retryable_windows?.length) {
+      set({promptEnhanceError: 'This draft has no saved windows to repair. Create a new draft instead.'})
+      return
+    }
     const planningStyle = requestedStyle === 'adaptive' && !isH3Writer ? 'faithful' : requestedStyle
     const clearCapturedEnhancement = () => set(s => s.enhanceOnGenerationRevision === state.enhanceOnGenerationRevision
       ? {enhanceOnGeneration: null, enhanceOnGenerationRevision: s.enhanceOnGenerationRevision + 1} : {})
@@ -9296,7 +9813,7 @@ export const useStore = create<AppState>((set, get) => ({
             state.modelOptions?.omni_reference === true
             || _isOmniVideoModel(selectedModelDefinition)
           )
-      const useStudioFrameInputs = !primaryStudioCreate || activeCreateRoute === 'guided'
+      const useStudioFrameInputs = !primaryStudioCreate || activeCreateRoute === 'guided' || activeCreateRoute === 'avatar'
       const isH3FirstLast = (
         String(
           state.modelOptions?.architecture
@@ -9331,7 +9848,11 @@ export const useStore = create<AppState>((set, get) => ({
           referenceContext = state.studioImageWorkflow === 'inpaint'
             ? 'Picture 1 is the source image. Preserve everything outside the supplied edit mask; describe the finished image, not mask instructions.'
             : 'Picture 1 is the protected source image. Extend its scene naturally beyond the existing canvas; describe the complete finished image.'
-        } else if (state.studioImageWorkflow === 'generate') {
+        } else if (state.studioImageWorkflow === 'generate' && params.image_guide && String(params.video_prompt_type || '').includes('V')) {
+          imagePaths.push(String(params.image_guide))
+          referenceContext = 'Picture 1 is the source/control image. Preserve the requested structure and change only what the user asks to edit.'
+        }
+        if (state.studioImageWorkflow === 'generate' || state.modelOptions?.image_ref_inpaint) {
           for (const ref of imageRefs) {
             try {
               const uploaded = await api.uploadImage(ref)
@@ -9345,7 +9866,7 @@ export const useStore = create<AppState>((set, get) => ({
         // the runtime's Qwen conditioner will number them.
         let h3HasStartAttachment = false
         let h3HasEndAttachment = false
-        if (useStudioFrameInputs && startImage) {
+        if (useStudioFrameInputs && startImage && !retryFlaggedWindows) {
           try {
             const uploaded = await api.uploadImage(startImage)
             imagePaths.push(uploaded.path)
@@ -9356,7 +9877,7 @@ export const useStore = create<AppState>((set, get) => ({
           h3HasStartAttachment = true
         }
         if (isH3FirstLast) {
-          if (useStudioFrameInputs && endImage) {
+          if (useStudioFrameInputs && endImage && !retryFlaggedWindows) {
             try {
               const uploaded = await api.uploadImage(endImage)
               imagePaths.push(uploaded.path)
@@ -9399,8 +9920,28 @@ export const useStore = create<AppState>((set, get) => ({
       // Include duration/window info for video models
       const fps = state.modelOptions?.fps ?? 16
       const swDefaults = (state.modelOptions as Record<string, unknown> | null)?.sliding_window_defaults as Record<string, number> | undefined
-      const discardFrames = swDefaults?.discard_last_frames ?? 0
-      const overlapSec = state.slidingWindowOverlap / fps
+      const windowDefaults = params.minimax_h3_extended_duration === true
+        && supportsH3ExtendedDuration(state.modelOptions)
+        ? { ...swDefaults, window_max: h3MaximumFrames(state.modelOptions, true) ?? swDefaults?.window_max }
+        : swDefaults
+      const h3FramesStoryboard = (
+        state.studioVideoWorkflow === 'frames'
+        && isH3FirstLast
+        && params.minimax_h3_multi_window === true
+      )
+      const windowFrames = normalizeSlidingWindowFrames(
+        Math.round(state.slidingWindowSeconds * fps),
+        windowDefaults,
+      )
+      const overlapFrames = _normalizeSlidingWindowOverlap(
+        state.slidingWindowOverlap,
+        swDefaults,
+      )
+      const discardFrames = h3FramesStoryboard
+        ? resolveH3StoryboardDiscardFrames(swDefaults, params.custom_settings)
+        : swDefaults?.discard_last_frames ?? 0
+      const windowSeconds = windowFrames / fps
+      const overlapSec = overlapFrames / fps
       const discardSec = discardFrames / fps
       const supportsSlidingWindows = state.modelOptions?.sliding_window === true
       const firstWindowSeconds = (
@@ -9408,13 +9949,13 @@ export const useStore = create<AppState>((set, get) => ({
         && supportsSlidingWindows
       )
         ? continuationFirstWindowFrames(
-            Math.round(state.slidingWindowSeconds * fps),
-            state.slidingWindowOverlap,
+            windowFrames,
+            overlapFrames,
           ) / fps
-        : state.slidingWindowSeconds
+        : windowSeconds
       const plannedDuration = durationWindowPlan(
         state.durationSeconds,
-        state.slidingWindowSeconds,
+        windowSeconds,
         overlapSec,
         discardSec,
         firstWindowSeconds,
@@ -9425,7 +9966,7 @@ export const useStore = create<AppState>((set, get) => ({
         ? plannedDuration.windowCount
         : 1
       const totalFrames = Math.max(1, Math.round(state.durationSeconds * fps))
-      const h3NativeMaximumFrames = state.modelOptions?.frames_maximum ?? null
+      const h3NativeMaximumFrames = h3MaximumFrames(state.modelOptions, params.minimax_h3_extended_duration)
       const h3SequenceBudget = (
         isOmniReference
         && params.minimax_h3_reference_sequence === true
@@ -9457,13 +9998,16 @@ export const useStore = create<AppState>((set, get) => ({
 
       if (shouldPlanH3Sequence) {
         const plan = await api.planH3Sequence({
+          ...(retryFlaggedWindows && state.h3WindowPlan ? { retry_plan: state.h3WindowPlan } : {}),
           prompt: h3PlanningSource,
           model_type: params.model_type,
           resolution: params.resolution,
           total_frames: totalFrames,
           references: params.minimax_h3_references ?? [],
+          activated_loras: params.activated_loras.length > 0 ? params.activated_loras : undefined,
           sequence_clip_frames: h3SequenceClipFrames,
           sequence_memory_override: state.slidingWindowLocked,
+          minimax_h3_extended_duration: params.minimax_h3_extended_duration,
           overlap_frames: state.slidingWindowOverlap,
           sequence_continuity: params.minimax_h3_sequence_continuity !== false,
           camera_coverage: params.minimax_h3_camera_coverage || 'auto',
@@ -9502,25 +10046,35 @@ export const useStore = create<AppState>((set, get) => ({
         // contain only their own local actions. Endpoint and injected images
         // were collected above in the runtime's stable presentation order.
         const plan = await api.planH3Windows({
+          ...(retryFlaggedWindows && state.h3WindowPlan ? { retry_plan: state.h3WindowPlan } : {}),
           prompt: h3PlanningSource,
           model_type: params.model_type,
           resolution: params.resolution,
           total_frames: totalFrames,
-          window_frames: Math.max(1, Math.round(state.slidingWindowSeconds * fps)),
-          overlap_frames: state.slidingWindowOverlap,
+          activated_loras: params.activated_loras.length > 0 ? params.activated_loras : undefined,
+          window_frames: windowFrames,
+          overlap_frames: overlapFrames,
           discard_frames: discardFrames,
+          minimax_h3_multi_window: true,
+          custom_settings: params.custom_settings,
           sliding_window_memory_override: state.slidingWindowLocked,
+          minimax_h3_extended_duration: params.minimax_h3_extended_duration,
           has_start_image: !!(startImage || params.image_start),
           has_end_image: !!(endImage || params.image_end),
-          image_paths: imagePaths.length > 0 ? imagePaths : undefined,
+          image_paths: retryFlaggedWindows ? retryContext?.image_paths : imagePaths.length > 0 ? imagePaths : undefined,
           injected_keyframes: injectedKeyframes.length > 0 ? injectedKeyframes : undefined,
           camera_coverage: params.minimax_h3_camera_coverage || 'auto',
           planning_style: planningStyle,
         })
         const effectiveWindowFrames = plan.effective_window_frames || plan.window_frames
+        const effectiveTotalFrames = plan.total_frames || totalFrames
+        const effectiveOverlapFrames = plan.overlap_frames ?? overlapFrames
+        const effectiveDiscardFrames = plan.discard_frames ?? discardFrames
         set(s => ({
           h3WindowPlan: plan,
+          durationSeconds: effectiveTotalFrames / fps,
           slidingWindowSeconds: effectiveWindowFrames / fps,
+          slidingWindowOverlap: effectiveOverlapFrames,
           // Clicking Enhance on a multi-window H3 First/Last job is an
           // explicit request to plan the idea across those windows. Turn the
           // planner back on even when an old saved setting left legacy mode
@@ -9530,7 +10084,10 @@ export const useStore = create<AppState>((set, get) => ({
             ...s.params,
             prompt: plan.source_prompt || h3PlanningSource,
             _h3_original_prompt: undefined,
+            video_length: effectiveTotalFrames,
             sliding_window_size: effectiveWindowFrames,
+            sliding_window_overlap: effectiveOverlapFrames,
+            sliding_window_discard_last_frames: effectiveDiscardFrames,
             minimax_h3_sequence_prompt_mode: params.minimax_h3_sequence_prompt_mode,
             minimax_h3_multi_window: true,
             minimax_h3_window_storyboard: true,
@@ -9541,6 +10098,9 @@ export const useStore = create<AppState>((set, get) => ({
         return
       }
 
+      if (retryFlaggedWindows) {
+        throw new Error('The window settings changed. Create a new draft for these settings.')
+      }
       // TTS dialogue needs more tokens for longer conversations
       const maxTokens = (generationMode === 'audio' && ttsMode) ? 2048 : undefined
       const ltxEnhanceSource = (
@@ -9841,6 +10401,27 @@ export const useStore = create<AppState>((set, get) => ({
       [modelType]: presetId,
     },
   })),
+  initializeDirectorH3Turbo: (modelType, options) => {
+    const state = get()
+    const option = options.minimax_h3_turbo
+    if (!option?.default_enabled || state.directorH3TurboModeByModel[modelType] != null) return
+    const preset = option.presets.find(item => item.id === option.preset_id)
+    if (!preset) return
+    const current = state.savedLoraPerMode.video
+    const managedFiles = new Set(option.presets.map(item => item.filename))
+    const loras = (current?.activated_loras || []).filter(name => !managedFiles.has(name))
+    const weights = { ...current?.loraWeights }
+    for (const name of managedFiles) delete weights[name]
+    loras.push(preset.filename)
+    weights[preset.filename] = [preset.weight]
+    const available = [...new Set([...(current?.availableLoras || []), preset.filename])]
+    state.directorSetLora('video', loras, loras.map(name => (
+      (weights[name] || [1]).map(value => value.toFixed(2)).join(';')
+    )).join(' '), weights, available)
+    state.setDirectorH3TurboPreset(modelType, preset.id)
+    state.setDirectorH3TurboMode(modelType, true)
+    state.setDirectorVideoInferenceSteps(modelType, preset.steps)
+  },
   setDirectorH3SolMode: (modelType, enabled) => set(s => ({
     directorH3SolModeByModel: {
       ...s.directorH3SolModeByModel,
@@ -10541,18 +11122,24 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorClipPlans, directorPlannedClips, params, selectedModelPerMode, savedParamsPerMode, savedLoraPerMode, directorResolution, directorAspectRatio, directorSceneDescription } = get()
     if (!directorClipPlans.length) return
 
-    // Use saved image-mode settings if available, otherwise fall back to defaults
+    // Use this model's defaults and only its own saved image-mode overrides.
     const imageModel = selectedModelPerMode.image || 'flux2_klein_9b'
-    const imageOptions = await api.fetchModelOptions(imageModel).catch(() => null)
+    const [imageOptions, imageDefaults] = await Promise.all([
+      api.fetchModelOptions(imageModel).catch(() => null),
+      api.fetchDefaults(imageModel).catch((): Record<string, unknown> => ({})),
+    ])
+    const imageCapability = get().models.find(model => model.model_type === imageModel)?.director
     const directorRes = resolveResolution(
       imageOptions,
       directorResolution,
       directorAspectRatio,
     )
-    // Director's hardcoded image_model fallback is flux2_klein_9b, which is
-    // step-distilled to 4 inference steps (per app/defaults/flux2_klein_9b.json).
+    const matchingImageParams = savedParamsPerMode.image?.model_type === imageModel
+      ? savedParamsPerMode.image : {}
     const imageParams = {
-      ...(savedParamsPerMode.image || { num_inference_steps: 4, guidance_scale: 1 }),
+      num_inference_steps: Number(matchingImageParams.num_inference_steps
+        ?? imageDefaults.num_inference_steps ?? imageOptions?.default_num_inference_steps ?? 4),
+      guidance_scale: Number(matchingImageParams.guidance_scale ?? imageDefaults.guidance_scale ?? 1),
       resolution: directorRes,
     }
     const imageLora = savedLoraPerMode.image
@@ -10571,15 +11158,17 @@ export const useStore = create<AppState>((set, get) => ({
 
     // Submit one image generation, poll to completion, download the result as a File.
     const genImage = async (prompt: string, refs: string[], label: string): Promise<{ file: File; filename: string }> => {
+      const maxRefs = imageCapability?.max_image_refs
+      const imageRefs = maxRefs && maxRefs > 0 ? refs.slice(0, maxRefs) : refs
       const genParams = {
         model_type: imageModel,
         prompt,
-        image_refs: refs,
+        image_refs: imageRefs,
         image_mode: 1,
         num_inference_steps: imageParams.num_inference_steps,
         guidance_scale: imageParams.guidance_scale,
-        // 'KI' carries an image reference; plain T2I (the anchor) needs no ref flag.
-        video_prompt_type: refs.length ? 'KI' : '',
+        // Unified editors such as Qwen 2.1 use I; older main-image editors use KI.
+        video_prompt_type: imageRefs.length ? (imageCapability?.image_reference_mode ?? 'KI') : '',
         resolution: imageParams.resolution,
         seed: -1,
         settings_version: 2.52,
@@ -11199,14 +11788,35 @@ export const useStore = create<AppState>((set, get) => ({
 
   selectModel: (modelType) => {
     const currentMode = get().generationMode
+    const previousModelType = String(get().params.model_type || '')
+    const switchesWithinH3SingularityPair = (
+      (previousModelType === 'minimax_h3_singularity' && modelType === 'minimax_h3_ref2va_singularity')
+      || (previousModelType === 'minimax_h3_ref2va_singularity' && modelType === 'minimax_h3_singularity')
+    )
+    const avatarModel = currentMode === 'video' && isLongCatAvatarModel({ model_type: modelType })
+    const leaveAvatar = currentMode === 'video' && get().studioVideoWorkflow === 'avatar' && !avatarModel
     set(s => ({
+      ...((avatarModel || leaveAvatar) ? { studioVideoWorkflow: avatarModel ? 'avatar' as const : 'frames' as const } : {}),
+      ...(avatarModel ? {
+        studioVideoModelPerCreateRoute: { ...s.studioVideoModelPerCreateRoute, avatar: modelType },
+      } : {}),
       params: {
         ...s.params,
         model_type: modelType,
+        ...((avatarModel || leaveAvatar) ? {
+          image_mode: 0, _studio_video_workflow: avatarModel ? 'avatar' as const : 'frames' as const,
+        } : {}),
+        ...(avatarModel ? {
+          audio_prompt_type: isMultiSpeakerAvatarModel({ model_type: modelType }) ? 'AB' : 'A',
+          speakers_locations: s.params.speakers_locations || DEFAULT_AVATAR_SPEAKER_LOCATIONS,
+        } : leaveAvatar ? {
+          audio_prompt_type: String(s.params.audio_prompt_type || '').replace(/B/g, ''),
+        } : {}),
+        custom_settings: _kreaCustomSettingsForModel(s.params.custom_settings, modelType, s.kreaIdentitySettingsPerModel),
         activated_loras: [],
         loras_multipliers: '',
-        minimax_h3_turbo_mode: false,
-        minimax_h3_turbo_preset: undefined,
+        minimax_h3_turbo_mode: switchesWithinH3SingularityPair ? s.params.minimax_h3_turbo_mode : undefined,
+        minimax_h3_turbo_preset: switchesWithinH3SingularityPair ? s.params.minimax_h3_turbo_preset : undefined,
       },
       selectedModelPerMode: { ...s.selectedModelPerMode, [currentMode]: modelType },
       ...(currentMode === 'audio' ? {
@@ -11219,6 +11829,7 @@ export const useStore = create<AppState>((set, get) => ({
       loraWeights: {},
       availableLoras: [],
     }))
+    if (avatarModel) _saveStudioVideoRoutePreferences({ route: 'auto', models: get().studioVideoModelPerCreateRoute })
     // Virtual SFX models don't have backend model options or LoRAs
     if (!sfxModelTypes.has(modelType)) {
       get().loadLoras(modelType)
@@ -11370,24 +11981,42 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   refreshOutputs: async () => {
+    const request = ++_galleryRefreshRequest
     const revision = _galleryRevision
     const options = galleryQuery(get())
     try {
       const result = await api.fetchOutputs(100, 0, options)
       if (revision !== _galleryRevision || JSON.stringify(options) !== JSON.stringify(galleryQuery(get()))) return
+      if (request < _galleryRefreshApplied) return
+      _galleryRefreshApplied = request
       const fresh = result.outputs.map(galleryOutput)
-      const current = get().outputs
-      const selected = get().filteredOutputs()[get().selectedOutput]
-      const refreshed = new Map(fresh.map(output => [outputIdentity(output), output]))
-      const oldIds = new Set(current.map(outputIdentity))
-      const newItems = fresh.filter(output => !oldIds.has(outputIdentity(output)))
-      const merged = [...newItems, ...current.map(output => refreshed.get(outputIdentity(output)) || output)]
-      if (selected) {
-        const selectedIndex = merged.findIndex(output => outputIdentity(output) === outputIdentity(selected))
-        set({ selectedOutput: Math.max(0, selectedIndex) })
-      }
-      set({ outputs: merged, outputsTotal: result.total,
-            ...(current.length === 0 ? { outputsCursor: result.next_cursor || null } : {}) })
+      const state = get()
+      const current = state.outputs
+      const selected = state.filteredOutputs()[state.selectedOutput]
+      // The API page is the authoritative head; an item missing from current
+      // may be an older record just surfaced by a running-job refresh.
+      const freshIds = new Set(fresh.map(outputIdentity))
+      const boundary = fresh[fresh.length - 1]
+      const retainedTail = result.next_cursor && boundary
+        ? current.filter(output => !freshIds.has(outputIdentity(output)) && galleryOutputIsOlder(output, boundary))
+        : []
+      const merged = [...fresh, ...retainedTail]
+      const filteredMerged = computeFilteredOutputs(merged, state.mediaFilter)
+      const selectedIndex = selected
+        ? filteredMerged.findIndex(output => outputIdentity(output) === outputIdentity(selected))
+        : -1
+      const selectedRemoved = selectedIndex < 0
+      const nextCursor = retainedTail.length > 0
+        ? state.outputsCursor
+        : result.next_cursor || null
+      if (selectedRemoved) ++_galleryMetadataRevision
+      set({
+        outputs: merged,
+        outputsTotal: result.total,
+        outputsCursor: nextCursor,
+        selectedOutput: selectedRemoved ? 0 : selectedIndex,
+        ...(selectedRemoved ? { selectedOutputMeta: null, metadataLoading: false } : {}),
+      })
     } catch {
       // A transient disconnect must not clear the current library.
     }
@@ -11657,6 +12286,7 @@ export const useStore = create<AppState>((set, get) => ({
           ...(subMode === 'music' ? {
             musicDescription: (p._music_description as string) || '',
             musicInstrumental: !!p._music_instrumental
+              || (p.custom_settings as Record<string, unknown> | undefined)?.instrumental === true
               || restoredLyrics.trim().toLowerCase() === '[instrumental]',
           } : {}),
         }))
@@ -11829,6 +12459,7 @@ export const useStore = create<AppState>((set, get) => ({
       p.sliding_window_discard_last_frames as number
     ) ?? undefined
     newParams.sliding_window_memory_override = p.sliding_window_memory_override === true
+    newParams.minimax_h3_extended_duration = p.minimax_h3_extended_duration === true
     newParams.guidance_phases = (p.guidance_phases as number) ?? undefined
     newParams.video_prompt_type = (p.video_prompt_type as string) || ''
     newParams.audio_prompt_type = (p.audio_prompt_type as string) || ''
@@ -11841,6 +12472,7 @@ export const useStore = create<AppState>((set, get) => ({
     newParams.voice_reference = (p.voice_reference as string) || undefined
     newParams.identity_guidance_scale = (p.identity_guidance_scale as number) ?? undefined
     newParams.audio_guide2 = (p.audio_guide2 as string) || ''
+    newParams.speakers_locations = (p.speakers_locations as string) || undefined
     newParams.audio_guide3 = (p.audio_guide3 as string) || ''
     newParams.audio_guide4 = (p.audio_guide4 as string) || ''
     newParams.audio_guide5 = (p.audio_guide5 as string) || ''
@@ -11991,7 +12623,7 @@ export const useStore = create<AppState>((set, get) => ({
     newParams.minimax_h3_turbo_preset = restoredTurboPreset?.id
     newParams.minimax_h3_text_encoder = restoredTextEncoder
     newParams.ltx25_video_vae = restoredLtx25VideoVae
-    if (restoredModelOptions?.minimax_h3_fused_turbo) {
+    if (restoredModelOptions?.minimax_h3_fused_turbo || restoredModelOptions?.minimax_h3_baked_turbo) {
       const minSteps = Math.max(
         1,
         Math.round(Number(restoredModelOptions.inference_steps_min ?? 4)),
@@ -12002,7 +12634,7 @@ export const useStore = create<AppState>((set, get) => ({
       )
       const restoredSteps = Number(p.num_inference_steps)
       const defaultSteps = Number(
-        restoredModelOptions.default_num_inference_steps ?? 4,
+        restoredModelOptions.default_num_inference_steps ?? (restoredModelOptions.minimax_h3_baked_turbo ? 8 : 4),
       )
       newParams.num_inference_steps = Math.max(
         minSteps,
@@ -12017,7 +12649,12 @@ export const useStore = create<AppState>((set, get) => ({
       newParams.minimax_h3_turbo_mode = false
       newParams.minimax_h3_turbo_preset = undefined
       newParams.skip_steps_cache_type = ''
-      newParams.override_attention = p.override_attention === 'sdpa' ? 'sdpa' : 'sla'
+      newParams.override_attention = restoredModelOptions.minimax_h3_baked_turbo
+        ? p.override_attention === 'sdpa'
+          ? 'sdpa'
+          : p.override_attention === 'sol' && restoredModelOptions.sol_attention
+            && restoredModelOptions.sol_attention_status?.supported ? 'sol' : ''
+        : p.override_attention === 'sdpa' ? 'sdpa' : 'sla'
     }
     const restoredCustomSettings = (
       p.custom_settings
@@ -12038,6 +12675,20 @@ export const useStore = create<AppState>((set, get) => ({
     newParams.custom_settings = Object.keys(
       restoredH3LongSequenceSettings,
     ).length > 0 ? restoredH3LongSequenceSettings : undefined
+    if (isKreaIdentityEdit(modelType)) {
+      // Older outputs used the neutral defaults. Their recipe must not borrow
+      // a newer preference that would silently change a reroll.
+      newParams.custom_settings = { ...normalizeKreaIdentitySettings(restoredCustomSettings) }
+    }
+    if (modelType === 'yue2') {
+      // Keep the complete music selection when loading or rerolling a song.
+      // Runtime-only LoRA fields are not part of the generic custom-setting UI.
+      newParams.custom_settings = Object.fromEntries(
+        ['abc', 'artist_id', 'artist_strength', 'artist_loras', 'instrumental']
+          .filter(key => restoredCustomSettings[key] !== undefined)
+          .map(key => [key, restoredCustomSettings[key]]),
+      )
+    }
     newParams.minimax_h3_window_storyboard = (p.minimax_h3_window_storyboard as boolean) ?? undefined
     newParams.minimax_h3_multi_window = (p.minimax_h3_multi_window as boolean) ?? undefined
     const legacyLtxLongForm = (
@@ -12479,6 +13130,8 @@ export const useStore = create<AppState>((set, get) => ({
         ttsVoices: restoredVoices,
       } : {}),
     }))
+
+    _rememberKreaIdentitySettings(get, set, modelType, newParams.custom_settings)
 
     const _probeRestoredVideo = (
       file: File | null,
@@ -12997,13 +13650,15 @@ export const useStore = create<AppState>((set, get) => ({
     const outputs = get().filteredOutputs()
     const idx = get().selectedOutput
     const output = target || outputs[idx]
-    if (!output) return
+    if (!output) return { ok: false, error: 'No media is selected.' }
 
     try {
       await api.deleteOutput(output.name, output.workspace)
       // Remove from local state
       const allOutputs = get().outputs.filter(o => outputIdentity(o) !== outputIdentity(output))
-      const newIdx = Math.min(idx, Math.max(0, allOutputs.length - 1))
+      const outputIndex = outputs.findIndex(o => outputIdentity(o) === outputIdentity(output))
+      const nextFiltered = computeFilteredOutputs(allOutputs, get().mediaFilter)
+      const newIdx = Math.min(outputIndex >= 0 ? outputIndex : idx, Math.max(0, nextFiltered.length - 1))
       set({ outputs: allOutputs, outputsTotal: Math.max(0, get().outputsTotal - 1), selectedOutput: newIdx })
       // Load metadata for new selection
       const newFiltered = get().filteredOutputs()
@@ -13012,8 +13667,10 @@ export const useStore = create<AppState>((set, get) => ({
       } else {
         set({ selectedOutputMeta: null })
       }
+      return { ok: true }
     } catch (e) {
       console.error('Failed to delete output:', e)
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
     }
   },
 
@@ -13168,10 +13825,14 @@ export const useStore = create<AppState>((set, get) => ({
       || directorTurboPresets[0]
     )
     const savedDirectorVideoLoras = savedLoraPerMode.video
+    const directorTurboDefault = directorH3TurboModeByModel[selectedVideoModel] == null
+      && directorTurboOption?.default_enabled === true
     const directorTurboEnabled = Boolean(
       directorTurboOption && directorTurboPreset
-      && directorH3TurboModeByModel[selectedVideoModel] === true
-      && savedDirectorVideoLoras?.activated_loras?.includes(directorTurboPreset.filename)
+      && (directorTurboDefault || (
+        directorH3TurboModeByModel[selectedVideoModel] === true
+        && savedDirectorVideoLoras?.activated_loras?.includes(directorTurboPreset.filename)
+      ))
     )
     if (directorTurboEnabled) directorVideoSteps = directorTurboPreset!.steps
     const directorSolEnabled = Boolean(

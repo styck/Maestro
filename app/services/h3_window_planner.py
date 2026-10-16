@@ -31,6 +31,7 @@ from services.h3_story_ledger import (
     sanitize_h3_nonverbal_audio,
     sanitize_h3_prompt_text,
 )
+from services.lora_guidance import lora_guidance_fingerprint
 
 _H3_WINDOW_PLANNER_VERSION = 4 + H3_STORY_LEDGER_VERSION
 _CAMERA_COVERAGE_VALUES = {"auto", "continuous", "multi_shot"}
@@ -89,7 +90,12 @@ def compute_h3_window_boundaries(
     boundaries: list[dict[str, Any]] = []
     committed_start = 0
     for index in range(count):
-        committed_length = window if index == 0 else stride
+        # Runtime drops the clean-tail frames from the first pass as well as
+        # continuation passes. Counting them here shifts every later event
+        # and can leave an extra, zero-duration final planning segment.
+        committed_length = stride
+        if index == 0:
+            committed_length = window - (discard if count > 1 else 0)
         committed_end = min(total, committed_start + committed_length)
         boundaries.append(
             {
@@ -251,6 +257,7 @@ def h3_window_plan_signature(
     camera_coverage: str = "auto",
     planning_style: str = "faithful",
     injected_keyframes: list[dict[str, Any]] | None = None,
+    lora_system_hint: str = "",
 ) -> str:
     """Fingerprint every input that can change a window plan."""
 
@@ -277,11 +284,17 @@ def h3_window_plan_signature(
             if isinstance(item, dict)
         ],
     }
+    if discard_frames > 0:
+        # Older clean-tail plans counted discarded first-pass frames as output.
+        payload["clean_tail_timing_version"] = 1
+    guidance_fingerprint = lora_guidance_fingerprint(lora_system_hint)
+    if guidance_fingerprint:
+        payload["lora_guidance_fingerprint"] = guidance_fingerprint
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
-def reviewed_h3_window_plan_matches(
+def reviewed_h3_window_plan_mismatch(
     plan: Any,
     window_prompts: Any,
     *,
@@ -292,8 +305,9 @@ def reviewed_h3_window_plan_matches(
     boundaries: Iterable[dict[str, Any]],
     camera_coverage: str = "auto",
     planning_style: str = "faithful",
-) -> bool:
-    """Validate a user-reviewed H3 plan without trusting a stale signature.
+    lora_system_hint: str = "",
+) -> str | None:
+    """Explain a reviewed-plan mismatch, or return None for a valid snapshot.
 
     Studio keeps the short story concept separate from the compiled prompt for
     every native H3 pass.  Once those prompts are visible (and potentially
@@ -308,7 +322,7 @@ def reviewed_h3_window_plan_matches(
     """
 
     if not isinstance(plan, dict) or not isinstance(window_prompts, (list, tuple)):
-        return False
+        return "the saved window plan or prompt list is missing"
     prompts = [
         item.strip()
         for item in window_prompts
@@ -317,41 +331,62 @@ def reviewed_h3_window_plan_matches(
     expected = [item for item in boundaries if isinstance(item, dict)]
     windows = plan.get("windows")
     if not prompts or not isinstance(windows, list):
-        return False
+        return "the saved window plan has no usable prompts"
     if len(prompts) != len(expected) or len(windows) != len(expected):
-        return False
+        return (
+            f"the saved plan has {len(windows)} windows and {len(prompts)} prompts, "
+            f"but the current duration and window settings require {len(expected)} windows"
+        )
     if str(plan.get("plan_kind") or "sliding_window") != "sliding_window":
-        return False
+        return "the saved plan uses a different generation mode"
     if str(plan.get("source_prompt") or "").strip() != str(source_prompt or "").strip():
-        return False
+        return "the source prompt changed"
     if str(plan.get("model_type") or "") != str(model_type or ""):
-        return False
+        return "the model changed"
     if str(plan.get("resolution") or "") != str(resolution or ""):
-        return False
-    if int(plan.get("window_frames") or 0) != int(window_frames):
-        return False
+        return "the output resolution changed"
+    try:
+        saved_window_frames = int(plan.get("window_frames") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return "the saved Window Length is invalid"
+    if saved_window_frames != int(window_frames):
+        return f"Window Length changed from {saved_window_frames} to {int(window_frames)} frames"
     if normalize_h3_camera_coverage(plan.get("camera_coverage")) != normalize_h3_camera_coverage(camera_coverage):
-        return False
+        return "the camera coverage setting changed"
     if normalize_h3_planning_style(plan.get("planning_style")) != normalize_h3_planning_style(planning_style):
-        return False
+        return "the enhancement style changed"
+    if plan.get("lora_guidance_fingerprint") != lora_guidance_fingerprint(lora_system_hint):
+        return "the active LoRA guidance changed"
 
     for index, (window, boundary, prompt) in enumerate(
         zip(windows, expected, prompts),
         start=1,
     ):
         if not isinstance(window, dict):
-            return False
+            return f"saved window {index} is invalid"
         try:
             geometry_matches = (
                 int(window.get("index") or index) == int(boundary.get("index") or index)
                 and int(window.get("start_frame") or 0) == int(boundary.get("start_frame") or 0)
                 and int(window.get("end_frame") or 0) == int(boundary.get("end_frame") or 0)
             )
-        except (TypeError, ValueError):
-            return False
-        if not geometry_matches or str(window.get("prompt") or "").strip() != prompt:
-            return False
-    return True
+        except (TypeError, ValueError, OverflowError):
+            return f"saved window {index} has invalid timing"
+        if not geometry_matches:
+            return (
+                f"window {index} timing changed from frames "
+                f"{window.get('start_frame', 0)}–{window.get('end_frame', 0)} "
+                f"to {boundary.get('start_frame', 0)}–{boundary.get('end_frame', 0)}"
+            )
+        if str(window.get("prompt") or "").strip() != prompt:
+            return f"window {index}'s prompt differs from the reviewed plan"
+    return None
+
+
+def reviewed_h3_window_plan_matches(plan: Any, window_prompts: Any, **kwargs) -> bool:
+    """Keep the boolean API for callers that do not need a mismatch reason."""
+
+    return reviewed_h3_window_plan_mismatch(plan, window_prompts, **kwargs) is None
 
 
 def _compact(value: Any, limit: int) -> str:
@@ -1342,6 +1377,8 @@ def plan_h3_sliding_windows(
     nsfw: bool = False,
     camera_coverage: str = "auto",
     planning_style: str = "faithful",
+    lora_system_hint: str = "",
+    retry_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use Maestro's configured LLM to create and compile an H3 window plan."""
 
@@ -1382,7 +1419,12 @@ def plan_h3_sliding_windows(
         camera_coverage=camera_coverage,
         planning_style=planning_style,
         injected_keyframes=injected_keyframes,
+        lora_system_hint=lora_system_hint,
     )
+    guidance_fingerprint = lora_guidance_fingerprint(lora_system_hint)
+    from services.h3_plan_retry import finish_retry_plan, retry_fingerprint, validate_retry_plan
+    fingerprint = retry_fingerprint(signature, image_paths, nsfw)
+    resume = validate_retry_plan(retry_plan, fingerprint=fingerprint, count=len(boundaries))
     if len(boundaries) <= 1:
         return {
             "source_prompt": str(prompt or ""),
@@ -1390,6 +1432,8 @@ def plan_h3_sliding_windows(
             "planned_by": "not_needed",
             "total_frames": int(total_frames),
             "window_frames": int(window_frames),
+            "overlap_frames": int(overlap_frames),
+            "discard_frames": int(discard_frames),
             "window_count": 1,
             "plan_kind": "sliding_window",
             "camera_coverage": camera_coverage,
@@ -1397,6 +1441,7 @@ def plan_h3_sliding_windows(
             "injected_keyframes": normalized_keyframes,
             "windows": [],
             "window_prompts": [],
+            **({"lora_guidance_fingerprint": guidance_fingerprint} if guidance_fingerprint else {}),
         }
 
     media_context = []
@@ -1423,6 +1468,7 @@ def plan_h3_sliding_windows(
         expect_dialogue = adaptive_dialogue_expected(prompt)
     resolved_coverage = _infer_camera_coverage(prompt, camera_coverage)
     story_ledger: dict[str, Any] | None = None
+    camera_checkpoint = None
     planning_warnings: list[str] = []
     planning_diagnostics: list[str] = []
     planning_notes: list[str] = []
@@ -1442,14 +1488,20 @@ def plan_h3_sliding_windows(
             image_paths=image_paths,
             has_start_image=has_start_image,
             nsfw=nsfw,
+            lora_system_hint=lora_system_hint,
+            resume=resume,
         )
         planned_by = staged["planned_by"]
+        camera_checkpoint = staged.get("camera_checkpoint")
         planning_warnings = list(staged.get("planning_warnings") or [])
         planning_diagnostics = list(staged.get("planning_diagnostics") or [])
         planning_notes = list(staged.get("planning_notes") or [])
         dialogue_fragments = list(staged.get("dialogue_fragments") or [])
         source_intent = staged.get("source_intent") or source_intent
         story_ledger = staged["ledger"]
+        stable_camera_context = story_ledger.get("stable_camera_context")
+        if not isinstance(stable_camera_context, dict):
+            stable_camera_context = story_ledger
         windows = []
         for index, segment in enumerate(staged["segments"]):
             windows.append({
@@ -1457,10 +1509,10 @@ def plan_h3_sliding_windows(
                 "window": index + 1,
             })
         plan = {
-            "subject_continuity": story_ledger.get("subject_continuity", ""),
-            "setting_continuity": story_ledger.get("setting_continuity", ""),
-            "visual_continuity": story_ledger.get("visual_continuity", ""),
-            "editing_style": story_ledger.get("editing_style", ""),
+            "subject_continuity": stable_camera_context.get("subject_continuity", ""),
+            "setting_continuity": stable_camera_context.get("setting_continuity", ""),
+            "visual_continuity": stable_camera_context.get("visual_continuity", ""),
+            "editing_style": stable_camera_context.get("editing_style", ""),
             "initial_state": story_ledger.get("initial_state", ""),
             "ambient_audio": story_ledger.get("ambient_audio", ""),
             "music": story_ledger.get("music", "N/A"),
@@ -1483,9 +1535,11 @@ def plan_h3_sliding_windows(
             injected_keyframes=normalized_keyframes,
             source_prompt=prompt,
         )
-    except H3DialogueTimingError:
+    except (H3DialogueTimingError, InterruptedError):
         raise
     except Exception as error:
+        if retry_plan is not None:
+            raise  # Never replace accepted windows after a failed repair.
         print(f"[MiniMax H3] Window planner fallback: {error}")
         planned_by = "deterministic_fallback"
         planning_warnings.append(
@@ -1517,7 +1571,7 @@ def plan_h3_sliding_windows(
             source_prompt=prompt,
         )
 
-    return {
+    return finish_retry_plan({
         "source_prompt": str(prompt or ""),
         "signature": signature,
         "planned_by": planned_by,
@@ -1526,6 +1580,8 @@ def plan_h3_sliding_windows(
         "planning_notes": list(dict.fromkeys(planning_notes)),
         "total_frames": int(total_frames),
         "window_frames": int(window_frames),
+        "overlap_frames": int(overlap_frames),
+        "discard_frames": int(discard_frames),
         "window_count": len(compiled),
         "plan_kind": "sliding_window",
         "camera_coverage": camera_coverage,
@@ -1537,8 +1593,10 @@ def plan_h3_sliding_windows(
         "setting_continuity": plan.get("setting_continuity", ""),
         "editing_style": plan.get("editing_style", ""),
         "story_ledger": story_ledger,
+        "camera_checkpoint": camera_checkpoint,
         "dialogue_fragments": dialogue_fragments,
         "source_intent": source_intent,
         "windows": compiled,
         "window_prompts": [item["prompt"] for item in compiled],
-    }
+        **({"lora_guidance_fingerprint": guidance_fingerprint} if guidance_fingerprint else {}),
+    }, retry_plan, fingerprint)

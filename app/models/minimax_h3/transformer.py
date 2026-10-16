@@ -15,7 +15,8 @@ grouped QKV and SwiGLU projections fused; full head-interleaved checkpoints can
 be split into independent streamable weights without expanding the transformer.
 
 Packing, modality tags, schedules, and rotary coordinates follow the official
-Diffusers MiniMax H3 implementation pinned in ``UPSTREAM.md``.
+Diffusers MiniMax H3 implementation pinned in ``UPSTREAM.md``. Fused QKV can
+retain either grouped ``[Q, K, V]`` rows or the official head-interleaved rows.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import torch.nn.functional as F
 
 from .sol_attention import MiniMaxH3SolAttention
 from .sla_attention import MiniMaxH3SLAAttention
+from . import denoiser_kernels
 
 MODALITY_VIDEO = 0
 MODALITY_TEXT = 1
@@ -45,6 +47,7 @@ MODALITY_COUNT = 3
 MINIMAX_H3_ACTIVATION_CHUNK_TOKENS = 8192
 MINIMAX_H3_ADAPTIVE_CHUNK_MAX_TOKENS = 32768
 MINIMAX_H3_LARGE_SEQUENCE_TOKENS = 50000
+MINIMAX_H3_RMS_NORM_NATIVE_MAX_TOKENS = 75000
 
 
 def _activation_chunk_tokens(
@@ -98,6 +101,16 @@ def _rms_norm_in_chunks(norm: nn.RMSNorm, hidden_states: torch.Tensor) -> torch.
     if torch.is_grad_enabled() or hidden_states.ndim < 2 or len(norm.normalized_shape) != 1:
         return norm(hidden_states)
     length, width = hidden_states.shape[-2:]
+    # Native RMSNorm avoids chunking overhead for moderate consumer-GPU
+    # workloads, including observed 71K-73K-row two-window reference jobs.
+    # Keep the bounded path for genuinely large reference sequences,
+    # including the 264K-row case that motivated it. Explicit activation
+    # chunk overrides still force chunking for tests and diagnostics.
+    if (
+        MINIMAX_H3_ACTIVATION_CHUNK_TOKENS == 8192
+        and length <= MINIMAX_H3_RMS_NORM_NATIVE_MAX_TOKENS
+    ):
+        return norm(hidden_states)
     chunk = _activation_chunk_tokens(length, width, width)
     if length <= chunk:
         return norm(hidden_states)
@@ -130,6 +143,41 @@ def _split_contiguous_qkv(src, dim, split_sizes, _context):
         part.clone(memory_format=torch.contiguous_format)
         for part in torch.split(src, split_sizes, dim=dim)
     ]
+
+
+def _split_fused_qkv(
+    qkv: torch.Tensor,
+    heads: int,
+    head_dim: int,
+    layout: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Q, K, and V shaped as ``[batch, tokens, heads, dim]`` rows."""
+
+    batch_tokens = qkv.shape[:-1]
+    if layout == "grouped":
+        query, key, value = qkv.chunk(3, dim=-1)
+        shape = (*batch_tokens, heads, head_dim)
+        return query.reshape(shape), key.reshape(shape), value.reshape(shape)
+    if layout == "interleaved":
+        interleaved = qkv.reshape(*batch_tokens, heads, 3, head_dim)
+        return (
+            interleaved.select(-2, 0).contiguous(),
+            interleaved.select(-2, 1).contiguous(),
+            interleaved.select(-2, 2).contiguous(),
+        )
+    raise ValueError(f"Unsupported MiniMax H3 fused QKV layout {layout!r}")
+
+
+def _normalize_qkv_layout(layout: str) -> str:
+    normalized = str(layout).strip().lower().replace("-", "_")
+    if normalized in {"grouped", "contiguous"}:
+        return "grouped"
+    if normalized in {"interleaved", "head_interleaved"}:
+        return "interleaved"
+    raise ValueError(
+        "MiniMax H3 QKV layout must be 'grouped' or 'interleaved', "
+        f"got {layout!r}"
+    )
 
 
 def _split_interleaved_qkv(src, dim, split_sizes, context):
@@ -376,6 +424,9 @@ class MiniMaxH3Attention(nn.Module):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
+        # Training and existing callers use grouped rows unless the loader
+        # explicitly configures the checkpoint's fused output-row layout.
+        self.qkv_layout = "grouped"
         self.sol_attention = sol_attention
         self.sla_attention = sla_attention
         inner = heads * head_dim
@@ -388,6 +439,11 @@ class MiniMaxH3Attention(nn.Module):
             self.vdn = VDNHybridAttention(hidden_size, heads, head_dim, dtype=dtype)
         else:
             self.vdn = None
+
+    def set_qkv_layout(self, layout: str) -> None:
+        """Configure how this attention module reads its fused QKV rows."""
+
+        self.qkv_layout = _normalize_qkv_layout(layout)
 
     def forward(
         self,
@@ -412,13 +468,42 @@ class MiniMaxH3Attention(nn.Module):
             if hasattr(self, "q_proj"):
                 raw = [projection(hidden_states).view(shape) for projection in (self.q_proj, self.k_proj, self.v_proj)]
             else:
-                raw = [part.reshape(shape) for part in self.qkv_proj(hidden_states).chunk(3, dim=-1)]
+                raw = list(
+                    _split_fused_qkv(
+                        self.qkv_proj(hidden_states),
+                        self.heads,
+                        self.head_dim,
+                        self.qkv_layout,
+                    )
+                )
             query, key = self.q_norm(raw[0]), self.k_norm(raw[1])
             if rotary is not None:
                 query, key = _apply_rope_inplace(query, *rotary), _apply_rope_inplace(key, *rotary)
             result = self.vdn([hidden_states[0]], [part[0] for part in raw],
                               [query, key, raw[2]], self.out_proj)
             return result.unsqueeze(0)
+        if attention_mask is not None:
+            attention_mask = attention_mask[None, None].to(device=hidden_states.device)
+        use_sla = (
+            self.sla_attention is not None
+            and self.sla_attention.use_for_layer(length, attention_mask)
+        )
+        use_sol = (
+            not use_sla
+            and self.sol_attention is not None
+            and self.sol_attention.use_for_layer(length, attention_mask)
+        )
+        fused_rms_rope = (
+            rotary is not None
+            and not use_sla
+            and not use_sol
+            and denoiser_kernels.can_rms_rope(
+                hidden_states,
+                rotary,
+                self.q_norm,
+                self.k_norm,
+            )
+        )
         projection_width = (
             self.heads * self.head_dim
             if hasattr(self, "q_proj")
@@ -457,19 +542,76 @@ class MiniMaxH3Attention(nn.Module):
                     output[:, start:end].copy_(rows)
                 return output
 
-            query = project_rows(self.q_proj, self.q_norm, rotary)
-            key = project_rows(self.k_proj, self.k_norm, rotary)
+            if fused_rms_rope:
+                query = key = None
+                for start in range(0, length, chunk_size):
+                    end = min(length, start + chunk_size)
+                    q_rows = self.q_proj(hidden_states[:, start:end]).view(
+                        batch, end - start, self.heads, self.head_dim
+                    )
+                    k_rows = self.k_proj(hidden_states[:, start:end]).view(
+                        batch, end - start, self.heads, self.head_dim
+                    )
+                    normalized = denoiser_kernels.rms_rope(
+                        q_rows,
+                        k_rows,
+                        rotary,
+                        start,
+                        end,
+                        self.q_norm,
+                        self.k_norm,
+                    )
+                    if normalized is None:
+                        q_rows = self.q_norm(q_rows)
+                        k_rows = self.k_norm(k_rows)
+                        cos, sin = rotary
+                        q_rows = _apply_rope_inplace(q_rows, cos[start:end], sin[start:end])
+                        k_rows = _apply_rope_inplace(k_rows, cos[start:end], sin[start:end])
+                    else:
+                        q_rows, k_rows = normalized
+                    if query is None:
+                        query = torch.empty(shape, device=q_rows.device, dtype=q_rows.dtype)
+                        key = torch.empty(shape, device=k_rows.device, dtype=k_rows.dtype)
+                    query[:, start:end].copy_(q_rows)
+                    key[:, start:end].copy_(k_rows)
+                assert query is not None and key is not None
+            else:
+                query = project_rows(self.q_proj, self.q_norm, rotary)
+                key = project_rows(self.k_proj, self.k_norm, rotary)
             value = project_rows(self.v_proj)
             qkv = None
         elif length <= chunk_size:
             qkv = self.qkv_proj(hidden_states)
-            query, key, value = qkv.chunk(3, dim=-1)
-            query = self.q_norm(query.view(batch, length, self.heads, self.head_dim))
-            key = self.k_norm(key.view(batch, length, self.heads, self.head_dim))
-            value = value.view(batch, length, self.heads, self.head_dim)
-            if rotary is not None:
-                query = _apply_rope_inplace(query, *rotary)
-                key = _apply_rope_inplace(key, *rotary)
+            query, key, value = _split_fused_qkv(
+                qkv,
+                self.heads,
+                self.head_dim,
+                self.qkv_layout,
+            )
+            if fused_rms_rope:
+                normalized = denoiser_kernels.rms_rope(
+                    query,
+                    key,
+                    rotary,
+                    0,
+                    length,
+                    self.q_norm,
+                    self.k_norm,
+                )
+                if normalized is None:
+                    query = self.q_norm(query)
+                    key = self.k_norm(key)
+                    cos, sin = rotary
+                    query = _apply_rope_inplace(query, cos, sin)
+                    key = _apply_rope_inplace(key, cos, sin)
+                else:
+                    query, key = normalized
+            else:
+                query = self.q_norm(query)
+                key = self.k_norm(key)
+                if rotary is not None:
+                    query = _apply_rope_inplace(query, *rotary)
+                    key = _apply_rope_inplace(key, *rotary)
         else:
             # Keep only Q/K/V themselves resident.  The fused projection,
             # normalization, and RoPE temporaries are bounded to one chunk.
@@ -478,16 +620,43 @@ class MiniMaxH3Attention(nn.Module):
             for start in range(0, length, chunk_size):
                 end = min(length, start + chunk_size)
                 qkv = self.qkv_proj(hidden_states[:, start:end])
-                q_chunk, k_chunk, v_chunk = qkv.chunk(3, dim=-1)
                 chunk_length = end - start
-                q_chunk = self.q_norm(
-                    q_chunk.view(batch, chunk_length, self.heads, self.head_dim)
+                q_chunk, k_chunk, v_chunk = _split_fused_qkv(
+                    qkv,
+                    self.heads,
+                    self.head_dim,
+                    self.qkv_layout,
                 )
-                k_chunk = self.k_norm(
-                    k_chunk.view(batch, chunk_length, self.heads, self.head_dim)
-                )
-                v_chunk = v_chunk.view(batch, chunk_length, self.heads, self.head_dim)
-                if rotary is not None:
+                if fused_rms_rope:
+                    normalized = denoiser_kernels.rms_rope(
+                        q_chunk,
+                        k_chunk,
+                        rotary,
+                        start,
+                        end,
+                        self.q_norm,
+                        self.k_norm,
+                    )
+                    if normalized is None:
+                        q_chunk = self.q_norm(q_chunk)
+                        k_chunk = self.k_norm(k_chunk)
+                        cos, sin = rotary
+                        q_chunk = _apply_rope_inplace(
+                            q_chunk,
+                            cos[start:end],
+                            sin[start:end],
+                        )
+                        k_chunk = _apply_rope_inplace(
+                            k_chunk,
+                            cos[start:end],
+                            sin[start:end],
+                        )
+                    else:
+                        q_chunk, k_chunk = normalized
+                else:
+                    q_chunk = self.q_norm(q_chunk)
+                    k_chunk = self.k_norm(k_chunk)
+                if rotary is not None and not fused_rms_rope:
                     cos, sin = rotary
                     q_chunk = _apply_rope_inplace(
                         q_chunk,
@@ -512,17 +681,8 @@ class MiniMaxH3Attention(nn.Module):
         # allocating the attention result; owned callers have already removed
         # theirs from the transfer list.
         hidden_states = None
-        if attention_mask is not None:
-            attention_mask = attention_mask[None, None].to(device=query.device)
-        use_sla = (
-            self.sla_attention is not None
-            and self.sla_attention.use_for_layer(length, attention_mask)
-        )
-        use_sol = (
-            not use_sla
-            and self.sol_attention is not None
-            and self.sol_attention.use_for_layer(length, attention_mask)
-        )
+        if attention_mask is not None and attention_mask.device != query.device:
+            attention_mask = attention_mask.to(device=query.device)
         if use_sla:
             attended = self.sla_attention([query, key, value], True)
         elif use_sol:
@@ -911,34 +1071,67 @@ class MiniMaxH3Transformer(nn.Module):
         )
         self._interrupt = False
 
-    def preprocess_loras(self, model_type: str, state_dict: dict) -> dict:
-        """Adapt AdaLN width while keeping logical grouped ``[Q, K, V]``.
+    def set_qkv_layout(self, layout: str) -> None:
+        """Set the fused QKV row layout for main and token-refiner attention.
 
-        Raw full-model checkpoints may need a head-interleaved-to-split loader,
-        but LoRAs target the already-instantiated H3 module used for training.
-        Its fused projection is consumed with ``qkv.chunk(3)``, so adapter B
-        rows are already grouped and MMGP's contiguous Q/K/V split is correct.
-        Reordering those rows here corrupts all attention adapters. Full and
-        Pruned checkpoints do use different AdaLN input widths, so convert only
-        that projection with WanGP's revision-pinned affine fit.
+        Loaders should call this after loading a fused checkpoint. When Q, K,
+        and V were already split into separate projections, those projections
+        keep their existing interpretation and this setting has no effect on
+        their forward path.
+        """
+
+        normalized = _normalize_qkv_layout(layout)
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.set_qkv_layout(normalized)
+        self.h3_qkv_layout = normalized
+
+    def preprocess_loras(self, model_type: str, state_dict: dict) -> dict:
+        """Adapt AdaLN width without changing fused QKV adapter row order.
+
+        Diffusers and PDD adapters identify Q, K, and V independently, so
+        their fused B rows can be arranged to match the target projection.
+        Already-fused native adapters do not identify their source layout and
+        are preserved unchanged. Packed base weights remain in their
+        checkpoint layout. Full and pruned LoRAs do use different AdaLN input
+        widths, so convert only that projection with WanGP's revision-pinned
+        affine fit.
         """
 
         from .lora_affine import convert_adaln_loras
+        from .lora_names import normalize_flattened_lora_names
         from .pdd import is_pdd_state_dict, preprocess_pdd_lora_state_dict
-        from .lora_vdn import normalize_diffusers_lora
+        from .lora_vdn import (
+            interleave_qkv_lora_b_rows,
+            normalize_diffusers_lora,
+        )
 
         pdd_adapter = is_pdd_state_dict(state_dict)
-        converted = (
-            preprocess_pdd_lora_state_dict(
+        if pdd_adapter:
+            split_qkv = hasattr(self.blocks[0].attn, "q_proj")
+            converted = preprocess_pdd_lora_state_dict(
                 state_dict,
-                split_qkv=hasattr(self.blocks[0].attn, "q_proj"),
+                split_qkv=split_qkv,
             )
-            if pdd_adapter
-            else normalize_diffusers_lora(state_dict, self)
-        )
+            if not split_qkv:
+                marker = ".qkv_proj.lora_B.weight"
+                for key in tuple(converted):
+                    if not key.endswith(marker):
+                        continue
+                    module_path = key[: -len(marker)]
+                    attention = self.get_submodule(module_path)
+                    if attention.qkv_layout == "interleaved":
+                        converted[key] = interleave_qkv_lora_b_rows(
+                            converted[key],
+                            attention.heads,
+                            attention.head_dim,
+                        )
+        else:
+            converted = normalize_diffusers_lora(state_dict, self)
+        converted = normalize_flattened_lora_names(converted, self)
         started = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
-            model_type,
+            getattr(self, "h3_lora_model_type", model_type),
             converted,
             self.adaln_t_table if self.use_adaln_curves else None,
         )
@@ -962,7 +1155,7 @@ class MiniMaxH3Transformer(nn.Module):
             print(
                 "[MiniMax H3 PDD] Mapped Alibaba PAI's interval adapter "
                 f"to {len(converted)} MMGP-managed low-rank tensors "
-                f"({'split' if hasattr(self.blocks[0].attn, 'q_proj') else 'fused'} QKV)."
+                f"({'split' if split_qkv else 'fused'} QKV)."
             )
         return converted
 
@@ -1066,6 +1259,8 @@ class MiniMaxH3Transformer(nn.Module):
                 raise ValueError("H3 VDN requires the packed layout and target latent geometry")
             for block in self.blocks:
                 block.attn.vdn.begin_forward(layout, *latent_shape, self.config.patch_size)
+        else:
+            rotary = denoiser_kernels.prepare_rope(rotary)
 
         if first_block_cache is None:
             for block in self.blocks:

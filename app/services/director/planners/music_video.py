@@ -107,40 +107,6 @@ _SECTION_VISUAL_STRATEGY = {
 }
 
 
-_BOILERPLATE_RE = re.compile(
-    r"Preserve character identity[^.]*\.?|"
-    r"Use lighting and color temp(?:erature)? from reference image\.?",
-    re.IGNORECASE,
-)
-
-_FRAMING_WORDS = {
-    "shot", "frame", "angle", "medium", "wide", "close", "close-up", "closeup",
-    "low", "high", "establishing", "static", "dynamic", "extreme", "panoramic",
-    "aerial", "sweeping", "intimate", "detail",
-}
-
-
-def _minimal_image_prompt(text):
-    """True when a prompt has no real subject (only boilerplate / framing)."""
-    if not text:
-        return True
-    stripped = _BOILERPLATE_RE.sub("", str(text))
-    words = [w for w in re.findall(r"[A-Za-z]+", stripped) if w.lower() not in _FRAMING_WORDS]
-    return len(words) < 3
-
-
-def _fallback_image_prompt(raw, section):
-    """Build a minimal-but-valid image prompt from shot metadata."""
-    parts = []
-    for key in ("scene_goal", "environment", "lighting"):
-        value = str(raw.get(key) or "").strip().rstrip(".")
-        if value:
-            parts.append(value)
-    if not parts:
-        parts.append(f"{section} scene")
-    return ". ".join(parts).rstrip(".") + "."
-
-
 _MUSIC_IMAGE_FIELDS = frozenset({
     "image_source",
     "image_prompt",
@@ -326,38 +292,6 @@ class MusicVideoPlanner(BasePlanner):
             and shot_image_policy in {"prompt_only", "direct_references"}
         )
         performer_map = _parse_performer_map(scene_description)
-        scene_text = scene_description or ""
-        # Explicit negation ("no singer", "no people", "no characters", ...)
-        # wins over any performer keyword. "no singer, no hero" must NOT be
-        # read as a performer concept — the singer keyword would otherwise flip
-        # the video to performer-centric and invent a whole band.
-        _no_performer_patterns = (
-            r"\bno\s+(?:people|person|characters?|performers?|singers?|vocalists?|"
-            r"musicians?|band|drummers?|guitarists?|rappers?|hero(?:es)?|crowd|"
-            r"faces?|danc(?:ing|ers?)|lip[- ]?sync|vocals?|singing)\b",
-            r"\bwithout\s+(?:people|characters?|performers?|singers?|musicians?|band|vocals?)\b",
-            r"\b(?:no[ -]one|nobody)\b",
-        )
-        explicit_no_performers = any(
-            re.search(pattern, scene_text, re.IGNORECASE)
-            for pattern in _no_performer_patterns
-        )
-        # A band/performer concept gets performer-centric cue text; a narrative
-        # (no-performer) concept gets timing-only cues so the writer never
-        # invents a drummer or instrument.
-        performers = (
-            False
-            if explicit_no_performers
-            else bool(performer_map) or bool(
-                re.search(
-                    r"\b(band|drummer|singer|vocalist|musician|guitar|bass|piano|"
-                    r"keyboard|stage|concert|venue|performs?|raps?|sings?|mic|microphone)\b",
-                    scene_text,
-                    re.IGNORECASE,
-                )
-            )
-        )
-        self._performers = performers
         source_audio_drives_vocals = video_model.lower().startswith(
             ("minimax_h3", "ltx2_25")
         )
@@ -427,7 +361,6 @@ class MusicVideoPlanner(BasePlanner):
             speaker_mappings,
             source_audio_drives_vocals=source_audio_drives_vocals,
             vocal_activity=vocal_activity,
-            performers=performers,
         )
 
         # Call LLM for creative planning
@@ -650,33 +583,16 @@ class MusicVideoPlanner(BasePlanner):
         *,
         source_audio_drives_vocals: bool = False,
         vocal_activity: Optional[list[str]] = None,
-        performers: bool = True,
     ) -> list[str]:
         """Build text descriptions for each clip (context for LLM)."""
         if source_audio_drives_vocals and vocal_activity is None:
             vocal_activity = classify_vocal_intervals(clips, lyrics, None)
-        sections = [
-            (clip.get("label") or clip.get("section_label") or "verse").lower()
-            for clip in clips
-        ]
-        total = len(clips)
         contexts = []
         for i, clip in enumerate(clips):
-            section = sections[i]
+            section = (clip.get("label") or clip.get("section_label") or "verse").lower()
             beat_count = clip.get("beat_count", 8)
             start_sec = clip.get("start", 0)
             end_sec = clip.get("end", start_sec + 5)
-            # Position within this section's consecutive run, so multi-clip
-            # sections (intro, instrumental, long chorus) plan a progression of
-            # distinct starting frames instead of repeating one identical frame.
-            run_start = i
-            while run_start > 0 and sections[run_start - 1] == section:
-                run_start -= 1
-            run_end = i
-            while run_end + 1 < total and sections[run_end + 1] == section:
-                run_end += 1
-            run_pos = i - run_start + 1
-            run_len = run_end - run_start + 1
 
             # Gather overlapping lyrics
             lyrics_snippet = ""
@@ -714,32 +630,27 @@ class MusicVideoPlanner(BasePlanner):
                 )
                 if activity == "active":
                     vocal_info = (
-                        "mapped source audio drives this interval; vocal "
-                        "activity is present; "
-                        "synchronize visible performance and movement to that "
-                        "exact audio; any visible vocalist explicitly lip-syncs "
-                        "every syllable to it without quoting, transcribing, "
-                        "or inventing words; an instrumentalist cutaway keeps "
-                        "the established singer off screen and the visible "
-                        "musician's mouth closed"
+                        "mapped source audio drives this interval and vocal "
+                        "activity is present; synchronize the shot's existing "
+                        "subjects and actions to that audio; only a person "
+                        "explicitly assigned as a visible vocalist lip-syncs, "
+                        "and only to their own audible part; do not add a person "
+                        "or transcribe lyrics for the soundtrack"
                     )
                 elif activity == "silent":
                     vocal_info = (
-                        "the separated vocal stem is silent in this interval; "
-                        "do not depict singing, lip-sync, or an open-mouth "
-                        "vocal performance; keep visible mouths closed except "
-                        "for clearly non-vocal expression; synchronize motion "
-                        "to the supplied soundtrack"
+                        "mapped source audio drives this interval with no "
+                        "detected vocal activity; do not depict singing or "
+                        "lip-sync; preserve the shot's assigned actions and "
+                        "explicit non-song expressions"
                     )
                 else:
                     vocal_info = (
                         "mapped source audio drives this interval, but vocal "
-                        "activity is unknown; do not invent lyrics or assert "
-                        "visible singing. Stage the lead singer listening or moving "
-                        "with relaxed closed lips by default; any lip movement must "
-                        "follow an actual audible voice in the supplied audio, never "
-                        "a guitar riff. Do not invent a bellow, shout, vocal breath "
-                        "or open-mouth exertion to convey musical energy"
+                        "activity is unknown; do not invent lyrics or visible "
+                        "singing, and do not add anyone to represent the "
+                        "soundtrack; lip movement follows an actually audible "
+                        "voice, not musical rhythm"
                     )
             else:
                 vocal_info = (
@@ -747,31 +658,9 @@ class MusicVideoPlanner(BasePlanner):
                     if lyrics_snippet else "instrumental"
                 )
 
-            # Put the lyrics excerpt FIRST and label it as the primary visual
-            # source. The 4B planner otherwise ignores the excerpt buried later
-            # in the line and falls back on the Scene Concept's recurring
-            # objects, producing the same image (e.g. an empty throne) for most
-            # clips instead of telling the lyric story.
-            if lyrics_snippet and not source_audio_drives_vocals:
-                ctx = (
-                    f"Clip {i + 1} of {total}: {section}, {beat_count} beats. "
-                    f"LYRICS — build this clip's image_prompt from this excerpt: "
-                    f'"{lyrics_snippet}".{performer_hint}'
-                )
-            else:
-                ctx = f"Clip {i + 1} of {total}: {section}, {beat_count} beats, {vocal_info}.{performer_hint}"
-            section_hints = _SECTION_VISUAL_STRATEGY.get(section, {}).get("hints", "")
-            if section_hints:
-                ctx += f" Section direction: {section_hints}."
-            if run_len > 1:
-                ctx += (
-                    f" This is {section} clip {run_pos} of {run_len}. "
-                    "Give it a distinct starting frame that progresses the section "
-                    "(establishing → detail → wide → action); never repeat the "
-                    "previous clip's image_prompt."
-                )
+            ctx = f"Clip {i + 1}: {section}, {beat_count} beats, {vocal_info}.{performer_hint}"
             from services.director.music_cues import format_music_cues
-            cue_context = format_music_cues(clip, performers=performers)
+            cue_context = format_music_cues(clip)
             if cue_context:
                 ctx += f" Music timing: {cue_context}"
             contexts.append(ctx)
@@ -822,24 +711,15 @@ class MusicVideoPlanner(BasePlanner):
                     str((previous or {}).get("ending_beat") or "").strip()
                     or "No prior clip; establish the opening cleanly."
                 )
-                timeline_continuity = (
-                    "Preserve performer identity, wardrobe, world, and "
-                    "established visual grammar unless the song section "
-                    "motivates a visible change."
-                    if getattr(self, "_performers", True)
-                    else "Preserve the established world, environment, and "
-                    "visual grammar unless the song section motivates a "
-                    "visible change. No lead performer, singer, musician, or "
-                    "dancer ever appears; carry the no-performer visual "
-                    "language through every remaining clip."
-                )
                 batch_concept = (
                     f"{scene_description}\n\n"
                     "LONG-FORM TIMELINE CONTRACT:\n"
                     f"This is planning batch {batch_number}, covering global "
                     f"clips {start + 1}-{end} of {len(clips)}. Continue the "
                     "same music video; do not restart its visual premise or "
-                    f"repeat completed clip ideas. {timeline_continuity}\n"
+                    "repeat completed clip ideas. Preserve performer identity, "
+                    "wardrobe, world, and established visual grammar unless "
+                    "the song section motivates a visible change.\n"
                     f"Previous planned ending: {previous_ending}"
                 )
                 return self._plan_with_llm(
@@ -897,36 +777,11 @@ class MusicVideoPlanner(BasePlanner):
         uses_generated_images = bool(
             getattr(self, "_uses_generated_shot_images", True)
         )
-        if (
-            getattr(self, "_performers", True)
-            or char_profiles
-            or has_reference
-            or num_character_refs
-        ):
-            char_rules = build_character_rules_block(
-                has_reference or bool(num_character_refs),
-                char_profiles if char_profiles else None,
-                preserve_names=preserve_names,
-            )
-        else:
-            # No performers, characters, or references — a narrative / scenery
-            # music video. The character-identification guide is all about
-            # people and reference images, which pushes the LLM to invent
-            # lead performers. Replace it with an explicit no-lead rule that
-            # still permits anonymous background figures when the concept
-            # calls for them (distant, faceless, never a lead).
-            char_rules = (
-                "NO LEAD PERFORMERS:\n"
-                "- The Scene Concept calls for no lead performer, singer, "
-                "musician, or dancer. Never show a named or lead character, "
-                "and never lip-sync.\n"
-                "- Anonymous background figures are allowed ONLY when the "
-                "Scene Concept calls for them: distant, faceless, at the "
-                "edge of frame, never close, never a lead, never singing or "
-                "lip-syncing.\n"
-                "- Otherwise, show only environment, scenery, vehicles, "
-                "objects, and atmosphere that fit the Scene Concept."
-            )
+        char_rules = build_character_rules_block(
+            has_reference or bool(num_character_refs),
+            char_profiles if char_profiles else None,
+            preserve_names=preserve_names,
+        )
         camera_block = build_camera_style_block()
         # video_guide now merged into ltx2_music_video_rules.md — no separate load needed
 
@@ -957,10 +812,10 @@ class MusicVideoPlanner(BasePlanner):
             "visible traits, wardrobe, performance, camera, lighting, ambience, "
             "effects, and music.\n"
             "- The per-shot source-audio slice is mapped as driving audio. "
-            "Synchronize instrument playing, dance, action and camera to it. "
-            "Only assigned visible vocalists sing or lip-sync; on instrument "
-            "cutaways the singer remains off screen and the musician's mouth "
-            "stays closed. Do not invent or transcribe lyrics.\n"
+            "Synchronize this shot's assigned actions to it. Only a person "
+            "explicitly assigned as a visible vocalist lip-syncs to their own "
+            "audible part. Keep the source soundtrack as the audio source; do "
+            "not add a person to represent it or transcribe lyrics.\n"
             "- Character/location references are soft guidance, not fixed first "
             "frames. Describe the finished target shot.\n"
             "- Do not create image_prompt, image_source, visual_changes, or "
@@ -1001,12 +856,8 @@ The user's main reference is visual ground truth. Every image_prompt and video_p
             scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
 Character references define identity and location references define the setting. Follow their labels and the Scene Concept in every self-contained video prompt; do not invent conflicting identities or settings."""
         else:
-            if getattr(self, "_performers", True):
-                scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
-No visual reference was provided. Invent consistent performers and a setting that fit the Scene Concept, then reuse the same artists, roles and world across every clip. Show the assigned singer delivering vocals in singer-focused shots; instrument cutaways keep that voice off screen."""
-            else:
-                scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
-No visual reference was provided and the Scene Concept calls for no lead performer. Invent only a consistent environment, setting, props and atmosphere that fit the Scene Concept, then reuse that same world across every clip. No lead performer, singer, musician, or dancer ever appears. Anonymous background figures are allowed only when the Scene Concept calls for them — distant, faceless, at the edge of frame, never close, never a lead, never lip-syncing."""
+            scene_anchoring_rules = """SCENE-ANCHORING (avoid off-topic content):
+No visual reference was provided. Follow the Scene Concept, which may be narrative, dance, environment, or performance-focused. Do not add people or objects solely because the soundtrack contains vocals. Keep the identity and role of any requested or explicitly assigned person consistent across clips."""
 
         system_prompt = f"""You are a music video director. Plan each clip AND write its prompts. Output ONLY the JSON array.
 
@@ -1021,26 +872,11 @@ No visual reference was provided and the Scene Concept calls for no lead perform
 MUSIC VIDEO RULES:
 - Chorus = high energy, bold framing. Verse = intimate, character focus.
 - Instrumental = environment, textures. Bridge = contrasting, unexpected.
-- CRITICAL: build each image_prompt from THAT clip's own lyrics excerpt — the
-  subject, mood, and metaphor the lyrics describe. Do not let one recurring
-  prop/object from the Scene Concept (a throne, crown, etc.) dominate clips
-  whose lyrics are about something else.
-- RESERVE the song's central object: if one object (throne, crown, etc.) is
-  the focus of the chorus/empire imagery, show it prominently ONLY in that
-  section. In verses, intro, bridge, and outro, depict the lyric's mood and
-  atmosphere instead (shadows, corridors, cracks, quiet details) — do not
-  place the central object in every shot.
-- No single object may be the main subject of more clips than its own lyrics
-  justify. Change the central subject from clip to clip so the frames tell the
-  lyric story rather than repeating one object.
-- Vary visuals across clips. Consecutive clips in the SAME section (a multi-clip
-  intro, instrumental, or long chorus) must each use a distinct image_prompt that
-  progresses the section; never repeat the same starting frame. Performer must be
-  visible when assigned.
+- Vary visuals across clips. Performer must be visible when assigned.
 
 {music_video_rules}
 
-{MUSIC_PERFORMANCE_RULES if getattr(self, "_performers", True) else ""}
+{MUSIC_PERFORMANCE_RULES}
 
 {h3_direct_rules}
 
@@ -1052,7 +888,7 @@ OUTPUT — respond with ONLY a JSON array:
   {{
     "scene_goal": "What this clip achieves",
     "scene_type": "performance|narrative|atmospheric",
-    "subjects_on_screen": [{{"visual_description": "the woman in red", "position_or_relation": "center frame", "performance_role": "vocalist"}}],
+    "subjects_on_screen": [{{"visual_description": "a visible person", "position_or_relation": "center frame", "performance_role": "non_vocal"}}],
     "environment": "Setting details",
     "visual_style": "Style",
     "lighting": "Lighting",
@@ -1193,9 +1029,8 @@ Write {len(clips)} structured shot plans. Go:"""
                 ),
             )
 
-            # Keep all generated views of a performance consistent, including
-            # its start image and ending pose. The final H3 compiler repeats
-            # this after any later polish, using the persisted audio evidence.
+            # Keep role-specific mouth cues consistent across generated views
+            # of the shot. The final H3 compiler repeats this after later polish.
             from ..music_performance import constrain_music_performance, music_performance_direction
             for key in ("video_prompt", "image_prompt", "spatial_setup", "ending_beat"):
                 if isinstance(raw.get(key), str):
@@ -1208,12 +1043,17 @@ Write {len(clips)} structured shot plans. Go:"""
                         constrain_music_performance(value, subjects, audio.vocal_activity, project_context=project_context)
                         if isinstance(value, str) else value for value in raw[key]
                     ]
-            if audio.vocal_activity is not None:
-                direction = music_performance_direction(subjects, audio.vocal_activity, project_context=project_context, performers=getattr(self, "_performers", True))
-                if raw.get("video_prompt"):
+            if audio.mode == "music_driven":
+                direction = music_performance_direction(subjects, audio.vocal_activity, project_context=project_context)
+                if direction and raw.get("video_prompt") and direction not in raw["video_prompt"]:
                     raw["video_prompt"] = f"{raw['video_prompt']} {direction}"
-                if raw.get("window_prompts"):
-                    raw["window_prompts"] = [f"{value} {direction}" if isinstance(value, str) else value for value in raw["window_prompts"]]
+                if direction and raw.get("window_prompts"):
+                    raw["window_prompts"] = [
+                        f"{value} {direction}"
+                        if isinstance(value, str) and direction not in value
+                        else value
+                        for value in raw["window_prompts"]
+                    ]
 
             # Parse dialogue beats if present
             dialogue_beats = None
@@ -1224,18 +1064,6 @@ Write {len(clips)} structured shot plans. Go:"""
             image_strategy = "reference_edit" if has_reference else "fresh_generation"
             if section == "instrumental" and not has_reference:
                 image_strategy = "fresh_generation"
-
-            # The 4B planner occasionally returns an empty image_prompt (just
-            # the "Preserve character identity..." boilerplate). Fall back to a
-            # description built from the shot metadata so the image model still
-            # has a real subject instead of inventing one. Only when images are
-            # actually requested — prompt_only / direct_references shots keep
-            # image_prompt as None by design.
-            if (
-                getattr(self, "_uses_generated_shot_images", True)
-                and _minimal_image_prompt(raw.get("image_prompt"))
-            ):
-                raw["image_prompt"] = _fallback_image_prompt(raw, section)
 
             shot = ShotPlan(
                 shot_id=self._make_shot_id(i, "mv"),

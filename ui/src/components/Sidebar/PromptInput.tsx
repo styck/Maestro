@@ -3,6 +3,7 @@ import { Sparkles, Loader2, ChevronDown, ChevronUp, Brain, PenLine, RefreshCw, C
 import { canEnhanceOnGeneration, shouldEnhanceOnGeneration, useStore } from '../../stores/useStore'
 import {
   effectiveH3OmniSequenceFrames,
+  h3MaximumFrames,
   h3OmniSequenceWindowCount,
   h3TimelineFrames,
 } from '../../lib/h3Memory'
@@ -10,6 +11,12 @@ import {
   continuationFirstWindowFrames,
   durationWindowPlan,
 } from '../../lib/durationPlanning'
+import {
+  h3SlidingWindowPlanMatchesTiming,
+  normalizeSlidingWindowFrames,
+  normalizeSlidingWindowOverlap,
+  resolveH3StoryboardDiscardFrames,
+} from '../../lib/h3WindowTiming'
 import { ComposerContext, ComposerToolbarItem } from './SidebarPanels'
 import { SidebarMenu } from './SidebarMenu'
 
@@ -160,6 +167,8 @@ export function PromptInput() {
   const slidingWindowLocked = useStore(s => s.slidingWindowLocked)
   const modelOptions = useStore(s => s.modelOptions)
   const resolution = useStore(s => s.params.resolution)
+  const modelType = useStore(s => s.params.model_type)
+  const customSettings = useStore(s => s.params.custom_settings)
   const totalVramGb = useStore(s => s.systemStats?.gpu.vram_total_gb ?? 0)
   const imageMode = useStore(s => s.params.image_mode)
   const studioVideoWorkflow = useStore(s => s.studioVideoWorkflow)
@@ -205,8 +214,27 @@ export function PromptInput() {
   const enhanceStatus = useEnhanceStatus(isEnhancing)
   const fps = modelOptions?.fps ?? 16
   const swDefaults = (modelOptions as Record<string, unknown> | null)?.sliding_window_defaults as Record<string, number> | undefined
-  const discardFrames = swDefaults?.discard_last_frames ?? 0
-  const overlapSec = slidingWindowOverlap / fps
+  const extendedDuration = useStore(s => s.params.minimax_h3_extended_duration === true)
+  const nativeMaximumFrames = h3MaximumFrames(modelOptions, extendedDuration)
+  const isH3FirstLast = (
+    String(modelOptions?.architecture || '').startsWith('minimax_h3')
+    && modelOptions?.omni_reference !== true
+  )
+  const h3StoryboardTiming = isH3FirstLast && h3FirstLastMultiWindow
+  const storyboardWindowDefaults = h3StoryboardTiming && extendedDuration && nativeMaximumFrames != null
+    ? { ...swDefaults, window_max: nativeMaximumFrames }
+    : swDefaults
+  const windowFrames = h3StoryboardTiming
+    ? normalizeSlidingWindowFrames(Math.round(slidingWindowSeconds * fps), storyboardWindowDefaults)
+    : Math.max(1, Math.round(slidingWindowSeconds * fps))
+  const overlapFrames = h3StoryboardTiming
+    ? normalizeSlidingWindowOverlap(slidingWindowOverlap, swDefaults)
+    : Math.max(0, Math.round(slidingWindowOverlap))
+  const discardFrames = h3StoryboardTiming
+    ? resolveH3StoryboardDiscardFrames(swDefaults, customSettings)
+    : swDefaults?.discard_last_frames ?? 0
+  const windowSeconds = windowFrames / fps
+  const overlapSec = overlapFrames / fps
   const discardSec = discardFrames / fps
   const supportsSlidingWindows = modelOptions?.sliding_window === true
   const firstWindowSeconds = (
@@ -214,20 +242,16 @@ export function PromptInput() {
     && supportsSlidingWindows
   )
     ? continuationFirstWindowFrames(
-        Math.round(slidingWindowSeconds * fps),
-        slidingWindowOverlap,
+        windowFrames,
+        overlapFrames,
       ) / fps
-    : slidingWindowSeconds
+    : windowSeconds
   const plannedDuration = durationWindowPlan(
     durationSeconds,
-    slidingWindowSeconds,
+    windowSeconds,
     overlapSec,
     discardSec,
     firstWindowSeconds,
-  )
-  const isH3FirstLast = (
-    String(modelOptions?.architecture || '').startsWith('minimax_h3')
-    && modelOptions?.omni_reference !== true
   )
   const isLtxSequence = modelOptions?.multi_window_sequence_controls === true
   const windowCount = supportsSlidingWindows
@@ -240,7 +264,6 @@ export function PromptInput() {
     usesWindows
     && modelOptions?.sliding_window_auto_prompt_pacing === true
   )
-  const nativeMaximumFrames = modelOptions?.frames_maximum ?? null
   const sequenceClipFrames = nativeMaximumFrames != null
     ? effectiveH3OmniSequenceFrames({
         policy: modelOptions?.omni_sequence_memory_policy,
@@ -262,7 +285,7 @@ export function PromptInput() {
   const h3SequenceTotalFrames = h3TimelineFrames(
     durationSeconds,
     fps,
-    modelOptions?.frames_maximum,
+    nativeMaximumFrames,
   )
   const h3SequenceNeedsMultiplePasses = (
     h3SequenceEnabled
@@ -303,12 +326,32 @@ export function PromptInput() {
   const expectedPlanCount = usesH3SequencePlanner ? sequenceClipCount : windowCount
   const expectedWindowFrames = usesH3SequencePlanner
     ? Math.max(1, Number(sequenceClipFrames || 1))
-    : Math.max(1, Math.round(slidingWindowSeconds * fps))
+    : windowFrames
+  const plannedWindowFrames = h3WindowPlan?.effective_window_frames
+    ?? h3WindowPlan?.window_frames
+  const h3FramesPlanIsStale = !!h3WindowPlan
+    && isH3FirstLast
+    && studioVideoWorkflow === 'frames'
+    && h3WindowPlan.plan_kind !== 'reference_sequence'
+    && (
+      !usesH3WindowPlanner
+      || !h3FirstLastMultiWindow
+      || !h3SlidingWindowPlanMatchesTiming(h3WindowPlan, {
+        sourcePrompt: prompt,
+        modelType,
+        resolution,
+        totalFrames: Math.max(1, Math.round(durationSeconds * fps)),
+        windowFrames,
+        overlapFrames,
+        discardFrames,
+        cameraCoverage: h3CameraCoverage,
+      })
+    )
   const h3PlanIsStale = !!h3WindowPlan && (
     h3WindowPlan.source_prompt.trim() !== prompt.trim()
     || h3WindowPlan.window_count !== expectedPlanCount
     || h3WindowPlan.total_frames !== Math.max(1, Math.round(durationSeconds * fps))
-    || h3WindowPlan.window_frames !== expectedWindowFrames
+    || plannedWindowFrames !== expectedWindowFrames
     || (h3WindowPlan.camera_coverage || 'auto') !== h3CameraCoverage
     || (usesH3SequencePlanner
       ? h3WindowPlan.plan_kind !== 'reference_sequence'
@@ -318,6 +361,7 @@ export function PromptInput() {
     || (usesH3SequencePlanner
       && h3NativeSequence
       && Number(h3WindowPlan.overlap_frames || 0) !== slidingWindowOverlap)
+    || h3FramesPlanIsStale
   )
   const matchingActiveH3Phase = (
     h3WindowPlan?.signature === activeH3JobPlanSignature
@@ -390,7 +434,7 @@ export function PromptInput() {
           {promptEnhanceError}
         </div>
       )}
-      {usesH3Plan && h3WindowPlan && (
+      {(usesH3Plan || h3FramesPlanIsStale) && h3WindowPlan && (
         <div className="mb-1.5">
           <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-border bg-bg-tertiary/70">
             <button
@@ -420,7 +464,7 @@ export function PromptInput() {
               type="button"
               onClick={() => enhancePrompt(undefined, h3WindowPlan.planning_style || 'adaptive')}
               disabled={isEnhancing}
-              title={`Rebuild the H3 ${usesH3SequencePlanner ? 'reference sequence' : 'window plan'} from the current idea and timing.`}
+              title="Create a new draft for all windows. This replaces the current prompts."
               className="p-1 text-text-muted hover:text-accent-blue disabled:opacity-50"
             >
               <RefreshCw size={11} className={isEnhancing ? 'animate-spin' : ''} />
@@ -448,8 +492,16 @@ export function PromptInput() {
                 </details>
               )}
               <div className="mt-1 text-text-muted">
-                Open the exact window prompts to review or edit the script, or refresh to enhance again.
+                Generate uses all {h3WindowPlan.window_count} {usesH3SequencePlanner && !h3NativeSequence ? 'clips' : 'windows'} shown below, including flagged drafts. You can edit them before generating.
               </div>
+              {!!h3WindowPlan.retryable_windows?.length && !h3PlanIsStale && <div className="mt-2">
+                <button type="button" disabled={isEnhancing}
+                  onClick={() => void enhancePrompt(undefined, h3WindowPlan.planning_style || 'adaptive', true)}
+                  className="rounded-md border border-border px-2 py-1.5 text-text-primary hover:bg-bg-hover disabled:opacity-50">
+                  Retry {h3WindowPlan.retryable_windows.length === 1 ? `window ${h3WindowPlan.retryable_windows[0]}` : 'flagged windows'}
+                </button>
+                <p className="mt-1 text-text-muted">Keeps the other prompts and story schedule. Updates this draft without starting generation.</p>
+              </div>}
             </div>
           )}
           {!compact && !!h3WindowPlan.planning_notes?.length && (
@@ -525,7 +577,9 @@ export function PromptInput() {
               ? (isLtxSequence
                   ? `Describe your complete video, then press Enhance to plan ${windowCount} LTX windows.`
                   : `Line 1 = window 1, line 2 = window 2... (${windowCount} windows)`)
-            : modePlaceholder}
+            : studioVideoWorkflow === 'avatar' && generationMode === 'video'
+              ? 'Describe the people, setting and motion. Voice audio supplies their speech.'
+              : modePlaceholder}
           className={`studio-prompt-textarea block w-full resize-none px-3 py-2 text-base md:text-sm text-text-primary placeholder:text-text-muted focus:outline-none transition-colors ${compact ? 'min-h-[72px] bg-transparent border border-transparent rounded-lg focus:border-border-light' : `${composer?.expanded ? 'min-h-[260px]' : 'min-h-[104px]'} bg-bg-tertiary border border-border rounded-xl focus:border-accent-blue`}`}
         />
         <ComposerToolbarItem>{isAudioOnly ? (

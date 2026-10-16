@@ -1,8 +1,9 @@
 import { Settings, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useMemo, useState, type CSSProperties } from 'react'
 import { useStore } from '../../stores/useStore'
+import { AvatarControls } from './AvatarControls'
 import { ViggleControls } from './ViggleControls'
-import { useIsMobile } from '../../lib/useIsMobile'
+import { useIsMobileSidecar } from '../../lib/useIsMobile'
 import { GenerationModeSelector } from './GenerationModeSelector'
 import { InputsPanel } from './InputsPanel'
 import { OmniReferenceSection } from './OmniReferenceSection'
@@ -30,6 +31,7 @@ import { HardwareStatusBar } from './HardwareStatusBar'
 import { VideoWorkflowSelector } from './VideoWorkflowSelector'
 import { ImageWorkflowSelector } from './ImageWorkflowSelector'
 import { ImageWorkflowControls } from './ImageWorkflowControls'
+import { ControlVideoSection } from './ControlVideoSection'
 import { AppModeToggle, MaestroBrand } from '../AppModeNavigation'
 import { CharacterToolbarContext, PromptDock, SidebarLayoutContext } from './SidebarPanels'
 
@@ -59,7 +61,7 @@ export function Sidebar() {
   const sidebarMode = useStore(s => s.sidebarMode)
   const editSubMode = useStore(s => s.editSubMode)
   const selectedModel = useStore(s => s.models.find(model => model.model_type === s.params.model_type))
-  const isMobile = useIsMobile()
+  const isMobile = useIsMobileSidecar()
   const [characterSlot, setCharacterSlot] = useState<HTMLDivElement | null>(null)
   const [sidebarElement, setSidebarElement] = useState<HTMLElement | null>(null)
   const [settingsElement, setSettingsElement] = useState<HTMLDivElement | null>(null)
@@ -169,6 +171,7 @@ export function Sidebar() {
   )
   const isFramesWorkflow = isVideo && Number(imageMode) === 0 && videoWorkflow === 'frames'
   const isAnimate = isVideo && videoWorkflow === 'animate'
+  const isAvatarWorkflow = isVideo && videoWorkflow === 'avatar'
   const isReferencesWorkflow = isVideo && Number(imageMode) === 0 && videoWorkflow === 'references'
   const isMultiClip = isVideo && imageMode === 2
   const isContinue = isVideo && imageMode === 3
@@ -241,6 +244,9 @@ export function Sidebar() {
           <ToolsPanel forcedTool="revoice" embedded />
         ) : (
         <>
+        {(isImage || isVideo) && !isAnimate && !isAvatarWorkflow && !isOmniReference && !modelOptions?.minimax_h3_media_sources && (
+          <ControlVideoSection galleryOnly />
+        )}
         {/* Video Transform workflows use the established Edit engines. */}
         {isEdit && editControls}
 
@@ -248,6 +254,7 @@ export function Sidebar() {
             start/end anchors — so the generic Duration slider and
             start/end ImageUpload don't apply there. */}
         {isAnimate && <ViggleControls />}
+        {isAvatarWorkflow && <AvatarControls />}
         {/* Frames (image_mode 0) AND Extend (image_mode 3) both use the unified
             InputsPanel. In Extend mode its first tile is the source video to
             continue from; otherwise it's the start frame. */}
@@ -266,7 +273,7 @@ export function Sidebar() {
 
         {/* Image workflows expose only the inputs their native pipeline uses. */}
         {isImage && <ImageWorkflowControls />}
-        {isImage && (imageWorkflow === 'generate' || !!modelOptions?.image_ref_choices) && <ImageRefSection />}
+        {isImage && (imageWorkflow === 'generate' || !!modelOptions?.image_ref_inpaint) && <ImageRefSection />}
 
         {/* Video/Image mode: audio controls (soundtrack, control video, etc.).
             In Frames mode (video, image_mode 0) the unified InputsPanel routes
@@ -321,6 +328,7 @@ export function Sidebar() {
               <AppModeToggle size="sm" />
               <button
                 onClick={() => setSidebarOpen(false)}
+                aria-label="Close sidecar"
                 className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
               >
                 <X size={16} />

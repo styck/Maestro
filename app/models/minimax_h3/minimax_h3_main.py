@@ -33,7 +33,11 @@ from .checkpoint import (
     preprocess_native_video_vae_state_dict,
 )
 from .conditioner import MiniMaxH3Conditioner, MiniMaxH3Qwen3VL, build_h3_processor, load_h3_qwen_config
-from .convrot_layout import has_convrot_layout, restore_interleaved_h3_qkv
+from .convrot_layout import (
+    convrot_quantization_info_from_file,
+    has_convrot_layout,
+    restore_interleaved_h3_qkv,
+)
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_FPS,
@@ -70,6 +74,7 @@ from .scheduler import (
     MiniMaxH3Scheduler,
     res_multistep_update,
 )
+from .singularity import validate_minimax_h3_singularity_checkpoint
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .fused_turbo import (
     FUSED_H3_MAX_EVALUATIONS,
@@ -83,9 +88,11 @@ from .transformer import (
 )
 from .turbo import (
     MINIMAX_H3_TURBO_MIN_STEPS,
+    find_minimax_h3_accelerators,
     find_minimax_h3_pdd_loras,
     find_minimax_h3_turbo_loras,
     h3_scheduler_grid_points,
+    minimax_h3_adapter_workflow,
     minimax_h3_turbo_preset_for_path,
 )
 from .pdd import (
@@ -425,6 +432,137 @@ def _reinject_video_source(
         video_rows.lerp_(buffer_rows, 1.0 - editable_mask_rows)
 
 
+def _report_h3_preview_error(callback, error) -> None:
+    """Report an optional preview failure without interrupting generation."""
+
+    report = getattr(callback, "preview_error", None)
+    if callable(report):
+        try:
+            report(error)
+        except Exception:
+            pass
+
+
+def _h3_video_scheduler_step(
+    scheduler,
+    model_output: torch.Tensor,
+    timestep,
+    sample: torch.Tensor,
+    *,
+    callback,
+    index: int,
+    audio_only: bool,
+    frozen_target_video,
+    generated_video_row_count: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run one H3 video update, capturing its existing x0 only for due previews."""
+
+    wants_preview = getattr(callback, "wants_preview", None) if callback is not None else None
+    preview_due = False
+    if (
+        generated_video_row_count > 0
+        and not audio_only
+        and frozen_target_video is None
+        and callable(wants_preview)
+    ):
+        try:
+            preview_due = bool(wants_preview(index))
+        except Exception as error:
+            _report_h3_preview_error(callback, error)
+
+    if preview_due:
+        prev_sample, denoised = scheduler.step(
+            model_output,
+            timestep,
+            sample,
+            return_dict=False,
+            return_denoised=True,
+        )
+        return prev_sample, denoised
+
+    prev_sample = scheduler.step(
+        model_output,
+        timestep,
+        sample,
+        return_dict=False,
+    )[0]
+    return prev_sample, None
+
+
+def _prepare_h3_clean_preview(
+    callback,
+    denoised_rows: torch.Tensor | None,
+    video_rows: torch.Tensor,
+    *,
+    condition_row_count: int,
+    generated_row_count: int,
+    index: int,
+    final_index: int,
+    denoising_start_step: int,
+    mask_end_step: int,
+    source_video_rows: torch.Tensor | None,
+    editable_mask_rows: torch.Tensor | None,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    patch_size,
+) -> torch.Tensor | None:
+    """Decode a due clean estimate while preserving H3 conditioning semantics."""
+
+    if denoised_rows is None:
+        return None
+    try:
+        target_rows = video_rows[condition_row_count:]
+        if index == final_index:
+            # The terminal state may include source reinjection or fixed rows;
+            # use the exact rows that the final decoder will receive.
+            preview_rows = target_rows
+        else:
+            clean_generated_rows = denoised_rows
+            if source_video_rows is not None and index < denoising_start_step:
+                clean_generated_rows = source_video_rows[:generated_row_count].clone()
+            elif (
+                source_video_rows is not None
+                and index < mask_end_step
+                and editable_mask_rows is not None
+            ):
+                source_clean_rows = source_video_rows[:generated_row_count].to(
+                    clean_generated_rows
+                )
+                editable_rows = editable_mask_rows[:generated_row_count].to(
+                    clean_generated_rows
+                )
+                clean_generated_rows = torch.lerp(
+                    source_clean_rows,
+                    clean_generated_rows,
+                    editable_rows,
+                )
+
+            # H3 target-conditioned rows are not stepped by the scheduler.
+            # Retain them after the generated clean rows so unpacking sees the
+            # complete target timeline without ever including prefix rows.
+            target_condition_rows = target_rows[generated_row_count:]
+            if target_condition_rows.shape[0]:
+                preview_rows = torch.cat(
+                    (clean_generated_rows, target_condition_rows),
+                    dim=0,
+                )
+            else:
+                preview_rows = clean_generated_rows
+
+        return unpatchify_video_tokens(
+            preview_rows,
+            num_latent_frames,
+            latent_height,
+            latent_width,
+            24,
+            patch_size,
+        ).squeeze(0).detach()
+    except Exception as error:
+        _report_h3_preview_error(callback, error)
+        return None
+
+
 def _build_frozen_control_video(
     input_frames,
     input_video,
@@ -638,17 +776,18 @@ def _strip_transformer_wrappers(
     # the official head-interleaved layout need this physical reorder.
     if interleave_qkv and any(key.endswith(".qkv_proj.weight") for key in state_dict):
         restore_interleaved_h3_qkv(state_dict)
-    prefixes = ("model.diffusion_model.", "diffusion_model.")
+    prefixes = ("model.diffusion_model.", "diffusion_model.", "module.")
 
     def strip(mapping):
         if mapping is None:
             return None
         normalized = {}
         for key, value in mapping.items():
-            for prefix in prefixes:
-                if key.startswith(prefix):
-                    key = key[len(prefix) :]
-                    break
+            while any(key.startswith(prefix) for prefix in prefixes):
+                for prefix in prefixes:
+                    if key.startswith(prefix):
+                        key = key[len(prefix) :]
+                        break
             if key.startswith("transformer_blocks."):
                 for branch in ("linear_attention", "softmax_gate", "to_out_linear"):
                     if f".attn.{branch}." in key:
@@ -714,20 +853,25 @@ def _normalize_conditioner_checkpoint_namespaces(
     )
 
 
-def probe_h3_checkpoint(filename: str) -> dict[str, int | bool | None]:
+def probe_h3_checkpoint(filename: str) -> dict[str, int | bool | str | tuple | None]:
     """Inspect H3 tensor headers before allocating its 20B/33B network."""
 
     state_dict, metadata = quant_router.load_metadata_state_dict(filename)
-    quantization_format = str(
+    metadata_quantization_format = str(
         (metadata or {}).get("quantization_format", "")
     ).lower()
-    convrot = "convrot" in quantization_format or has_convrot_layout(state_dict)
+    convrot = (
+        "convrot" in metadata_quantization_format
+        or has_convrot_layout(state_dict)
+    )
     table = None
     for key, tensor in state_dict.items():
-        for prefix in ("model.diffusion_model.", "diffusion_model."):
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
-                break
+        prefixes = ("model.diffusion_model.", "diffusion_model.", "module.")
+        while any(key.startswith(prefix) for prefix in prefixes):
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix) :]
+                    break
         if key == "adaln_t_table":
             table = tensor
             break
@@ -737,14 +881,20 @@ def probe_h3_checkpoint(filename: str) -> dict[str, int | bool | None]:
             "adaln_curve_grid": None,
             "time_embed_dim": 2688,
             "convrot": convrot,
+            "quantization_format": metadata_quantization_format,
+            "convrot_group_size": None,
         }
     if len(table.shape) != 2 or int(table.shape[0]) < 2:
         raise ValueError(f"Invalid H3 AdaLN curve table shape: {tuple(table.shape)}")
+    if not table.dtype.is_floating_point:
+        raise ValueError("The H3 AdaLN curve must use unquantized floating-point storage.")
     return {
         "compressed_modulation": True,
         "adaln_curve_grid": int(table.shape[0]),
         "time_embed_dim": int(table.shape[1]),
         "convrot": convrot,
+        "quantization_format": metadata_quantization_format,
+        "convrot_group_size": None,
     }
 
 
@@ -755,11 +905,41 @@ def _load_transformer(
     qkv_layout: str = "contiguous",
     sla_config=None,
     vdn: bool = False,
+    singularity: bool = False,
+    dasiwa: bool = False,
+    import_profile: dict | None = None,
 ) -> MiniMaxH3Transformer:
     checkpoint = probe_h3_checkpoint(_first_path(filename))
     qkv_layout = str(qkv_layout or "contiguous").strip().lower()
     if qkv_layout not in {"contiguous", "grouped", "interleaved"}:
         raise ValueError(f"Unsupported MiniMax H3 QKV layout {qkv_layout!r}")
+    if singularity or dasiwa:
+        # MMGP's metadata-only loader returns descriptor tensor stubs. Read
+        # just the tiny Comfy quantization marker tensors from this pinned
+        # checkpoint; never materialize the model weights during the probe.
+        checkpoint.update(
+            convrot_quantization_info_from_file(_first_path(filename))
+        )
+    if singularity:
+        validate_minimax_h3_singularity_checkpoint(checkpoint, qkv_layout)
+    if dasiwa:
+        from .dasiwa import validate_dasiwa_checkpoint
+        validate_dasiwa_checkpoint(checkpoint, qkv_layout)
+    if import_profile:
+        from services.civitai_checkpoints import inspect_local_h3
+        verified = inspect_local_h3(_first_path(filename), import_profile.get("source") or {},
+                                   sampling_profile=import_profile.get("sampling_profile", "auto"),
+                                   native_workflow=import_profile.get("native_workflow", "auto"),
+                                   qkv_layout=import_profile.get("qkv_layout_selection", "auto"))
+        if verified.get("status") != "verified" or any(
+            verified.get(key) != import_profile.get(key) for key in
+            ("compressed_modulation", "adaln_curve_grid", "time_embed_dim", "qkv_layout", "quantization_format", "convrot_group_size")
+        ) or any(
+            verified.get(key) != import_profile[key] for key in
+            ("file_format", "weight_group_size", "gguf_quant_types") if key in import_profile
+        ) or qkv_layout != verified["qkv_layout"]:
+            raise ValueError("The imported H3 checkpoint no longer matches its verified loader profile. Re-import the file in the model browser.")
+        checkpoint.update(verified)
     with init_empty_weights(include_buffers=True):
         transformer = MiniMaxH3Transformer(
             curve_grid=checkpoint["adaln_curve_grid"],
@@ -778,7 +958,13 @@ def _load_transformer(
     # contiguous [Q, K, V] groups; older BF16/full definitions can still ask
     # for the head-interleaved split explicitly.
     split_map = None
-    if qkv_layout in {"grouped", "interleaved"}:
+    scaled_fp8_grouped = checkpoint.get("quantization_format") == "scaled_fp8" and qkv_layout == "grouped"
+    # GGUF stores packed blocks whose byte shape differs from logical rows.
+    # Keep fused QKV/MLP weights, as WanGP does, and interpret their verified
+    # grouped/interleaved row order in the transformer forward pass.
+    filenames = filename if isinstance(filename, (list, tuple)) else [filename]
+    gguf_checkpoint = any(str(path).lower().endswith(".gguf") for path in filenames)
+    if qkv_layout in {"grouped", "interleaved"} and not scaled_fp8_grouped and not gguf_checkpoint:
         split_map = get_linear_split_map(
             inner_size,
             interleaved=qkv_layout == "interleaved",
@@ -798,8 +984,17 @@ def _load_transformer(
     )
     transformer._model_dtype = dtype
     transformer.h3_checkpoint_info = checkpoint
+    if singularity or dasiwa or import_profile:
+        # Studio Frames changes conditioning, not this Ref2VA checkpoint's
+        # AdaLN basis. MMGP otherwise chooses conversion from the UI architecture.
+        transformer.h3_lora_model_type = (
+            "minimax_h3_ref2va" if not import_profile or import_profile["native_workflow"] == "ref2va"
+            else "minimax_h3"
+        )
     transformer.split_linear_modules_map = split_map
     transformer.h3_qkv_layout = qkv_layout
+    if split_map is None:
+        transformer.set_qkv_layout(qkv_layout)
     print(
         "[MiniMax H3] Loaded "
         f"{'pruned 20B curve' if checkpoint['compressed_modulation'] else 'full 33B'} "
@@ -973,6 +1168,13 @@ class MiniMaxH3Model:
         self._fused_turbo = bool(
             model_def.get("minimax_h3_fused_turbo", False)
         )
+        self.singularity = bool(model_def.get("minimax_h3_singularity", False))
+        self.dasiwa = bool(model_def.get("minimax_h3_dasiwa", False))
+        self._baked_turbo = bool(model_def.get("minimax_h3_baked_turbo", False))
+        if self.singularity and self._fused_turbo:
+            raise ValueError(
+                "MiniMax H3 Singularity uses a separate checkpoint and cannot be marked as fused Turbo."
+            )
         self.sample_solver = str(
             model_def.get("minimax_h3_sampler") or "euler"
         ).strip().lower()
@@ -1017,6 +1219,9 @@ class MiniMaxH3Model:
             qkv_layout=qkv_layout,
             sla_config=model_def.get("sla_attention_config"),
             vdn=self.vdn,
+            singularity=self.singularity,
+            dasiwa=self.dasiwa,
+            import_profile=model_def.get("minimax_h3_import_profile"),
         )
         from .viggle import load_conditioner
         self.conditioner = load_conditioner() if self.viggle else _load_conditioner(
@@ -1028,10 +1233,10 @@ class MiniMaxH3Model:
         self.vae = _load_video_vae(video_vae_path)
         self.audio_vae = _load_audio_vae(audio_vae_path)
         self.scheduler = MiniMaxH3Scheduler(
-            shift=3.0 if self.viggle else 12.0,
+            shift=3.0 if self.viggle else float(model_def.get("minimax_h3_video_shift", 12.0)),
             solver=self.sample_solver,
         )
-        self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
+        self.audio_scheduler = MiniMaxH3Scheduler(shift=float(model_def.get("minimax_h3_audio_shift", 3.0)))
         self._turbo_lora_active = False
         self._turbo_lora_paths: tuple[str, ...] = ()
         self._pdd_lora_active = False
@@ -1048,23 +1253,30 @@ class MiniMaxH3Model:
         self.release_special_loras()
         if getattr(self, "_fused_turbo", False):
             validate_fused_h3_loras(loras_selected)
+        if getattr(self, "_baked_turbo", False):
+            if self.model_def.get("minimax_h3_import_profile"):
+                from .imported import validate_imported_h3_loras
+                validate_imported_h3_loras(loras_selected)
+            else:
+                from .dasiwa import validate_dasiwa_turbo_loras
+                validate_dasiwa_turbo_loras(loras_selected)
+        accelerator_paths = tuple(
+            find_minimax_h3_accelerators(loras_selected)
+        )
+        if len(accelerator_paths) > 1:
+            raise ValueError(
+                "MiniMax H3 supports one accelerator at a time; select only "
+                "one Turbo or PDD adapter."
+            )
         turbo_paths = tuple(find_minimax_h3_turbo_loras(loras_selected))
-        if len(turbo_paths) > 1:
-            raise ValueError(
-                "MiniMax H3 supports one Turbo accelerator at a time; "
-                "select one preset in H3 Optimizations."
-            )
         pdd_paths = tuple(find_minimax_h3_pdd_loras(loras_selected))
-        if len(pdd_paths) > 1:
-            raise ValueError(
-                "MiniMax H3 supports one Parallel Decoding Distillation "
-                "adapter at a time."
-            )
         for path in turbo_paths:
             preset = minimax_h3_turbo_preset_for_path(path)
             if preset is None:
                 continue
-            expected = "ref2va" if self.omni_reference else "fl2va"
+            expected = minimax_h3_adapter_workflow(
+                {**self.model_def, "omni_reference": self.omni_reference}
+            )
             actual = str(preset.get("workflow") or "all").lower()
             if actual not in {"all", expected}:
                 raise ValueError(
@@ -1548,6 +1760,7 @@ class MiniMaxH3Model:
         _audio_segment=False,
         _audio_speaker=None,
         _face_refinement=None,
+        minimax_h3_extended_duration=False,
         **_kwargs,
     ):
         if not _audio_segment:
@@ -1599,13 +1812,27 @@ class MiniMaxH3Model:
                 "cover up to 10.13s; Maestro will continue, but quality "
                 "beyond that demonstrated envelope is experimental."
             )
-        if _face_refinement is None and not self.audio_only and not MINIMAX_H3_MIN_DURATION <= duration <= MINIMAX_H3_MAX_DURATION:
+        from .duration import H3_EXPERIMENTAL_MAX_SECONDS
+        maximum_duration = (
+            H3_EXPERIMENTAL_MAX_SECONDS
+            if minimax_h3_extended_duration is True and not self.viggle
+            else MINIMAX_H3_MAX_DURATION
+        )
+        if _face_refinement is None and not self.audio_only and not MINIMAX_H3_MIN_DURATION <= duration <= maximum_duration:
             raise ValueError(
-                f"MiniMax H3 supports {MINIMAX_H3_MIN_DURATION:g}-{MINIMAX_H3_MAX_DURATION:g}s at 24 fps; "
+                f"MiniMax H3's selected duration limit is {MINIMAX_H3_MIN_DURATION:g}-{maximum_duration:g}s at 24 fps; "
                 f"the aligned request is {frame_num} frames ({duration:.3f}s)."
             )
         if int(sampling_steps) < 2:
             raise ValueError("MiniMax H3 needs at least two scheduler grid points.")
+        if self._baked_turbo:
+            profile = self.model_def.get("minimax_h3_import_profile")
+            if profile:
+                from .imported import normalize_imported_h3_steps
+                sampling_steps = normalize_imported_h3_steps(sampling_steps, profile)
+            else:
+                from .dasiwa import normalize_dasiwa_turbo_steps
+                sampling_steps = normalize_dasiwa_turbo_steps(sampling_steps)
         if self._fused_turbo and not (
             FUSED_H3_MIN_EVALUATIONS
             <= int(sampling_steps)
@@ -1703,7 +1930,7 @@ class MiniMaxH3Model:
         if refine_soundtrack:
             from .audio_refinement import refinement_unavailable
             reason = refinement_unavailable(audio_only=self.audio_only, pdd=self._pdd_lora_active,
-                                            fused=self._fused_turbo, source_audio=source_audio_mode)
+                                            fused=self._fused_turbo or self._baked_turbo, source_audio=source_audio_mode)
             if reason:
                 raise ValueError(reason)
         if frozen_video_mode:
@@ -2579,15 +2806,23 @@ class MiniMaxH3Model:
                     if prediction is None or self._interrupt:
                         return None
                     video_velocity, audio_velocity = prediction
+                    preview_denoised_rows = None
                     if generated_video_row_count:
                         video_start = layout.num_condition_video_rows
                         video_stop = video_start + generated_video_row_count
-                        video_rows[video_start:video_stop] = self.scheduler.step(
+                        updated_video_rows, preview_denoised_rows = _h3_video_scheduler_step(
+                            self.scheduler,
                             video_velocity[0, video_start:video_stop].float(),
                             video_timestep,
                             video_rows[video_start:video_stop],
-                            return_dict=False,
-                        )[0]
+                            callback=callback,
+                            index=index,
+                            audio_only=self.audio_only,
+                            frozen_target_video=frozen_target_video,
+                            generated_video_row_count=generated_video_row_count,
+                        )
+                        video_rows[video_start:video_stop] = updated_video_rows
+                        del updated_video_rows
                         if source_video_rows is not None and (
                             index < denoising_start_step
                             or index < mask_end_step
@@ -2653,7 +2888,25 @@ class MiniMaxH3Model:
                                 )[0]
                             )
                     if callback is not None:
-                        callback(index, None)
+                        preview = _prepare_h3_clean_preview(
+                            callback,
+                            preview_denoised_rows,
+                            video_rows,
+                            condition_row_count=layout.num_condition_video_rows,
+                            generated_row_count=generated_video_row_count,
+                            index=index,
+                            final_index=len(timesteps) - 1,
+                            denoising_start_step=denoising_start_step,
+                            mask_end_step=mask_end_step,
+                            source_video_rows=source_video_rows,
+                            editable_mask_rows=editable_mask_rows,
+                            num_latent_frames=num_latent_frames,
+                            latent_height=latent_height,
+                            latent_width=latent_width,
+                            patch_size=self.patch_size,
+                        )
+                        callback(index, preview)
+                        del preview, preview_denoised_rows
                     progress.update()
         finally:
             if first_block_cache is not None:

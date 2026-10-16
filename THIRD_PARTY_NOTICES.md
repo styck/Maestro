@@ -87,6 +87,71 @@ Apache-2.0-licensed SLA utilities and kernels from **ModelTC/LightX2V**.
 - The Apache License 2.0 text covering the adapted LightX2V portions is
   distributed at `app/shared/sol_attn/saganaki/LICENSE`.
 
+## Experimental Windows 10 direct DLSS backend
+
+The optional Windows 10 integration calls the native ABI of **lisitskyaa/ComfyUI-DLSS5-NR**
+v0.3.1, pinned to commit `41dcdfa593cb61b6a98c65bb8ed27606260bb598`.
+Its MIT-licensed bridge/caller libraries are obtained by an explicit installer;
+they are not bundled in Maestro's source. Maestro's worker follows its native
+parameter and channel-order contracts, with separate process isolation.
+
+- Source: https://github.com/lisitskyaa/ComfyUI-DLSS5-NR/tree/41dcdfa593cb61b6a98c65bb8ed27606260bb598
+- MIT text: `app/LICENSES/ComfyUI-DLSS5-NR-MIT.txt`.
+- Upstream third-party notices, including NIGos optical-flow attribution:
+  `app/LICENSES/ComfyUI-DLSS5-NR-THIRD-PARTY.md`.
+- `app/scripts/install_dlss5_direct.py` pins package and extracted-file hashes.
+
+The separate SR worker comes from the same WanGP DLSS worker release already
+used by the Windows 11 integration. Its included DLSS5-Feeder license is
+installed alongside it. NVIDIA-derived SR and modified unsigned NR runtime
+binaries retain their own terms; the bridge's MIT license grants no rights in
+NVIDIA software. Driver NGX and optical-flow libraries are loaded from the
+installed driver and are not redistributed. See `docs/DLSS5.md` for the explicit
+opt-in and experimental limitations.
+
+The explicit installer obtains the NVIDIA-derived runtime assets from these
+community-hosted **RankFTW/rhi-repo** release archives:
+
+- Modified NR: [dlssnr-310.8.SF-v2](https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.SF-v2/nvngx_dlssnr_310.8.SF-v2.zip).
+  Archive SHA-256: `1da35941894994eb087e017577829e492454e9bae3a6a9397027069ceb74955c`.
+- SR: [dlss-310.8.0](https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.8.0/nvngx_dlss_310.8.0.zip).
+  Archive SHA-256: `fb481660f7e952b87f91760e3afd7f9dc14cd2c3361b470e948d6346e4323009`.
+
+These pinned archives contain no separate license or notice file. They are
+runtime downloads, not source assets redistributed in Maestro; neither this
+attribution nor the bridge's MIT license grants a license to NVIDIA software.
+
+## Tiny VAE generation previews
+
+The optional generation-preview integration adapts Wan2GP's live previews,
+contributed by **GOvEy1nw**, from revision
+`b8b18f8114e432eea8f3d7e853a51dd91fa99571`.
+
+- Upstream preview integration: https://github.com/deepbeepmeep/Wan2GP/tree/b8b18f8114e432eea8f3d7e853a51dd91fa99571
+- **madebyollin/taesd** and **madebyollin/taehv** decoder implementations retain
+  their MIT licenses in `app/shared/tinyvae/LICENSES/taesd-MIT.txt` and
+  `app/shared/tinyvae/LICENSES/taehv-MIT.txt`.
+- The H3 approximate decoder's Apache-2.0 license text is distributed in
+  `app/shared/tinyvae/LICENSES/taeh3-Apache-2.0.txt`; its pinned weight source is
+  **Kijai/MiniMax-H3-TAE**.
+- Decoder weight download identities and SHA-256 values are recorded in
+  `app/shared/tinyvae/decoders.json`; revision-pinned upstream reference sources
+  are recorded in `app/shared/tinyvae/sources.json`.
+
+Decoder weights download on demand and are not redistributed in this source
+repository. Their source/model terms remain separate from Maestro's application
+license. See `docs/Generation-preview.md` for support and behavior.
+
+## DaSiWa and imported community checkpoints
+
+DaSiWa checkpoints are user-selected imports rather than built-in model
+selections. No checkpoint weights are redistributed. Official source links
+and family import limits are documented in `docs/DaSiWa-models.md`.
+Imported CivitAI H3 files retain
+creator/source provenance and verification receipts. Underlying model licenses
+and creator distribution terms continue to apply; Maestro's application license
+does not grant rights in these weights. See `docs/H3-checkpoint-import.md`.
+
 ## MATLOWAI MiniMax H3 fused four-step checkpoint
 
 The optional experimental model definitions

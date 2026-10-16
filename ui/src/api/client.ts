@@ -1,4 +1,5 @@
-import type { DirectorModelCompatibility, H3WindowPlan, LTXWindowPlan, MiniMaxH3Reference, ProductionPlan, SavedOmniCharacter, ScailResolutionProfile } from '../types'
+import type { DirectorModelCompatibility, GenerationPreview, GenerationPreviewSupport, H3WindowPlan, LTXWindowPlan, MiniMaxH3Reference, ProductionPlan, SavedOmniCharacter, ScailResolutionProfile } from '../types'
+import type { KreaIdentitySettings } from '../lib/kreaIdentityControls'
 
 const BASE = ''  // same origin in production; Vite proxy handles /api in dev
 
@@ -20,6 +21,8 @@ export interface ApiModel {
   supports_audio_input?: boolean
   generates_audio?: boolean
   supports_ref_images?: boolean
+  /** Native preview decoders supported by this model, when reported by the backend. */
+  preview_support?: GenerationPreviewSupport
   /** Per-workflow eligibility computed by the Director backend. */
   director?: DirectorModelCompatibility
   is_downloaded?: boolean
@@ -78,6 +81,9 @@ export interface ApiJobStatus {
   phase: string
   message: string
   output_files: string[]
+  /** Small job-specific preview; absent on older backends. */
+  preview?: GenerationPreview | null
+  preview_notice?: string | null
   viggle_preparation?: import('../types').VigglePreparedFrame | null
   error: string | null
   /** Present only on failed jobs that look like CUDA OOMs.
@@ -154,7 +160,16 @@ export async function deleteModel(modelType: string): Promise<{ deleted: string[
   return res.json()
 }
 
-export type ModelDownloadStatus = 'downloading' | 'completed' | 'failed'
+export type ModelDownloadStatus = 'downloading' | 'cancelling' | 'cancelled' | 'completed' | 'failed'
+
+export interface ModelDownloadSnapshot {
+  status: ModelDownloadStatus
+  error: string | null
+  /** Opaque backend cancellation token. Absent on older backends. */
+  cancel_id?: string | null
+  /** Only true when the current transfer can be interrupted safely. */
+  cancellable?: boolean
+}
 
 export async function downloadModel(modelType: string): Promise<{ status: ModelDownloadStatus; model_type: string }> {
   const res = await fetch(`${BASE}/api/v1/models/${encodeURIComponent(modelType)}/download`, { method: 'POST' })
@@ -162,7 +177,19 @@ export async function downloadModel(modelType: string): Promise<{ status: ModelD
   return res.json()
 }
 
-export async function fetchModelDownloads(): Promise<{ downloads: Record<string, { status: ModelDownloadStatus; error: string | null }> }> {
+export async function cancelModelDownload(modelType: string): Promise<{
+  status: 'cancelling' | 'cancelled' | 'completed' | 'failed'
+  model_type: string
+}> {
+  const res = await fetch(`${BASE}/api/v1/models/${encodeURIComponent(modelType)}/download/cancel`, { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to cancel model download' }))
+    throw new Error(err?.detail || err?.error || 'Failed to cancel model download')
+  }
+  return res.json()
+}
+
+export async function fetchModelDownloads(): Promise<{ downloads: Record<string, ModelDownloadSnapshot> }> {
   const res = await fetch(`${BASE}/api/v1/models/downloads/status`)
   if (!res.ok) throw new Error('Failed to fetch model download status')
   return res.json()
@@ -212,14 +239,20 @@ export async function submitGeneration(
 }
 
 export async function planH3Windows(params: {
+  retry_plan?: H3WindowPlan
   prompt: string
   model_type: string
   resolution: string
   total_frames: number
+  /** Active adapters stay keyed by their on-disk filename through planning. */
+  activated_loras?: string[]
   window_frames: number
   overlap_frames: number
   discard_frames: number
+  minimax_h3_multi_window?: boolean
+  custom_settings?: Record<string, unknown>
   sliding_window_memory_override?: boolean
+  minimax_h3_extended_duration?: boolean
   has_start_image?: boolean
   has_end_image?: boolean
   image_paths?: string[]
@@ -270,6 +303,7 @@ export interface StudioPreferenceSettings {
   selected_model_per_mode?: Record<string, string>
   selected_model_per_audio_sub_mode?: Record<string, string>
   inference_steps_per_model?: Record<string, number>
+  krea_identity_settings_per_model?: Record<string, KreaIdentitySettings>
   enhance_on_generation_default?: boolean
   director_music_clip_seconds?: number | null
   director_max_shot_frames_per_model?: Record<string, number>
@@ -304,13 +338,17 @@ export async function updateStudioPreferences(
 }
 
 export async function planH3Sequence(params: {
+  retry_plan?: H3WindowPlan
   prompt: string
   model_type: string
   resolution: string
   total_frames: number
   references: MiniMaxH3Reference[]
+  /** Active adapters stay keyed by their on-disk filename through planning. */
+  activated_loras?: string[]
   sequence_clip_frames?: number
   sequence_memory_override?: boolean
+  minimax_h3_extended_duration?: boolean
   overlap_frames?: number
   sequence_continuity?: boolean
   camera_coverage?: 'auto' | 'continuous' | 'multi_shot'
@@ -569,11 +607,13 @@ export async function deleteEditorProject(projectId: string, workspace?: string)
 export async function probeEditorMedia(
   asset: Pick<import('../types').EditorAsset, 'name' | 'origin' | 'path' | 'workspace'>,
   workspace?: string,
+  signal?: AbortSignal,
 ): Promise<import('../types').EditorMediaProbe> {
   const res = await fetch(`${BASE}/api/v1/editor/media/probe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workspace, asset }),
+    signal,
   })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: 'Unable to inspect media' }))
@@ -602,15 +642,35 @@ export async function fetchEditorMediaPreview(
   workspace: string,
   includeProxy = false,
   proxyProfile: 'auto' | 'mobile' = 'auto',
+  signal?: AbortSignal,
 ): Promise<import('../types').EditorMediaPreview> {
   const res = await fetch(`${BASE}/api/v1/editor/media/preview`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workspace, asset, include_proxy: includeProxy, proxy_profile: proxyProfile }),
+    signal,
   })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: 'Unable to prepare Editor preview' }))
     throw new Error(error.detail || 'Unable to prepare Editor preview')
+  }
+  return res.json()
+}
+
+/** Create a separate excerpt; the gallery original is never modified. */
+export async function trimGalleryMedia(
+  asset: Pick<import('../types').EditorAsset, 'name' | 'origin' | 'workspace'>,
+  startTime: number,
+  endTime: number,
+): Promise<{ filename: string; media_type: 'audio' | 'video'; mime_type: string; duration: number }> {
+  const res = await fetch(`${BASE}/api/v1/media/trim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ asset, start_time: startTime, end_time: endTime }),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Unable to trim this clip' }))
+    throw new Error(error.detail || 'Unable to trim this clip')
   }
   return res.json()
 }
@@ -776,8 +836,16 @@ export async function fetchOutputMetadata(name: string, workspace?: string): Pro
 }
 
 export async function deleteOutput(name: string, workspace?: string): Promise<void> {
-  const res = await fetch(`${BASE}/api/v1/outputs/${encodeURIComponent(name)}${workspaceQuery(workspace)}`, { method: 'DELETE' })
-  if (!res.ok) throw new Error('Failed to delete output')
+  const isUpload = workspace === '__uploads__'
+  const endpoint = isUpload
+    ? `${BASE}/api/v1/uploads/${encodeURIComponent(name)}`
+    : `${BASE}/api/v1/outputs/${encodeURIComponent(name)}${workspaceQuery(workspace)}`
+  const res = await fetch(endpoint, { method: 'DELETE' })
+  if (!res.ok) {
+    const error = await res.json().catch(() => null) as { detail?: unknown } | null
+    const detail = typeof error?.detail === 'string' ? error.detail : null
+    throw new Error(detail || `Failed to delete ${isUpload ? 'upload' : 'output'}`)
+  }
 }
 
 export async function rejoinClips(groupId: string, audioFile?: string, workspace?: string): Promise<{ filename: string; clip_count: number }> {
@@ -982,6 +1050,7 @@ export interface RecipeLora {
   filename: string
   multiplier: string | number
   source_url?: string
+  version_name?: string
   size_mb?: number
 }
 
@@ -2156,6 +2225,40 @@ export async function unloadLlm(): Promise<void> {
   if (!res.ok) throw new Error('Failed to unload LLM')
 }
 
+export interface RemoteLoadedModel {
+  instance_id: string
+  model_key: string
+  display_name: string
+}
+
+export interface RemoteLoadedModels {
+  server_url: string
+  instances: RemoteLoadedModel[]
+}
+
+async function remoteManagementResponse<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    const error = await res.json().catch(() => null)
+    throw new Error(typeof error?.detail === 'string' ? error.detail : 'LM Studio model management failed')
+  }
+  return res.json()
+}
+
+export async function fetchRemoteLoadedModels(): Promise<RemoteLoadedModels> {
+  return remoteManagementResponse(await fetch(`${BASE}/api/v1/llm/remote/loaded-models`))
+}
+
+export async function unloadRemoteModel(params: {
+  instance_id: string
+  server_url: string
+}): Promise<{ status: 'unloaded' | 'not_loaded' }> {
+  return remoteManagementResponse(await fetch(`${BASE}/api/v1/llm/remote/unload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  }))
+}
+
 export async function fetchLlmModels(): Promise<{ models: import('../types').LlmModelOption[] }> {
   const res = await fetch(`${BASE}/api/v1/llm/models`)
   if (!res.ok) throw new Error('Failed to fetch LLM models')
@@ -2470,6 +2573,35 @@ export interface CheckpointArchitecture {
   template_model_type: string
 }
 
+export interface H3CheckpointInspection {
+  supported: boolean
+  status: 'verified' | 'needs_selection' | 'blocked'
+  reason: string | null
+  architectures: CheckpointArchitecture[]
+  suggested_architecture?: string | null
+  profile?: {
+    sampling_profile?: string
+    native_workflow?: string
+    default_steps?: number
+    compressed_modulation?: boolean
+    quantization_format?: string
+    gguf_quant_types?: string[]
+    qkv_layout?: string
+    needs_selection?: string[]
+  }
+}
+
+export async function inspectH3Checkpoint(params: {
+  model_id: number; version_id: number; file_id: number
+  h3_sampling_profile?: string; h3_native_workflow?: string; h3_qkv_layout?: string
+}): Promise<H3CheckpointInspection> {
+  const res = await fetch(`${BASE}/api/v1/civitai/checkpoint-inspect`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params),
+  })
+  if (!res.ok) throw new Error('Could not inspect this H3 checkpoint. Restart Maestro after updating and try again.')
+  return res.json()
+}
+
 // List only architectures verified for the exact CivitAI baseModel, plus an
 // unambiguous default and a user-facing reason when import is unsupported.
 export async function fetchCheckpointArchitectures(
@@ -2557,13 +2689,14 @@ export async function startCivitAIDownload(params: {
   download_url: string; filename: string; target_arch: string
   model_id: number; version_id: number; trained_words: string[]
   model_name: string; images: { url: string }[]
-  description?: string; version_description?: string; base_model?: string
+  description?: string; version_description?: string; version_name?: string; base_model?: string
   example_prompts?: string[]; tags?: string[]
   nsfw?: boolean; target_dir_name?: string; published_at?: string
   // Checkpoint imports: kind='checkpoint' routes the file into ckpts/ and
   // registers a finetune for target_architecture instead of saving a LoRA.
   // auto_quantize=true sets the finetune to load-time int8 (mmgp).
   kind?: string; target_architecture?: string; auto_quantize?: boolean
+  file_id?: number; h3_sampling_profile?: string; h3_native_workflow?: string; h3_qkv_layout?: string
 }): Promise<{ download_id: string }> {
   const res = await fetch(`${BASE}/api/v1/civitai/download`, {
     method: 'POST',
@@ -2580,6 +2713,23 @@ export async function startCivitAIDownload(params: {
 export async function fetchCivitAIDownloads(): Promise<{ downloads: import('../types').CivitAIDownload[] }> {
   const res = await fetch(`${BASE}/api/v1/civitai/downloads`)
   if (!res.ok) throw new Error('Failed to fetch downloads')
+  return res.json()
+}
+
+/** Cancel one server-confirmed cancellable transfer using its opaque token. */
+export async function cancelDownload(cancelId: string): Promise<{
+  status: 'cancelling' | 'cancelled' | 'completed' | 'failed'
+  download_id: string
+}> {
+  const res = await fetch(`${BASE}/api/v1/downloads/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ download_id: cancelId }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to cancel download' }))
+    throw new Error(err?.detail || err?.error || 'Failed to cancel download')
+  }
   return res.json()
 }
 
@@ -2649,6 +2799,11 @@ export type LoraUpdateStatus = 'current' | 'available' | 'unknown' | 'local' | '
 export interface InstalledLora {
   filename: string
   directory: string
+  /** Resolved user-facing name, independent from the on-disk filename. */
+  display_name?: string
+  display_name_override?: string | null
+  suggested_name?: string
+  version_label?: string | null
   /** File lives in a linked install's loras folder (read-only), not
    *  Maestro's own. Sidecars/guides for it live in Maestro's mirror. */
   linked?: boolean
@@ -2696,6 +2851,41 @@ export async function fetchInstalledLoras(): Promise<{
 }> {
   const res = await fetch(`${BASE}/api/v1/loras/installed`)
   if (!res.ok) throw new Error('Failed to fetch installed LoRAs')
+  return res.json()
+}
+
+export interface LoraDisplayNameResult {
+  filename: string
+  lora_id: string
+  display_name: string
+  display_name_override: string | null
+  suggested_name: string
+  version_label: string | null
+}
+
+export type LoraDisplayNameScope =
+  | { modelType: string; directory?: never }
+  | { directory: string; modelType?: never }
+
+/** Set a custom LoRA alias, or pass null to return to the automatic name. */
+export async function updateLoraDisplayName(
+  filename: string,
+  displayName: string | null,
+  scope: LoraDisplayNameScope,
+): Promise<LoraDisplayNameResult> {
+  const res = await fetch(`${BASE}/api/v1/loras/display-name`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename,
+      display_name: displayName,
+      ...('modelType' in scope ? { model_type: scope.modelType } : { directory: scope.directory }),
+    }),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({})) as { detail?: string; error?: string }
+    throw new Error(error.detail || error.error || `Failed to update LoRA display name (${res.status})`)
+  }
   return res.json()
 }
 
@@ -2887,14 +3077,25 @@ export interface ActiveDownload {
   last_active_at: number
   downloaded_bytes: number
   total_bytes: number | null
-  status: 'downloading' | 'stalled' | 'retrying' | 'done' | 'incomplete'
+  status: 'downloading' | 'stalled' | 'retrying' | 'cancelling' | 'cancelled' | 'done' | 'incomplete'
+  /** Opaque backend cancellation token. Absent on older backends. */
+  cancel_id?: string | null
+  /** Only true when the current transfer can be interrupted safely. */
+  cancellable?: boolean
   /** Seconds since the byte counter last advanced. UI uses this to
-   *  flag stalled downloads (e.g. `> 15` → show "slow / retrying"). */
+   *  flag stalled downloads (`> 30` → show "slow / retrying"). */
   seconds_since_progress: number
 }
 
-export async function fetchActiveDownloads(): Promise<{ downloads: ActiveDownload[] }> {
-  const res = await fetch(`${BASE}/api/v1/downloads/active`)
+/** Pass the `version` of the last answer as `since` to have the server hold
+ *  the request until the downloads change (up to 25 s). Older servers omit
+ *  `version` and always answer at once. */
+export async function fetchActiveDownloads(
+  since?: string,
+  signal?: AbortSignal,
+): Promise<{ downloads: ActiveDownload[]; version?: string }> {
+  const query = since === undefined ? '' : `?since=${encodeURIComponent(since)}`
+  const res = await fetch(`${BASE}/api/v1/downloads/active${query}`, { signal })
   if (!res.ok) throw new Error(`Failed to fetch active downloads (${res.status})`)
   return res.json()
 }

@@ -3,7 +3,8 @@ import { ChevronDown, ChevronRight, X, Mic } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import { MediaFinishingControls } from './MediaFinishingControls'
-import { dlssSpatialOptions } from '../../lib/mediaFlow'
+import { dlssSpatialOptions, useDlssAvailability } from '../../lib/mediaFlow'
+import { GalleryInput } from '../shared/GalleryInput'
 
 const baseOptions = [
   { value: '', label: 'None' },
@@ -29,6 +30,7 @@ const flashvsrOptions = [
 ]
 
 export function PostProcessing({ expanded = false }: { expanded?: boolean }) {
+  const dlss = useDlssAvailability()
   const [open, setOpen] = useState(false)
   const spatialUpsampling = useStore(s => s.spatialUpsampling)
   const setSpatialUpsampling = useStore(s => s.setSpatialUpsampling)
@@ -105,7 +107,7 @@ export function PostProcessing({ expanded = false }: { expanded?: boolean }) {
               className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
             >
               {upsamplingOptions.map(opt => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                <option key={opt.value} value={opt.value} disabled={dlss.disabled(opt.value)}>{dlss.label(opt.value, opt.label)}</option>
               ))}
             </select>
           </div>
@@ -206,6 +208,9 @@ export function PostProcessing({ expanded = false }: { expanded?: boolean }) {
                     const label = voiceCloneMode === 'two' ? (idx === 0 ? 'Voice A' : 'Voice B') : 'Reference Voice'
                     return (
                       <div key={idx}>
+                        {(!ref || !ref.path) && <GalleryInput kind="audio"
+                          label={`SeedVC ${label.toLowerCase()}`} onFile={file => handleVcUpload(idx, file)}
+                          disabledReason={vcUploading === idx ? `Uploading ${label.toLowerCase()}…` : undefined} />}
                         <label className="text-[10px] text-text-muted uppercase tracking-wider mb-1 block">{label}</label>
                         {!ref || !ref.path ? (
                           <div

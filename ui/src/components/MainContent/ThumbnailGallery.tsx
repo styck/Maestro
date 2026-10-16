@@ -4,6 +4,7 @@ import { Film, Music, PanelRightClose, PanelRightOpen, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { requestThumbnail } from '../../lib/thumbnailCache'
 import { useIsMobile } from '../../lib/useIsMobile'
+import { getMediaTimestamp } from '../../lib/mediaTimestamp'
 
 // Thumbnail dimensions: 80px wide, 16:9 aspect = 45px tall, 6px gap
 const THUMB_HEIGHT = 45
@@ -36,7 +37,7 @@ function VideoThumbnail({ src, name }: { src: string; name: string }) {
 
 interface Props {
   activeIndex: number
-  onThumbnailClick: (index: number) => void
+  onThumbnailClick: (id: string) => void
 }
 
 function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick }: Props & { onMobileClick?: () => void }) {
@@ -44,7 +45,6 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
   const containerRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const [viewHeight, setViewHeight] = useState(400)
-  const isAutoScrolling = useRef(false)
 
   // Measure container height
   useEffect(() => {
@@ -84,11 +84,12 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
     const viewBottom = viewTop + viewHeight
 
     if (itemTop < viewTop || itemBottom > viewBottom) {
-      isAutoScrolling.current = true
-      container.scrollTo({ top: Math.max(0, itemTop - viewHeight / 2 + THUMB_HEIGHT / 2), behavior: 'smooth' })
-      setTimeout(() => { isAutoScrolling.current = false }, 400)
+      // Each selection supersedes the previous one. A pending smooth scroll
+      // can otherwise carry the strip away from a newer, already-visible item.
+      container.scrollTo({ top: Math.max(0, itemTop - viewHeight / 2 + THUMB_HEIGHT / 2), behavior: 'auto' })
+      setScrollTop(container.scrollTop)
     }
-  }, [activeIndex, viewHeight])
+  }, [activeIndex, viewHeight, outputs.length])
 
   const totalHeight = outputs.length * (THUMB_HEIGHT + THUMB_GAP) - (outputs.length > 0 ? THUMB_GAP : 0)
 
@@ -109,12 +110,17 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
       <div className="relative" style={{ height: totalHeight }}>
         {outputs.slice(startIdx, endIdx).map((file, i) => {
           const idx = startIdx + i
+          const timestamp = getMediaTimestamp(undefined, file.created_at)
+          const thumbLabel = timestamp ? `${file.name} · ${timestamp.compact}` : file.name
           return (
             <button
               key={outputIdentity(file)}
+              title={thumbLabel}
+              aria-label={`Show ${thumbLabel}`}
+              aria-current={activeIndex === idx ? 'true' : undefined}
               data-thumb-index={idx}
               onClick={() => {
-                onThumbnailClick(idx)
+                onThumbnailClick(outputIdentity(file))
                 onMobileClick?.()
               }}
               className={`absolute left-0 right-0 rounded-lg border overflow-hidden transition-all ${

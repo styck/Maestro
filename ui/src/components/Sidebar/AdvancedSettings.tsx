@@ -4,7 +4,11 @@ import { Save, Trash2, FolderOpen, SlidersHorizontal, ChevronDown } from 'lucide
 import { useStore } from '../../stores/useStore'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
+import { Qwen21Controls } from './Qwen21Controls'
+import { KreaIdentityControls } from './KreaIdentityControls'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
+import { Yue2LoraSelector } from './Yue2LoraSelector'
+import { selectedMusicStyles } from '../../lib/musicStyles'
 import { WindowSettings } from './DurationSlider'
 import { DirectorH3Optimizations } from './DirectorH3Optimizations'
 import { H3MediaControls } from './H3MediaControls'
@@ -12,6 +16,12 @@ import { MiniMaxH3Optimizations } from './MiniMaxH3Optimizations'
 import { AutomaticFaceRefiner } from '../Characters/FaceRefiner'
 import { SidebarDialog } from './SidebarPanels'
 import type { GenerateParams } from '../../types'
+import {
+  activeKreaIdentityLabels,
+  countKreaIdentityReferences,
+  isKreaIdentityEdit,
+  KREA_IDENTITY_SETTING_KEYS,
+} from '../../lib/kreaIdentityControls'
 
 const H3_LONG_SEQUENCE_EXPERIMENTS = [
   {
@@ -243,6 +253,7 @@ function LtxFramesExperimentalControls() {
 /** One source for section badges, the total count and their help text. */
 function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   const params = useStore(s => s.params)
+  const instrumental = useStore(s => s.musicInstrumental)
   const modelOptions = useStore(s => s.modelOptions)
   const sidebarMode = useStore(s => s.sidebarMode)
   const directorVideoModel = useStore(s => s.selectedModelPerMode.video || '')
@@ -256,6 +267,12 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   const slidingWindowLocked = useStore(s => s.slidingWindowLocked)
   const servicesConfig = useStore(s => s.servicesConfig)
   const studioVideoWorkflow = useStore(s => s.studioVideoWorkflow)
+  const studioImageWorkflow = useStore(s => s.studioImageWorkflow)
+  const imageRefCount = useStore(s => s.imageRefs.length)
+  const imageSourcePresent = useStore(s => Boolean(
+    s.imageWorkflowSourcePath || s.imageWorkflowSourceFile
+    || (Number(s.params.image_mode) === 2 && (s.params.image_start || s.params.image_guide)),
+  ))
   const hasVoiceClone = useStore(s => s.voiceCloneEnabled && s.voiceCloneRefs.some(reference => !!reference?.path))
   const selectedModel = useStore(s => s.models.find(model => model.model_type === s.params.model_type))
   const isScailEdit = (
@@ -284,6 +301,18 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
     if (params.override_attention === 'sla') items.performance.push('H3 SLA')
     if (params.skip_steps_cache_type === 'first_block') items.performance.push('First Block Cache')
     if (generationMode !== 'audio' && params.custom_settings?.audio_refinement === 'enabled') items.finishing.push('Audio refinement')
+  }
+  const kreaModel = selectedModel || { model_type: params.model_type, architecture: modelOptions?.architecture }
+  if (generationMode === 'image' && isKreaIdentityEdit(kreaModel)) {
+    const referenceCount = countKreaIdentityReferences({
+      generationMode,
+      workflow: studioImageWorkflow,
+      imageMode: params.image_mode,
+      sourceImagePresent: imageSourcePresent,
+      referenceCount: imageRefCount,
+      editReferencesSupported: modelOptions?.image_ref_inpaint === true,
+    })
+    items.generation.push(...activeKreaIdentityLabels(params.custom_settings, referenceCount))
   }
   if (generationMode === 'video' && params.face_refiner?.enabled) items.finishing.push('Face refinement')
   if (generationMode === 'video' && params.temporal_upsampling) items.finishing.push(`Smoothing (${params.temporal_upsampling})`)
@@ -340,7 +369,9 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
     && !modelOptions?.no_negative_prompt
     && (!isScailEdit || isScailHq)
   ) items.generation.push('Negative prompt')
-  if (!modelOptions?.loras_disabled && !(generationMode === 'avatar' && editSubMode === 'outpaint')) {
+  if (params.model_type === 'yue2') items.loras.push(...(instrumental
+    ? ['YuE2 instrumental LoRA'] : selectedMusicStyles(params.custom_settings).map(() => 'YuE2 music LoRA')))
+  if (params.model_type !== 'yue2' && !modelOptions?.loras_disabled && !(generationMode === 'avatar' && editSubMode === 'outpaint')) {
     for (const l of params.activated_loras) items.loras.push(`LoRA: ${l.replace(/\.(safetensors|sft)$/i, '')}`)
   }
   if (!isScailEdit && generationMode !== 'audio' && spatialUpsampling) items.finishing.push(`Upscaling (${spatialUpsampling})`)
@@ -446,6 +477,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
   const editSubMode = useStore(s => s.editSubMode)
   const audioSubMode = useStore(s => s.audioSubMode)
   const isAudio = generationMode === 'audio'
+  const isImage = generationMode === 'image'
   const isSfx = isAudio && audioSubMode === 'sfx'
   const isAudioOnly = modelOptions?.audio_only || isSfx
   const isVideo = generationMode === 'video'
@@ -477,7 +509,12 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
   const hasPerformance = showH3Optimizations || showReferenceDetail || showCacheTuning
     || !!modelOptions?.minimax_h3_text_encoder_choices?.length || !!modelOptions?.ltx25_video_vae_choices?.length
   const hasFinishing = !isAudio && (!isScailEdit || (isH3 && !modelOptions?.audio_only))
-  const canUseLoras = !isOutpaint && !modelOptions?.loras_disabled
+  const isYue2 = params.model_type === 'yue2'
+  const isKreaImageEdit = isImage && isKreaIdentityEdit({
+    model_type: params.model_type,
+    architecture: modelOptions?.architecture,
+  })
+  const canUseLoras = !isYue2 && !isOutpaint && !modelOptions?.loras_disabled
   const showH3LongSequenceExperiments = (
     H3_LONG_SEQUENCE_TESTS_VISIBLE
     && isVideo
@@ -512,6 +549,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
         : !modelOptions?.lock_guidance_scale
     )
   )
+  const qwenTurboProfile = modelOptions?.qwen21_acceleration_profiles?.[String(params.sample_solver || '')]
   const showNegativePrompt = (
     !modelOptions?.no_negative_prompt
     && (!isScailEdit || isScailHq)
@@ -587,13 +625,14 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
 
               {/* Presets belong with the creative adapter controls so users can
                   save or restore a setup before adjusting its LoRAs. */}
-              <AdvancedSection section="loras" title={canUseLoras ? 'LoRAs & presets' : 'Presets'} activeItems={activeSections.loras} open={sections.loras} onToggle={expanded => toggleSection('loras', expanded)}>
+              <AdvancedSection section="loras" title={canUseLoras || isYue2 ? 'LoRAs & presets' : 'Presets'} activeItems={activeSections.loras} open={sections.loras} onToggle={expanded => toggleSection('loras', expanded)}>
               <PresetManager />
 
               {/* Keep creative adapters near the top so users can choose them
                   before working through the lower-level tuning controls.
                   Official Outpaint owns its stage-one-only IC-LoRA schedule. */}
               {canUseLoras && <LoraSelector />}
+              {isYue2 && <Yue2LoraSelector />}
               {canUseLoras && modelOptions?.minimax_h3_fused_turbo && (
                 <p className="rounded-lg border border-amber-500/25 bg-amber-500/8 px-3 py-2 text-[9px] leading-relaxed text-text-muted">
                   H3 LoRAs are experimental with Fused 4-Step. Start with one adapter at low strength and compare a short clip using the same seed. Extra acceleration adapters are excluded; Mystic remains baked in at 0.7.
@@ -839,7 +878,9 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   </div>
 
                   {/* Auto-Split */}
-                  {modelOptions?.custom_settings_def?.map(setting => (
+                  {modelOptions?.custom_settings_def?.filter(setting => (
+                    !isKreaImageEdit || !KREA_IDENTITY_SETTING_KEYS.includes(setting.id as typeof KREA_IDENTITY_SETTING_KEYS[number])
+                  )).map(setting => (
                     <div key={setting.id}>
                       <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">{setting.name}</label>
                       <input
@@ -1132,6 +1173,8 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
 
               {/* Dedicated SCAIL edit endpoints honor this value for both
                   Fast and HQ; other distilled models retain their lock. */}
+              <Qwen21Controls />
+              <KreaIdentityControls />
               {showInferenceSteps && (
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
@@ -1144,7 +1187,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                       max={inferenceStepsMax}
                       step={1}
                       value={params.num_inference_steps}
-                      disabled={h3TurboMode}
+                      disabled={h3TurboMode || !!qwenTurboProfile}
                       onChange={e => setInferenceSteps(Number(e.target.value))}
                       className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue disabled:cursor-not-allowed disabled:opacity-50"
                     />
@@ -1152,7 +1195,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   <input
                     type="range" min={inferenceStepsMin} max={inferenceStepsMax} step={1}
                     value={params.num_inference_steps}
-                    disabled={h3TurboMode}
+                    disabled={h3TurboMode || !!qwenTurboProfile}
                     onChange={e => setInferenceSteps(Number(e.target.value))}
                     className="w-full disabled:cursor-not-allowed disabled:opacity-50"
                   />
@@ -1160,6 +1203,9 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                     <p className="text-[9px] text-text-muted mt-0.5">
                       Turbo mode locks this preset to {params.num_inference_steps} steps.
                     </p>
+                  )}
+                  {qwenTurboProfile && (
+                    <p className="text-[9px] text-text-muted mt-0.5">The acceleration profile uses {qwenTurboProfile.steps} steps and CFG {qwenTurboProfile.guidance}.</p>
                   )}
                   {!h3TurboMode && modelOptions?.inference_steps_help && (
                     <p className="text-[9px] text-text-muted mt-0.5">
@@ -1183,6 +1229,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                     <input
                       type="number"
                       value={params.guidance_scale}
+                      disabled={!!qwenTurboProfile}
                       onChange={e => setParam('guidance_scale', Number(e.target.value))}
                       step={0.1}
                       className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue"
@@ -1191,6 +1238,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   <input
                     type="range" min={0} max={20} step={0.1}
                     value={params.guidance_scale}
+                    disabled={!!qwenTurboProfile}
                     onChange={e => setParam('guidance_scale', Number(e.target.value))}
                     className="w-full"
                   />
