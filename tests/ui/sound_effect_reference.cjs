@@ -270,8 +270,68 @@ const references = [
     const restoredIntent = await page.evaluate(() => window.store.getState().params.minimax_h3_references
       .find(reference => reference.id === 'laser')?.audio_intent);
     assert.equal(restoredIntent, 'sound', 'Output settings restore preserves sound effect intent');
+
+    await page.getByRole('button', {name: /Edit .*Video 1 reference/}).click();
+    const videoType = page.getByRole('combobox', {name: /Video 1 type$/});
+    assert.equal(await videoType.inputValue(), 'motion', 'Older uploaded videos retain their motion role');
+    await videoType.selectOption('character');
+    let video = await page.evaluate(() => window.store.getState().params.minimax_h3_references.find(ref => ref.id === 'video'));
+    assert.equal(video.video_intent, 'character');
+    assert.equal(video.follow_timeline, false, 'A character sample is reusable rather than following a source timeline');
+    assert.equal(video.include_audio, true, 'Choosing a visual role does not silently change the soundtrack role');
+    const soundtrack = page.getByRole('combobox', {name: /Video 1 soundtrack role$/});
+    await soundtrack.selectOption('voice');
+    await page.evaluate(async () => window.store.getState().enhancePrompt());
+    video = enhanceRequest.minimax_h3_references.find(ref => ref.id === 'video');
+    assert.equal(video.video_intent, 'character', 'Enhance receives the selected character-video role');
+    assert.equal(video.video_audio_role, 'voice', 'Enhance receives the separately selected voice role');
+    assert.equal(video.include_audio, false, 'Voice guidance does not reuse the old soundtrack');
+    await videoType.selectOption('scene');
+    video = await page.evaluate(() => window.store.getState().params.minimax_h3_references.find(ref => ref.id === 'video'));
+    assert.equal(video.video_intent, 'scene');
+    assert.equal(video.follow_timeline, true);
+    assert.equal(video.video_audio_role, 'voice', 'Changing visual intent preserves an explicit audio choice');
+    await videoType.selectOption('motion');
+    await page.evaluate(async () => window.store.getState().startGeneration('queue'));
+    assert.equal(generateRequest.minimax_h3_references.find(ref => ref.id === 'video').video_intent, 'motion',
+      'The selected motion role survives generation submission');
+
+    await page.evaluate(async savedParams => {
+      const params = {
+        ...savedParams,
+        audio_prompt_type: 'AD',
+        audio_guide: '/uploads/h3_reference_cache/derived-drive.wav',
+        minimax_h3_references: savedParams.minimax_h3_references.map(ref => {
+          if (ref.id === 'video') return {...ref, video_audio_role: 'drive', audio_duration_seconds: 12};
+          if (ref.id === 'score') return {...ref, audio_intent: 'style'};
+          return ref;
+        }),
+      };
+      window.store.setState({
+        selectedOutput: 0,
+        selectedOutputMeta: {source: 'sidecar', params},
+      });
+      await window.store.getState().loadSettingsFromOutput();
+    }, generateRequest);
+    if (!(await soundtrack.isVisible())) {
+      await page.getByRole('button', {name: /Edit .*Video 1 reference/}).click();
+    }
+    assert.equal(await soundtrack.inputValue(), 'drive');
+    const beforeOutputOnly = await page.evaluate(() => window.store.getState().durationSeconds);
+    await soundtrack.selectOption({label: 'Keep source audio (output only)'});
+    assert.equal(await soundtrack.inputValue(), 'output_only');
+    assert.equal(await page.evaluate(() => window.store.getState().durationSeconds), beforeOutputOnly);
+    await page.evaluate(async () => window.store.getState().enhancePrompt());
+    assert.doesNotMatch(enhanceRequest.reference_context, /soundtrack paired with <Video 1>|Exact target soundtrack/);
+    await page.evaluate(async () => window.store.getState().startGeneration('queue'));
+    const outputOnly = generateRequest.minimax_h3_references.find(ref => ref.id === 'video');
+    assert.equal(outputOnly.video_audio_role, 'output_only');
+    assert.equal(outputOnly.include_audio, false);
+    assert.equal(generateRequest.audio_prompt_type, '');
+    assert.ok(!generateRequest.audio_guide, 'A saved derived Drive guide is not carried over');
+
     assert.deepEqual(errors, [], 'The reference editor and store actions render without React errors');
-    console.log('Sound effect reference: mobile help, unchanged duration, saved voice/style semantics, Audio inventory labels, submission, and output restore passed');
+    console.log('Reference roles: mobile visual and audio controls, enhancement, submission, and Drive-to-output-only settings restore passed');
   } finally {
     await browser.close();
   }

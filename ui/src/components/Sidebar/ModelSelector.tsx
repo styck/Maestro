@@ -20,50 +20,68 @@ function ModelChoicesPanel({open, placement, onClose, children}: {open: boolean;
   return open ? <div className={`${placement === 'below' ? 'relative mt-2 w-full' : 'absolute bottom-full left-0 mb-1 w-[360px] max-w-[90vw]'} bg-bg-secondary border border-border rounded-xl shadow-xl overflow-hidden z-50`}>{children}</div> : null
 }
 
-export function ModelSelector(props: { placement?: Placement }) {
+export type ModelSelectorSelection = {
+  modelType: string
+  onSelect: (modelType: string) => void
+  disabled?: boolean
+}
+
+type ModelSelectorProps = {
+  placement?: Placement
+  selection?: ModelSelectorSelection
+}
+
+export function ModelSelector(props: ModelSelectorProps) {
   // A workflow change starts a new picker session, dismissing any open reset.
-  const contextKey = useStore(s => [
+  const storeContextKey = useStore(s => [
     s.generationMode, s.studioVideoWorkflow, s.studioImageWorkflow,
     s.audioSubMode, s.editSubMode,
   ].join(':'))
+  const contextKey = props.selection ? 'controlled:video:frames' : `store:${storeContextKey}`
   return <WorkflowModelSelector key={contextKey} {...props} />
 }
 
-function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement }) {
+function WorkflowModelSelector({ placement = 'above', selection }: ModelSelectorProps) {
   const models = useStore(s => s.models)
   const families = useStore(s => s.families)
   const enabledModels = useStore(s => s.enabledModels)
-  const generationMode = useStore(s => s.generationMode)
+  const storedGenerationMode = useStore(s => s.generationMode)
+  const generationMode = selection ? 'video' : storedGenerationMode
   const editSubMode = useStore(s => s.editSubMode)
   const imageWorkflow = useStore(s => s.studioImageWorkflow)
   const hasImageReferences = useStore(s => s.imageRefs.length > 0)
-  const studioVideoWorkflow = useStore(s => s.studioVideoWorkflow)
-  const videoImageMode = useStore(s => Number(s.params.image_mode || 0))
+  const storedStudioVideoWorkflow = useStore(s => s.studioVideoWorkflow)
+  const studioVideoWorkflow = selection ? 'frames' : storedStudioVideoWorkflow
+  const videoImageMode = useStore(s => selection ? 0 : Number(s.params.image_mode || 0))
   const hasFrameGuidance = useStore(s => Boolean(
-    s.startImage
-    || s.endImage
-    || s.params.image_start
-    || s.params.image_end
-    || s.imageRefs.length
-    || (
-      Array.isArray(s.params.image_refs)
-      && s.params.image_refs.length
-      && s.params.frames_positions
+    !selection && (
+      s.startImage
+      || s.endImage
+      || s.params.image_start
+      || s.params.image_end
+      || s.imageRefs.length
+      || (
+        Array.isArray(s.params.image_refs)
+        && s.params.image_refs.length
+        && s.params.frames_positions
+      )
     ),
   ))
-  const hasOmniReferences = useStore(s => (
+  const hasOmniReferences = useStore(s => !selection && (
     s.params.minimax_h3_references?.some(reference => !(
       reference.type === 'audio' && reference.audio_intent === 'drive'
     )) === true
   ))
-  const hasFrameAudioDrive = useStore(s => Boolean(s.params.audio_guide))
-  const hasReferenceAudioDrive = useStore(s => Boolean(
+  const hasFrameAudioDrive = useStore(s => !selection && Boolean(s.params.audio_guide))
+  const hasReferenceAudioDrive = useStore(s => !selection && Boolean(
     s.params.minimax_h3_references?.some(reference => (
       reference.type === 'audio' && reference.audio_intent === 'drive'
     )),
   ))
-  const currentModelType = useStore(s => s.params.model_type)
+  const storedCurrentModelType = useStore(s => s.params.model_type)
+  const currentModelType = selection?.modelType ?? storedCurrentModelType
   const selectModel = useStore(s => s.selectModel)
+  const controlsPending = useStore(s => s.modelsLoading || (!s.modelsLoaded && !!s.modelsLoadError))
   const selectStudioVideoModel = useStore(s => s.selectStudioVideoModel)
   const openModelVisibility = useStore(s => s.openModelVisibility)
   const resetEnabledModels = useStore(s => s.resetEnabledModels)
@@ -83,6 +101,7 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
   const containerRef = useRef<HTMLDivElement>(null)
   const resetButtonRef = useRef<HTMLButtonElement>(null)
   const confirmResetRef = useRef<HTMLButtonElement>(null)
+  const selectionDisabled = Boolean(selection?.disabled)
 
   // Close on click outside
   useEffect(() => {
@@ -121,6 +140,7 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
     hasAudioDrive: createWorkflow === 'references' ? hasReferenceAudioDrive : hasFrameAudioDrive,
   } as const
   const currentModelCompatible = Boolean(currentModel)
+    && !currentModel?.world_model
     && (!currentModel?.nsfw_only || nsfwMode)
     && isModelEnabledInScope(currentModelType, enabledModels, modelVisibilityOverrides, visibilityScope)
     && (
@@ -155,7 +175,8 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
   //   1. the effective model choice for this workflow,
   //   2. nsfw_only gate (Mature Mode must be on for those to appear).
   const workflowFilter = (model: typeof models[number]) => (
-    (generationMode !== 'video' || (studioVideoWorkflow === 'animate'
+    !model.world_model
+    && (generationMode !== 'video' || (studioVideoWorkflow === 'animate'
       ? model.model_type === 'viggle_animate' : model.model_type !== 'viggle_animate'))
     && (generationMode !== 'video' || studioVideoWorkflow === 'avatar' || !isLongCatAvatarModel(model))
     &&
@@ -189,6 +210,8 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
       {/* Trigger button */}
       <button
         aria-label="Choose model" aria-expanded={open}
+        data-model-type={currentModelType}
+        disabled={controlsPending || selectionDisabled}
         onClick={() => setOpen(!open)}
         title={currentModelCompatible
           ? `${currentModel?.name || 'Select model'}\n${currentModel?.selector_help || currentModel?.description || ''}`
@@ -196,7 +219,7 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
         className={`w-full flex items-center gap-1.5 bg-bg-tertiary border border-border rounded-lg px-2 py-2 text-left hover:border-border-light transition-colors ${placement === 'footer' ? 'min-h-11' : ''}`}
       >
         <span className={`flex-1 min-w-0 text-text-primary ${placement === 'footer' ? 'line-clamp-2 text-[11px] leading-tight' : 'truncate text-xs'}`}>
-          {currentModelCompatible && currentModel
+          {controlsPending ? 'Loading model controls…' : currentModelCompatible && currentModel
             ? modelNameForContext(currentModel, visibilityScope)
             : currentModel ? 'No compatible model' : 'Select model'}
         </span>
@@ -297,7 +320,9 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
                       <button
                         title={model.name}
                         onClick={() => {
-                          if (
+                          if (selection) {
+                            if (!selectionDisabled) selection.onSelect(model.model_type)
+                          } else if (
                             generationMode === 'video'
                             && ['frames', 'references', 'avatar'].includes(studioVideoWorkflow)
                             && videoImageMode === 0
@@ -305,6 +330,7 @@ function WorkflowModelSelector({ placement = 'above' }: { placement?: Placement 
                           else selectModel(model.model_type)
                           setOpen(false)
                         }}
+                        disabled={selectionDisabled}
                         className="min-w-0 flex-1 px-3 py-1.5 flex items-center gap-2 text-left"
                       >
                         <span className="flex-1 min-w-0 text-xs truncate">{modelNameForContext(model, visibilityScope)}</span>

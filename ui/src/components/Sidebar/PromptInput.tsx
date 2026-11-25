@@ -18,8 +18,12 @@ import {
   resolveH3StoryboardDiscardFrames,
 } from '../../lib/h3WindowTiming'
 import { ComposerContext, ComposerToolbarItem } from './SidebarPanels'
+import { EnhancementBadge } from './EnhancementBadge'
+import { fetchWriterDrafts } from '../../api/client'
+import { LoadWriterDraftHistory } from '../WriterDraftHistory'
 import { SidebarMenu } from './SidebarMenu'
 import { Flux3PromptHelper } from './Flux3PromptHelper'
+import { MossImagePromptHelper } from './MossImagePromptHelper'
 
 const placeholders: Record<string, string> = {
   image: 'Describe your image...',
@@ -34,7 +38,7 @@ function estimateH3TextTokens(value: string): number {
   return Math.ceil(lexical * 1.25) + (value.trim() ? 8 : 0)
 }
 
-function useAutoGrowingTextarea(value: string, enabled = true) {
+function useAutoGrowingTextarea(value: string, enabled = true, overlay = false) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   const fitToContent = useCallback(() => {
@@ -47,7 +51,7 @@ function useAutoGrowingTextarea(value: string, enabled = true) {
     textarea.style.height = `${textarea.scrollHeight + 2}px`
   }, [enabled])
 
-  useLayoutEffect(fitToContent, [value, fitToContent])
+  useLayoutEffect(fitToContent, [value, fitToContent, overlay])
   // The dock's hidden text mirror owns its height. Clear the expanded editor's
   // measurements on return so the ordinary prompt follows that CSS layout.
   useLayoutEffect(() => {
@@ -133,7 +137,10 @@ function useEnhanceStatus(isEnhancing: boolean) {
             } else if (!streamStarted) {
               setStatus({ phase: 'loading', chars: 0 })
             }
-            if (data.done) break
+            // This finishes one model call. A long script or a repair can
+            // start another call while the outer enhancement is still active.
+            // Poll until isEnhancing changes, including stale done responses
+            // from the previous request while a new model is loading.
           }
         } catch { /* ignore */ }
         await new Promise(r => setTimeout(r, 800))
@@ -150,18 +157,19 @@ export function PromptInput() {
   const composer = useContext(ComposerContext)
   const compact = !!composer && !composer.expanded
   const prompt = useStore(s => s.params.prompt)
-  const promptTextareaRef = useAutoGrowingTextarea(prompt, !compact)
   const setParam = useStore(s => s.setParam)
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const enhancePrompt = useStore(s => s.enhancePrompt)
   const setEnhanceOnGeneration = useStore(s => s.setEnhanceOnGeneration)
   const enhanceOnGeneration = useStore(shouldEnhanceOnGeneration)
+  const promptTextareaRef = useAutoGrowingTextarea(prompt, !compact, enhanceOnGeneration)
   const enhanceOnGenerationDefault = useStore(s => s.enhanceOnGenerationDefault)
   const setEnhanceOnGenerationDefault = useStore(s => s.setEnhanceOnGenerationDefault)
   const canDeferEnhancement = useStore(canEnhanceOnGeneration)
   const isEnhancing = useStore(s => s.isEnhancing)
   const promptEnhanceError = useStore(s => s.promptEnhanceError)
+  const draftHistoryId = useStore(s => s.params._prompt_enhancement?.draft_history_id)
   const durationSeconds = useStore(s => s.durationSeconds)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
@@ -435,6 +443,8 @@ export function PromptInput() {
           {promptEnhanceError}
         </div>
       )}
+      {!isEnhancing && draftHistoryId && <LoadWriterDraftHistory key={draftHistoryId}
+        load={() => fetchWriterDrafts('interactive', draftHistoryId)}/>}
       {(usesH3Plan || h3FramesPlanIsStale) && h3WindowPlan && (
         <div className="mb-1.5">
           <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-border bg-bg-tertiary/70">
@@ -560,7 +570,7 @@ export function PromptInput() {
           </span>
         </div>
       )}
-      <div className={compact ? 'studio-prompt-field relative min-h-[120px] grow shrink-0 basis-auto' : 'relative mt-auto'}>
+      <div data-enhancement-enabled={enhanceOnGeneration || undefined} className={compact ? 'studio-prompt-field relative min-h-[120px] grow shrink-0 basis-auto' : 'relative mt-auto'}>
         {compact && (
           <div data-prompt-mirror aria-hidden="true" className="studio-prompt-mirror invisible select-none whitespace-pre-wrap break-words border border-transparent px-3 py-2 text-base md:text-sm">{prompt + ' '}</div>
         )}
@@ -583,9 +593,11 @@ export function PromptInput() {
               : modePlaceholder}
           className={`studio-prompt-textarea block w-full resize-none px-3 py-2 text-base md:text-sm text-text-primary placeholder:text-text-muted focus:outline-none transition-colors ${compact ? 'min-h-[72px] bg-transparent border border-transparent rounded-lg focus:border-border-light' : `${composer?.expanded ? 'min-h-[260px]' : 'min-h-[104px]'} bg-bg-tertiary border border-border rounded-xl focus:border-accent-blue`}`}
         />
+        {enhanceOnGeneration && <EnhancementBadge onRemove={() => setEnhanceOnGeneration(false)} />}
         {/* One portal keeps conditional helpers before the existing enhancer after model switches. */}
         <ComposerToolbarItem><div className={`${composer ? 'relative' : 'absolute right-2 bottom-2'} flex items-center justify-end gap-2`}>
         {generationMode === 'image' && modelType.startsWith('flux3') && <Flux3PromptHelper />}
+        {generationMode === 'image' && modelOptions?.moss_image_prompt_helper && <MossImagePromptHelper />}
         {isAudioOnly ? (
           /* TTS: mode-aware split button. Main button uses default mode based
              on voice-slot count; dropdown exposes both Speech and Dialogue

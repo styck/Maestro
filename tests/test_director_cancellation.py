@@ -1603,6 +1603,157 @@ class TestDirectorCancellation(unittest.TestCase):
         self.assertEqual(args[2], audio_path)
         self.assertEqual(kwargs["audio_start_sec"], 2.0)
 
+    def test_rejoin_uses_saved_music_frames_and_bounds_audio_padding(self):
+        pid = "pipe-rejoin-music-frame-bound"
+        record = self._add_pipeline(pid, "completed")
+        audio_path = self._write_media("exact-song.wav", b"audio")
+        record["params"].update({
+            "pipeline_type": "music_video",
+            "audio_path": audio_path,
+            "_director_shot_image_policy": "prompt_only",
+            "_director_video_execution_profile": {"fps": 24.0},
+        })
+        record["clip_plans"] = [
+            {"image_prompt": "one", "video_prompt": "one"},
+            {"image_prompt": "two", "video_prompt": "two"},
+        ]
+        record["_planned_clips"] = [
+            {
+                "music_timing_version": 1,
+                "start": 2.0,
+                "end": 2.25,
+                "duration_sec": 0.25,
+                "output_frames": 6,
+            },
+            {
+                "music_timing_version": 1,
+                "start": 2.25,
+                "end": 2.5,
+                "duration_sec": 0.25,
+                "output_frames": 6,
+            },
+        ]
+        record["_clip_video_files"] = ["one.mp4", "two.mp4"]
+        for filename in record["_clip_video_files"]:
+            self._write_media(filename, b"video")
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+        pipeline._update_saved_pipeline(
+            self.temp_dir.name,
+            pid,
+            lambda state: state.__setitem__("video_execution_profile", {}),
+        )
+
+        def concatenate(_clips, output_path, _audio, **_kwargs):
+            self._write_media(os.path.basename(output_path), b"joined")
+            return True
+
+        mock_concat = Mock(side_effect=concatenate)
+        pipeline._wgp.concatenate_multi_clip_videos = mock_concat
+
+        pipeline.rejoin_clips(self.temp_dir.name, pid)
+
+        args, kwargs = mock_concat.call_args
+        self.assertEqual(args[2], audio_path)
+        self.assertEqual(kwargs["audio_start_sec"], 2.0)
+        self.assertAlmostEqual(kwargs["video_duration_sec"], 0.5)
+        self.assertTrue(kwargs["pad_audio"])
+        self.assertAlmostEqual(kwargs["audio_duration_sec"], 0.5)
+        self.assertAlmostEqual(kwargs["max_audio_pad_sec"], 1 / 24)
+
+    def test_rejoin_keeps_legacy_concat_options_for_story_and_unknown_music_timing(self):
+        cases = (
+            {
+                "pid": "pipe-rejoin-story-frame-guard",
+                "pipeline_type": "short_film_story",
+                "audio_path": None,
+                "planned_clips": [
+                    {
+                        "music_timing_version": 1,
+                        "start": 0.0,
+                        "end": 0.25,
+                        "output_frames": 6,
+                    },
+                    {
+                        "music_timing_version": 1,
+                        "start": 0.25,
+                        "end": 0.5,
+                        "output_frames": 6,
+                    },
+                ],
+                "expected_audio_start": 0.0,
+            },
+            {
+                "pid": "pipe-rejoin-legacy-music-frame-guard",
+                "pipeline_type": "music_video",
+                "audio_path": "legacy-song.wav",
+                "planned_clips": [
+                    {"start": 3.0, "end": 3.25, "duration_sec": 0.25},
+                    {"start": 3.25, "end": 3.5, "duration_sec": 0.25},
+                ],
+                "expected_audio_start": 3.0,
+            },
+            {
+                "pid": "pipe-rejoin-gapped-music-frame-guard",
+                "pipeline_type": "music_video",
+                "audio_path": "gapped-song.wav",
+                "planned_clips": [
+                    {
+                        "music_timing_version": 1,
+                        "start": 0.0,
+                        "end": 0.25,
+                        "output_frames": 6,
+                    },
+                    {
+                        "music_timing_version": 1,
+                        "start": 0.3,
+                        "end": 0.55,
+                        "output_frames": 6,
+                    },
+                ],
+                "expected_audio_start": 0.0,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(pipeline_type=case["pipeline_type"]):
+                record = self._add_pipeline(case["pid"], "completed")
+                record["params"].update({
+                    "pipeline_type": case["pipeline_type"],
+                    "_director_shot_image_policy": "prompt_only",
+                    "_director_video_execution_profile": {"fps": 24.0},
+                })
+                if case["audio_path"]:
+                    audio_path = self._write_media(case["audio_path"], b"audio")
+                    record["params"]["audio_path"] = audio_path
+                record["clip_plans"] = [
+                    {"image_prompt": str(index), "video_prompt": str(index)}
+                    for index in range(2)
+                ]
+                record["_planned_clips"] = case["planned_clips"]
+                record["_clip_video_files"] = ["one.mp4", "two.mp4"]
+                for filename in record["_clip_video_files"]:
+                    self._write_media(filename, b"video")
+                self.assertTrue(pipeline._save_pipeline_state(case["pid"]))
+
+                def concatenate(_clips, output_path, _audio, **_kwargs):
+                    self._write_media(os.path.basename(output_path), b"joined")
+                    return True
+
+                mock_concat = Mock(side_effect=concatenate)
+                pipeline._wgp.concatenate_multi_clip_videos = mock_concat
+
+                pipeline.rejoin_clips(self.temp_dir.name, case["pid"])
+
+                _args, kwargs = mock_concat.call_args
+                self.assertEqual(
+                    kwargs,
+                    {
+                        "audio_start_sec": case["expected_audio_start"],
+                        "codec_type": "libx264_8",
+                        "container": "mp4",
+                    },
+                )
+
     def test_server_repair_skips_good_media_and_persists_joined_completion(self):
         pid = "pipe-server-repair-order"
         record = self._add_pipeline(pid, "completed")
@@ -2809,6 +2960,87 @@ class TestDirectorCancellation(unittest.TestCase):
             pipeline._clip_video_slots(outputs, 3),
             ["clip0-window2.mp4", None, "clip1.mp4"],
         )
+
+    def test_failed_video_job_preserves_completed_shot_indices(self):
+        pid = "pipe-video-failure"
+        self._add_pipeline(pid)
+
+        def fake_generation(job_id):
+            job = pipeline._jobs[job_id]
+            self.assertTrue(try_start(job))
+            record_job_outputs(
+                job, ["shot-1.mp4", "shot-4.mp4"],
+                clip_output_files={0: "shot-1.mp4", 3: "shot-4.mp4"},
+            )
+            finish_job(job, "failed", error="Join failed")
+
+        pipeline._run_generation = fake_generation
+        with self.assertRaisesRegex(pipeline._GenerationFailedError, "Join failed") as caught:
+            pipeline._submit_and_wait(
+                {"_director_pipeline_id": pid, "generation_mode": "video"},
+                timeout_s=1, out_dir=self.temp_dir.name,
+            )
+        self.assertEqual(
+            pipeline._clip_video_slots(caught.exception.output_files, 5),
+            ["shot-1.mp4", None, None, "shot-4.mp4", None],
+        )
+
+    def test_repair_recovers_existing_shots_and_only_renders_the_edited_shot(self):
+        pid = "pipe-recover-clips"
+        record = self._add_pipeline(pid, "completed")
+        record["params"].update({"seamless": False, "image_model_type": "none"})
+        record["clip_plans"] = [{"video_prompt": f"Shot {i + 1}"} for i in range(5)]
+        record["clip_images"] = [f"manual_shot_{i + 1}.jpg" for i in range(5)]
+        for name in record["clip_images"]:
+            self._write_media(name)
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+
+        def write_video(stem, clip_index, *, owner=pid, artifact="clip"):
+            filename = stem + ".mp4"
+            self._write_media(filename)
+            self._write_media(stem + ".meta.json", json.dumps({
+                "director_pipeline_id": owner,
+                "director_artifact_kind": artifact,
+                "director_clip_index": clip_index,
+                "output_filename": filename,
+            }).encode("utf-8"))
+            return filename
+
+        expected = [write_video(f"shot-{i + 1}", i) for i in range(5)]
+        write_video("other-revision", 0, owner="other-pipeline")
+        write_video("joined-master", 1, artifact="joined")
+
+        # Loading the Dashboard restores clip review and persists the exact links.
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertEqual([clip["video_filename"] for clip in state["clips"]], expected)
+        self.assertEqual(state["output_files"], expected)
+        with open(pipeline._find_pipeline_file(self.temp_dir.name, pid), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["output_files"], expected)
+
+        self.assertTrue(pipeline.update_clip_prompt(
+            self.temp_dir.name, pid, 4, {"video_prompt": "Updated shot five"},
+        ))
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        plan = pipeline._plan_pipeline_repair(self.temp_dir.name, pid, state)
+        self.assertEqual(plan["video_indices"], [4])
+        self.assertEqual(plan["image_indices"], [])
+        self.assertTrue(plan["should_rejoin"])
+
+    def test_shot_recovery_leaves_unselected_takes_unlinked(self):
+        pid = "pipe-ambiguous-takes"
+        record = self._add_pipeline(pid, "failed")
+        record["params"]["seamless"] = False
+        record["clip_plans"] = [{"video_prompt": "A single shot"}]
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+        for stem in ("take-one", "take-two"):
+            filename = stem + ".mp4"
+            self._write_media(filename)
+            self._write_media(stem + ".meta.json", json.dumps({
+                "director_pipeline_id": pid, "director_artifact_kind": "clip",
+                "director_clip_index": 0, "output_filename": filename,
+            }).encode("utf-8"))
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertIsNone(state["clips"][0]["video_filename"])
 
     def test_cancel_race_completion_fallback_persists_exact_clip_mapping(self):
         source = inspect.getsource(pipeline._run_pipeline)

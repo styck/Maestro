@@ -1,5 +1,6 @@
 import subprocess
 import tempfile, os
+import math
 import ffmpeg
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
@@ -14,6 +15,7 @@ import os.path as osp
 import json
 import numpy as np
 import soundfile as sf
+from services.video_encoding import get_imageio_codec_params
 
 def rand_name(length=8, suffix=''):
     name = binascii.b2a_hex(os.urandom(length)).decode('utf-8')
@@ -351,6 +353,28 @@ def get_audio_file_channels(audio_path):
     return int(audio_stream["channels"])
 
 
+def slice_audio_file_from_frame(audio_path, start_frame, fps, output_path):
+    """Write the source audio tail beginning at one exact video frame.
+
+    H3 output-only reference audio uses this after request preflight has
+    decoded its source to WAV. Reading and writing at the source sample rate
+    keeps the audio clock aligned without resampling the reference.
+    """
+    import soundfile as sf
+
+    fps = float(fps)
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("Audio timeline frame rate must be positive.")
+    start_frame = max(0, int(start_frame or 0))
+    with sf.SoundFile(audio_path) as audio_file:
+        sample_rate = audio_file.samplerate
+        start_sample = int(round(start_frame * sample_rate / fps))
+        audio_file.seek(min(start_sample, len(audio_file)))
+        data = audio_file.read(dtype="float32")
+    sf.write(output_path, data, sample_rate)
+    return output_path
+
+
 def combine_and_concatenate_video_with_audio_tracks(
     save_path_tmp, video_path,
     source_audio_tracks, new_audio_tracks,
@@ -614,21 +638,7 @@ def save_video(tensor,
 
 def _get_codec_params(codec_type, container):
     """Get codec parameters based on codec type and container."""
-    if codec_type == 'libx264_8':
-        return {'codec': 'libx264', 'quality': 8, 'pixelformat': 'yuv420p'}
-    elif codec_type == 'libx264_10':
-        return {'codec': 'libx264', 'quality': 10, 'pixelformat': 'yuv420p'}
-    elif codec_type == 'libx265_28':
-        return {'codec': 'libx265', 'pixelformat': 'yuv420p', 'output_params': ['-crf', '28', '-x265-params', 'log-level=none','-hide_banner', '-nostats']}
-    elif codec_type == 'libx265_8':
-        return {'codec': 'libx265', 'pixelformat': 'yuv420p', 'output_params': ['-crf', '8', '-x265-params', 'log-level=none','-hide_banner', '-nostats']}
-    elif codec_type == 'libx264_lossless':
-        if container == 'mkv':
-            return {'codec': 'ffv1', 'pixelformat': 'rgb24'}
-        else:  # mp4
-            return {'codec': 'libx264', 'output_params': ['-crf', '0'], 'pixelformat': 'yuv444p'}
-    else:  # libx264
-        return {'codec': 'libx264', 'pixelformat': 'yuv420p'}
+    return get_imageio_codec_params(codec_type, container)
 
 
 

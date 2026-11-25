@@ -13,6 +13,20 @@ reference component and saved-character support.
 LoRAs and Advanced appear directly below the model selectors, before the music
 and image inputs, so generation settings can be chosen before audio analysis.
 
+## Reviewed scene images
+
+**None — no generated images** disables the image-generation stage. Explicitly
+reviewed per-scene images still guide the corresponding video shots and are
+retained for resume and clip reruns. Maestro copies those images into the saved
+project, so temporary upload paths are not needed later. Missing reviewed images
+produce a repair message instead of silently switching to text-only video.
+
+Frames models use the reviewed image as a start frame. H3 References models use
+it as that shot's composition reference alongside the character and scene
+references. It is not a fixed first frame in References mode. Choosing None
+without reviewed scene images continues to skip generated starts; stale images
+from an older generated-image revision are not reused automatically.
+
 ## Target duration
 
 Target duration uses Studio's compact duration control. Auto and the current
@@ -46,6 +60,8 @@ Music-video setup includes **Clip length**, with Auto and a maximum-length slide
 Auto follows the chosen video model, resolution and memory recommendation. Moving
 the dimmed slider selects a custom maximum immediately. The displayed time follows
 the model's frame increments, and the minimum clip count updates with it.
+That count is the number of clips needed for this track at the selected maximum;
+it is not a requirement to supply a song with twelve or more clips.
 
 Cuts follow section changes, lyric phrases, performer changes, and strong beats.
 **Cut Speed** controls how tightly these cues divide the song: **0** keeps the
@@ -93,6 +109,31 @@ neighboring clips and revalidate their boundaries. Final H3 compilation also
 checks reference-picture ownership. These checks guide prompts; review the
 planned shots and rendered video for creative quality.
 
+Write the visual concept in plain language: who appears, what happens, the visual
+style, camera constraints, and whether visible characters sing. There is no need
+to paste Maestro's internal JSON schema or six-section H3 prompt layout into the
+concept box. The outline contains short beats; the later clip-writing pass builds
+the complete model-specific prompts and reference bindings. Formatting instructions,
+schema examples, and native identity/retention/soundscape metadata do not become
+mandatory story actions. Concrete actions in narrative sections remain ordered
+obligations. The bounded outline supports up to 48 extracted source actions,
+with up to sixteen assigned to one outline group. This is separate from song
+duration and the number of clips. Selecting a character from uploaded reference
+images is context, rather than an action the character must perform.
+
+The internal outline contract depends on those actions. When actions exist,
+`source_event_clips` maps each action to a zero-based timeline item, and beat rows
+omit `source_event_ids`. Without source actions, rows have empty `source_event_ids`
+arrays. Maestro supplies the required schema to the selected writer; users should
+not maintain a separate response template in their concept.
+
+The Dashboard's expandable **LLM Planning Log** intentionally shows the requests
+and responses for troubleshooting. A planning failure can leave a saved Director
+draft with zero completed clips: **Resume** retries from the first unfinished
+planning unit, while **Open & Edit** restores the inputs for a new revision.
+This recovery draft is separate from an Editor timeline project. If the draft is
+missing entirely, include the launcher log so a persistence failure can be checked.
+
 API clients can send the JSON boolean `use_lyrics_context` to
 `POST /api/v1/director/v2/plan` or
 `POST /api/v1/director/plan-prompts-and-images`. Missing or non-boolean values
@@ -130,6 +171,22 @@ schedule. Models with multiple phases retain independent controls for each
 phase. Values, including zero, are saved and carried into Director projects.
 Older empty weight arrays recover serialized strengths where available, or
 use 1.0 when no strength was saved.
+
+## Story planning recovery
+
+H3 checks action ownership and physical continuity before queuing video jobs.
+When a complete shot plan has an action-allocation or continuity-ledger error,
+Director can repair that metadata while preserving the shot text, dialogue,
+camera, cast and timing. This applies to single-action stories and stories with
+speech as well as silent ones. The same focused recovery is available when a
+larger shot-plan repair leaves metadata errors behind.
+
+Recovery is bounded and the repaired plan is checked again. If it still
+contradicts the source or leaves physical state unresolved, planning stops
+before video generation. Review the planning log for the response and repair
+feedback. Share that log, the original concept and the selected
+Director LLM when reporting a persistent failure; the error does not by itself
+indicate a GPU or model-download problem.
 
 ## Recommended next UI pass
 

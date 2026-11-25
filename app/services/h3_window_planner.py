@@ -24,6 +24,7 @@ from services.h3_story_ledger import (
     UNREQUESTED_SPECTACLE_PATTERNS,
     extract_h3_source_intent,
     extract_locked_dialogue,
+    extract_source_events,
     has_h3_window_bookkeeping,
     normalize_h3_planning_style,
     plan_h3_story_segments,
@@ -258,6 +259,7 @@ def h3_window_plan_signature(
     planning_style: str = "faithful",
     injected_keyframes: list[dict[str, Any]] | None = None,
     lora_system_hint: str = "",
+    source_audio_transcript: dict | None = None,
 ) -> str:
     """Fingerprint every input that can change a window plan."""
 
@@ -290,6 +292,9 @@ def h3_window_plan_signature(
     guidance_fingerprint = lora_guidance_fingerprint(lora_system_hint)
     if guidance_fingerprint:
         payload["lora_guidance_fingerprint"] = guidance_fingerprint
+    if source_audio_transcript is not None:
+        from services.studio_audio_context import transcript_fingerprint
+        payload["source_audio_transcript"] = transcript_fingerprint(source_audio_transcript)
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:24]
 
@@ -1252,6 +1257,30 @@ def _fallback_plan(
         for part in beat_separator.split(source)
         if part.strip(" ,;:-")
     ]
+    # Timed source-video motion edits may put several ordered actions in one
+    # punctuation-free paragraph. When the source has no dialogue, use the
+    # ledger's already-parsed source events if they expose more detail than
+    # the lightweight sentence splitter. This keeps each exact source action
+    # in its own ordered slot without inventing choreography.
+    if not extract_locked_dialogue(source) and not re.search(
+        r"\b(?:says?|said|speaks?|spoke|asks?|asked|replies?|answers?|"
+        r"shouts?|whispers?|tells?|told|explains?|explained|announces?|announced)\b",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        try:
+            source_events = extract_source_events(source)
+            event_beats = [
+                str(event.get("text") or "").strip()
+                for event in source_events
+                if isinstance(event, dict) and str(event.get("text") or "").strip()
+            ]
+            if len(event_beats) > len(beats):
+                beats = event_beats
+        except Exception:
+            # Keep the conservative sentence-based fallback if source
+            # extraction cannot make a stable ordered schedule.
+            pass
     if not beats:
         beats = ["Establish and begin the requested action"]
     beat_buckets: list[list[str]] = [[] for _ in range(window_count)]
@@ -1379,10 +1408,12 @@ def plan_h3_sliding_windows(
     planning_style: str = "faithful",
     lora_system_hint: str = "",
     retry_plan: dict[str, Any] | None = None,
+    source_audio_transcript: dict | None = None,
 ) -> dict[str, Any]:
     """Use Maestro's configured LLM to create and compile an H3 window plan."""
 
-    raw_prompt = str(prompt or "").strip()
+    from services.studio_audio_context import strip_window_transcript
+    raw_prompt = strip_window_transcript(str(prompt or ""))
     prompt = recover_h3_plain_story(raw_prompt)
     source_intent = extract_h3_source_intent(prompt)
     if prompt != raw_prompt and "subject_definitions:" in raw_prompt.casefold():
@@ -1420,6 +1451,7 @@ def plan_h3_sliding_windows(
         planning_style=planning_style,
         injected_keyframes=injected_keyframes,
         lora_system_hint=lora_system_hint,
+        source_audio_transcript=source_audio_transcript,
     )
     guidance_fingerprint = lora_guidance_fingerprint(lora_system_hint)
     from services.h3_plan_retry import finish_retry_plan, retry_fingerprint, validate_retry_plan
@@ -1444,7 +1476,12 @@ def plan_h3_sliding_windows(
             **({"lora_guidance_fingerprint": guidance_fingerprint} if guidance_fingerprint else {}),
         }
 
-    media_context = []
+    from services.studio_audio_context import (
+        conditioning_transcript_windows, transcript_plan_context, transcript_window_contexts,
+    )
+    audio_windows = conditioning_transcript_windows(boundaries, overlap_frames=overlap_frames, fps=fps)
+    audio_context = transcript_plan_context(source_audio_transcript, audio_windows)
+    media_context = [audio_context] if audio_context else []
     if has_start_image:
         media_context.append("<Picture 1> is the exact first frame and visual identity/scene anchor.")
     if has_end_image:
@@ -1466,6 +1503,8 @@ def plan_h3_sliding_windows(
     if planning_style == "adaptive":
         from services.adaptive_enhancement import adaptive_dialogue_expected
         expect_dialogue = adaptive_dialogue_expected(prompt)
+    if source_audio_transcript is not None:
+        expect_dialogue = False  # The supplied waveform, not a new script, owns speech.
     resolved_coverage = _infer_camera_coverage(prompt, camera_coverage)
     story_ledger: dict[str, Any] | None = None
     camera_checkpoint = None
@@ -1483,6 +1522,7 @@ def plan_h3_sliding_windows(
             mode="sliding_window",
             camera_coverage=resolved_coverage,
             reference_context=" ".join(media_context),
+            source_audio_context_windows=transcript_window_contexts(source_audio_transcript, audio_windows),
             expect_dialogue=expect_dialogue,
             planning_style=planning_style,
             image_paths=image_paths,

@@ -2266,7 +2266,7 @@ class MusicVideoPlanner(BasePlanner):
             kwargs,
             kind="music_video",
             fingerprint_payload={
-                "planner_revision": 25,
+                "planner_revision": 27,
                 **(
                     {"h3_music_physical_state_policy": "visual-prose-v1"}
                     if video_model.lower().startswith("minimax_h3") else {}
@@ -2497,7 +2497,7 @@ class MusicVideoPlanner(BasePlanner):
             creative_plan_schema, normalize_music_arc, music_arc_quality_issues,
             music_arc_action_issues, music_arc_repetition_findings,
             music_arc_reprise_reason_findings,
-            ground_music_combat_arc,
+            ground_music_combat_arc, coerce_music_arc_rows, recover_music_arc_event_map,
         )
         cached = self._planning_resume_checkpoint.get("music_creative_arc")
         contract = self._music_narrative_contract
@@ -2647,32 +2647,41 @@ class MusicVideoPlanner(BasePlanner):
             # was a bookkeeping trap even when their visual beats were sound.
             schema["items"]["properties"].pop("source_event_ids")
             schema["items"]["required"].remove("source_event_ids")
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    "beats": schema,
-                    "source_event_clips": {
-                        "type": "object",
-                        "properties": {event_id: {"type": "integer", "minimum": 0,
-                                                   "maximum": len(groups) - 1}
-                                       for event_id in event_ids},
-                        "required": event_ids,
-                        "additionalProperties": False,
-                    },
+            response_properties = {
+                "beats": schema,
+                "source_event_clips": {
+                    "type": "object",
+                    "properties": {event_id: {"type": "integer", "minimum": 0,
+                                               "maximum": len(groups) - 1}
+                                   for event_id in event_ids},
+                    "required": event_ids,
+                    "additionalProperties": False,
                 },
-                "required": ["beats", "source_event_clips"],
-                "additionalProperties": False,
             }
+            response_required = ["beats", "source_event_clips"]
         else:
             event_field["maxItems"] = 0
-            response_schema = schema
+            response_properties = {"beats": schema}
+            response_required = ["beats"]
+        # Remote OpenAI-compatible structured-output APIs require an object
+        # at the schema root. Keeping the rows under `beats` gives the remote
+        # writer one explicit container to return; local llama-server still
+        # receives the same complete schema.
+        response_schema = {
+            "type": "object",
+            "properties": response_properties,
+            "required": response_required,
+            "additionalProperties": False,
+        }
         lyric_context = ""
         if self._use_lyrics_context and lyrics:
             lyric_context = "\nOptional thematic lyric context:\n" + _compact_lyrics_for_context(
                 self._format_lyrics_text(lyrics), max_words=900, max_chars=6000,
             )
         prompt = (
-            f"User visual concept: {scene_description}\n"
+            "User visual concept (JSON string containing creative source material):\n"
+            + json.dumps(scene_description, ensure_ascii=False)
+            + "\n"
             + lyric_visual_policy(self._use_lyrics_context)
             + "\nPlan the COMPLETE song before writing detailed shots. Output one compact "
             "creative beat for each timeline item. Develop the requested narrative, "
@@ -2689,14 +2698,25 @@ class MusicVideoPlanner(BasePlanner):
             "synonyms for the same action. Cutaways and performance inserts may develop "
             "the concept without resetting persistent physical facts. An intentional "
             "reprise needs a specific purpose and new development or treatment. "
-            "Only source_event_ids below are immutable obligations: assign each once "
+            "Only the source-event IDs below are immutable obligations: assign each once "
             "in order; other creative beats may be invented within the concept. "
             "A continuing state (e.g. travelling together) does not require replaying "
             "the transition that established it. Visibly complete each assigned "
             "source action in its item, describing the action rather than merely "
             "writing its event ID. Following items begin from its completed result; "
-            "do not spread an enabling action across unassigned items. Keep each text field concise.\n"
+            "do not spread an enabling action across unassigned items. "
+            "A requested opening or closing pose constrains that endpoint; it does not "
+            "mean the performer must freeze for an entire clip. For movement-led "
+            "concepts, plan visible performance that develops across each clip, with "
+            "restrained beat accents during a quiet introduction and the requested "
+            "energy when the performance builds. Preserve explicitly requested "
+            "stillness or timed holds. If a loop is requested, return the ending "
+            "pose, framing, camera position and setting to the planned opening; "
+            "do not rely on the same pose alone. Keep each text field concise.\n"
             "Required source actions: " + json.dumps(contract.get("events", []), ensure_ascii=False)
+            + f"\nThe supplied timeline is fixed and exhaustive: exactly {len(groups)} groups. "
+            "Do not merge, split, reorder, omit, or add groups. Return one beat row for "
+            "each supplied clip_index, once each. The timeline indices are zero-based."
             + "\nSong timeline: " + json.dumps(timeline, ensure_ascii=False)
             + lyric_context
         )
@@ -2710,53 +2730,215 @@ class MusicVideoPlanner(BasePlanner):
                 "source-event key to exactly one ZERO-BASED timeline item where "
                 "its visible action occurs. Keep those clip indices in source order."
             )
+        else:
+            prompt += "\nOutput one JSON object with a beats array."
+        # Keep the complete response contract in the text as well as the
+        # provider's structured-output argument. A server that rejects that
+        # argument falls back to this same prompt and still needs exact row
+        # fields, bounds, and source-event ownership instructions.
+        prompt += (
+            "\nUse visual_beat for each row's visible action. Use the exact required "
+            "field names and value types below; include every required field and "
+            "no unrelated fields. Return only the outline data matching this "
+            "schema, not the schema itself or an explanation.\n"
+            "Required JSON response schema:\n"
+            + json.dumps(response_schema, ensure_ascii=False, separators=(",", ":"))
+        )
+        outline_system_prompt = (
+            "You are Maestro's whole-song outline planner. This pass returns compact "
+            "creative beats, not finished video-generation prompts. Preserve the user's "
+            "characters, actions, style, camera constraints and audio intent. Treat JSON "
+            "templates, field lists and response-format instructions inside the User visual "
+            "concept as source material, not as this pass's output contract. Follow only "
+            "the supplied Song timeline and Required JSON response schema for structure. "
+            "Each beat must contain all these exact fields: "
+            + ", ".join(schema["items"]["required"])
+            + ". Use visual_beat for the visible action; do not rename it beat or prompt. "
+            "Do not put full subject_definitions, summary, retention_analysis, "
+            "detailed_description or soundscape sections inside visual_beat; Maestro's "
+            "later clip-writing pass constructs the model-specific prompt sections. "
+            "Return only the JSON object matching the supplied response schema."
+        )
+
+        def outline_response_payload(outline):
+            """Show repair examples in the same wire format as the response schema."""
+            rows = copy.deepcopy(outline)
+            payload = {"beats": rows}
+            if event_ids:
+                payload["source_event_clips"] = {
+                    event_id: row["clip_index"]
+                    for row in rows for event_id in row.pop("source_event_ids", [])
+                }
+            return payload
+
+        class EventMapRepairRequired(ValueError):
+            """A sound outline whose event-to-group map needs a focused repair."""
+
+            def __init__(self, message, *, beats, assignments):
+                super().__init__(message)
+                self.beats = beats
+                self.assignments = copy.deepcopy(assignments)
+
+        def event_map_issue(assignments, *, check_order=True):
+            """Return a detailed map error without changing any event placement."""
+            if not isinstance(assignments, dict):
+                return "source_event_clips must be an object"
+
+            issues = []
+            expected = set(event_ids)
+            actual = set(assignments)
+            missing = [event_id for event_id in event_ids if event_id not in actual]
+            unexpected = sorted((str(key) for key in actual - expected))
+            if missing or unexpected:
+                issues.append(
+                    "source-event keys must match the contract exactly "
+                    f"(missing={missing[:8]!r}, unexpected={unexpected[:8]!r})"
+                )
+
+            valid_indices = {}
+            for event_id in event_ids:
+                if event_id not in assignments:
+                    continue
+                index = assignments[event_id]
+                if not isinstance(index, int) or isinstance(index, bool):
+                    issues.append(
+                        f"{event_id}={index!r} must be an integer group index"
+                    )
+                elif index < 0 or index >= len(groups):
+                    issues.append(
+                        f"{event_id}={index} is outside group indices "
+                        f"0..{len(groups) - 1}"
+                    )
+                else:
+                    valid_indices[event_id] = index
+
+            if check_order:
+                previous = None
+                for event_id in event_ids:
+                    if event_id not in valid_indices:
+                        continue
+                    index = valid_indices[event_id]
+                    if previous is not None and index < previous[1]:
+                        issues.append(
+                            "source-event order decreases from "
+                            f"{previous[0]}={previous[1]} to {event_id}={index}"
+                        )
+                    previous = (event_id, index)
+
+            if not issues:
+                return None
+            return "source_event_clips invalid: " + "; ".join(issues[:8])
+
+        def source_event_map_schema():
+            return {
+                "type": "object",
+                "properties": {
+                    event_id: {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": len(groups) - 1,
+                    }
+                    for event_id in event_ids
+                },
+                "required": event_ids,
+                "additionalProperties": False,
+            }
+
+        def parse_event_map_response(response):
+            """Decode the focused map-only response and enforce its full contract."""
+            mapping = response
+            if isinstance(response, list):
+                if len(response) != 1 or not isinstance(response[0], dict):
+                    raise ValueError("source-event map repair must return one JSON object")
+                mapping = response[0]
+            issue = event_map_issue(mapping)
+            if issue:
+                raise ValueError(issue)
+            return copy.deepcopy(mapping)
+
+        def focused_event_map_prompt(repair):
+            """Ask only for a source-faithful assignment map; keep beats locked."""
+            locked_beats = []
+            for row in repair.beats:
+                item = copy.deepcopy(row)
+                item.pop("source_event_ids", None)
+                locked_beats.append({
+                    "clip_index": item.get("clip_index"),
+                    "visual_beat": item.get("visual_beat"),
+                })
+            event_details = [
+                copy.deepcopy(event) for event in contract.get("events", [])
+                if isinstance(event, dict)
+            ]
+            return (
+                "The whole-song beat outline below has passed its timeline and field checks. "
+                "It is locked: do not rewrite, reorder, split, merge, or add beats. "
+                "Repair only source_event_clips. Map every immutable source event to the "
+                "zero-based group whose visual_beat visibly performs that event. Keep "
+                "event assignments in the listed source order; group indices must be "
+                "nondecreasing, and multiple events may share one group only when their "
+                "actions are both visibly present there. Do not move an event to a beat "
+                "that does not show it merely to make the indices increase. If this locked "
+                "outline cannot support a complete source-faithful ordered map, repeat the "
+                "rejected map so validation can stop safely instead of guessing.\n"
+                "Source events in immutable order:\n"
+                + json.dumps(event_details, ensure_ascii=False)
+                + "\nFixed timeline groups:\n"
+                + json.dumps(timeline, ensure_ascii=False)
+                + "\nLocked visual beats:\n"
+                + json.dumps(locked_beats, ensure_ascii=False)
+                + "\nRejected source_event_clips:\n"
+                + json.dumps(repair.assignments, ensure_ascii=False)
+                + "\nThe rejected map failed validation: " + str(repair)
+                + "\nReturn only the complete source_event_clips object. Required JSON response schema:\n"
+                + json.dumps(source_event_map_schema(), ensure_ascii=False, separators=(",", ":"))
+            )
+
         def parse_candidate(response, baseline=None):
             """Parse and validate one response, preserving locked source assignments."""
             rows = response
             assignments = None
             if event_ids:
+                envelope = response
+                if isinstance(response, list) and len(response) == 1:
+                    envelope = response[0]
                 if (
-                    not isinstance(response, list) or len(response) != 1
-                    or not isinstance(response[0], dict)
-                    or set(response[0]) != {"beats", "source_event_clips"}
+                    not isinstance(envelope, dict)
+                    or "beats" not in envelope
+                    or set(envelope) - {"beats", "source_event_clips"}
                 ):
                     raise ValueError("outline response must contain beats and source_event_clips")
-                envelope = response[0]
                 assignments = envelope.get("source_event_clips")
                 rows = envelope.get("beats")
-                if not isinstance(assignments, dict) or set(assignments) != set(event_ids):
-                    raise ValueError("source_event_clips must contain exactly the required source-event keys")
-                for event_id in event_ids:
-                    index = assignments[event_id]
-                    if (
-                        not isinstance(index, int) or isinstance(index, bool)
-                        or index < 0 or index >= len(groups)
-                    ):
-                        raise ValueError(f"source event {event_id} needs a valid zero-based timeline index")
-                if (
-                    not isinstance(rows, list) or len(rows) != len(groups)
-                    or not all(isinstance(row, dict) for row in rows)
-                ):
-                    raise ValueError("beats must cover exactly the requested timeline items")
+                rows = coerce_music_arc_rows(rows, len(groups))
+                if any("source_event_ids" in row for row in rows):
+                    raise ValueError("outline beats must omit source_event_ids; use source_event_clips")
                 rows = copy.deepcopy(rows)
-                by_index = {}
-                for row in rows:
-                    index = row.get("clip_index")
-                    if not isinstance(index, int) or isinstance(index, bool):
-                        raise ValueError("each outline beat needs an integer clip_index")
-                    if index in by_index:
-                        raise ValueError("outline beat clip_index values must be unique")
-                    if "source_event_ids" in row:
-                        raise ValueError("outline beats must omit source_event_ids; use source_event_clips")
-                    by_index[index] = row
-                if set(by_index) != set(range(len(groups))):
-                    raise ValueError("beats must cover each requested timeline item exactly once")
                 if baseline is None:
+                    map_issue = event_map_issue(assignments)
+                    if map_issue:
+                        unassigned_rows = copy.deepcopy(rows)
+                        for row in unassigned_rows:
+                            row["source_event_ids"] = []
+                        # Validate and retain the authored beat outline before
+                        # asking for a map-only repair. The real contract is
+                        # applied again once the map is valid.
+                        accepted_beats = normalize_music_arc(
+                            unassigned_rows, groups, {"source": "", "events": []},
+                        )
+                        raise EventMapRepairRequired(
+                            map_issue, beats=accepted_beats, assignments=assignments,
+                        )
                     for row in rows:
                         row["source_event_ids"] = []
+                    by_index = {row["clip_index"]: row for row in rows}
                     for event_id in event_ids:
                         by_index[assignments[event_id]]["source_event_ids"].append(event_id)
                 else:
+                    map_issue = event_map_issue(assignments, check_order=False)
+                    if map_issue:
+                        raise ValueError(map_issue)
+                    by_index = {row["clip_index"]: row for row in rows}
                     baseline_by_index = {row["clip_index"]: row for row in baseline}
                     for row in rows:
                         # Source-event ownership is immutable during a creative repair.
@@ -2807,6 +2989,7 @@ class MusicVideoPlanner(BasePlanner):
                         item["source_event_ids"] = []
                     expanded.append(item)
             checkpoint = copy.deepcopy(self._planning_resume_checkpoint)
+            checkpoint.pop("music_creative_outline_draft", None)
             checkpoint["music_creative_arc"] = expanded
             checkpoint["music_arc_assignment_notes"] = copy.deepcopy(self._music_arc_assignment_notes)
             checkpoint["music_arc_quality_notes"] = copy.deepcopy(self._music_arc_quality_notes)
@@ -2854,8 +3037,184 @@ class MusicVideoPlanner(BasePlanner):
         baseline = None
         baseline_findings = []
         best_outline = None
+        saw_empty_outline_response = False
+        focused_map_repair = None
+        draft = self._planning_resume_checkpoint.get("music_creative_outline_draft")
+        if event_ids and isinstance(draft, dict):
+            try:
+                beats = normalize_music_arc(
+                    draft.get("beats"), groups, {"source": "", "events": []},
+                )
+                focused_map_repair = EventMapRepairRequired(
+                    str(draft.get("issue") or ""),
+                    beats=beats, assignments=draft.get("assignments"),
+                )
+            except ValueError:
+                pass
+
+        def response_has_no_outline_rows(response):
+            """Recognize only explicit empty outline containers."""
+            if isinstance(response, list) and not response:
+                return True
+            payload = response
+            if isinstance(response, list):
+                if len(response) != 1 or not isinstance(response[0], dict):
+                    return False
+                payload = response[0]
+            if not isinstance(payload, dict):
+                return False
+            rows = payload.get("beats")
+            return isinstance(rows, list) and not rows
+
+        def plan_sections():
+            from ..music_narrative import music_narrative_row_issue
+
+            state = self._planning_resume_checkpoint
+            mapping = state.get("music_arc_section_event_map", {})
+            if event_ids and event_map_issue(mapping):
+                for _ in range(2):
+                    response = self._call_llm_json(
+                        user_prompt=(
+                            "Assign the requested source actions to the given timeline groups. "
+                            "Use each source ID exactly once, in source order. Honor explicitly "
+                            "requested timing and keep later consequences after their causes. "
+                            "Return only the event-to-group object.\n"
+                            + json.dumps({
+                                "brief": scene_description, "timeline": timeline,
+                                "events": contract.get("events", []),
+                            }, ensure_ascii=False)
+                        ),
+                        system_prompt="Map immutable events to zero-based timeline groups.",
+                        max_tokens=max(512, 32 * len(event_ids) + 128),
+                        temperature=0.2, thinking_budget=0,
+                        json_schema=source_event_map_schema(), remote_json_schema=True,
+                    )
+                    try:
+                        mapping = parse_event_map_response(response)
+                    except ValueError:
+                        continue
+                    if not event_map_issue(mapping):
+                        break
+                if event_map_issue(mapping):
+                    raise RuntimeError("The section planner could not assign every source action in order.")
+                state = copy.deepcopy(self._planning_resume_checkpoint)
+                state["music_arc_section_event_map"] = mapping
+                self._publish_planning_checkpoint(state)
+            mapping = mapping if event_ids else {}
+            allocation = [{"event_id": item, "clip_index": mapping[item]} for item in event_ids]
+            ids_by_group = [[] for _ in groups]
+            for item in allocation:
+                ids_by_group[item["clip_index"]].append(item["event_id"])
+
+            def write_section(_batch, start, section, previous):
+                rows = self._call_llm_json(
+                    user_prompt=(
+                        "Write only these timeline groups as a JSON array. Use their original "
+                        "clip_index and exact source_event_ids. Perform each assigned action "
+                        "visibly with the stated actor. Use the previous beat for continuity.\n"
+                        + json.dumps({
+                            "brief": scene_description, "previous_beat": previous,
+                            "timeline": [
+                                {**group, "source_event_ids": ids_by_group[start + offset]}
+                                for offset, group in enumerate(section)
+                            ],
+                            "events": [
+                                event for event in contract.get("events", [])
+                                if start <= mapping[event["event_id"]] < start + len(section)
+                            ],
+                        }, ensure_ascii=False)
+                        + lyric_context + "\nRequired JSON schema:\n"
+                        + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                    system_prompt="Write compact section beats with the supplied source actions and camera constraints. Return only the requested JSON array.",
+                    max_tokens=160 * len(section) + 1024, temperature=0.45, thinking_budget=0,
+                    json_schema=schema, remote_json_schema=True,
+                )
+                return rows
+
+            def validate_section_row(index, row, _prior_rows):
+                if isinstance(row.get("clip_index"), bool) or row.get("clip_index") != index:
+                    return f"Expected outline group {index}."
+                try:
+                    relevant = [event for event in contract.get("events", [])
+                                if mapping[event["event_id"]] == index]
+                    normalize_music_arc(
+                        [{**row, "clip_index": 0}], [groups[index]],
+                        {"source": scene_description, "events": relevant},
+                    )
+                except ValueError as error:
+                    return str(error)
+                return music_narrative_row_issue(
+                    {**row, "video_prompt": row.get("visual_beat", "")},
+                    contract=contract, allocation=allocation, index=index,
+                )
+
+            outline = self._run_checkpointed_json_batches(
+                items=timeline, batch_size=8, checkpoint_key="music_creative_outline_sections",
+                stage="music_creative_arc", progress_label="song outline",
+                call_batch=write_section, row_validator=validate_section_row,
+                repair_batch_size=4, repair_attempts=1,
+            )
+            return normalize_music_arc(outline, groups, contract)
+
+        def candidate_from_event_map(locked_beats, assignments):
+            repaired_beats = [
+                {key: value for key, value in row.items() if key != "source_event_ids"}
+                for row in locked_beats
+            ]
+            candidate = parse_candidate({
+                "beats": repaired_beats,
+                "source_event_clips": assignments,
+            })
+            action_issues = music_arc_action_issues(candidate, contract)
+            if action_issues:
+                raise ValueError(
+                    "focused source_event_clips repair does not match the locked "
+                    "visual beats: " + "; ".join(action_issues[:3])
+                )
+            return candidate
+
+        if self._planning_resume_checkpoint.get("music_creative_outline_sections"):
+            outline = plan_sections()
+            return expand_and_checkpoint(outline, quality_notes_for(outline))
+
         for attempt in range(2):
             self._raise_if_planning_cancelled()
+            if focused_map_repair is not None:
+                self._emit_planning_progress(
+                    message="Repairing source-event timing without rewriting the outline...",
+                    current=0, total=len(clips), stage="music_creative_arc",
+                )
+                map_schema = source_event_map_schema()
+                response = self._call_llm_json(
+                    user_prompt=focused_event_map_prompt(focused_map_repair),
+                    system_prompt=(
+                        "You repair only the source-event-to-timeline map for an accepted "
+                        "music-video outline. Never author or edit visual beats. Assign each "
+                        "source event to a group that visibly contains its action, exactly "
+                        "once and in source order. Return only the map JSON object."
+                    ),
+                    max_tokens=max(512, 32 * len(event_ids) + 128),
+                    temperature=0.2,
+                    thinking_budget=0,
+                    json_schema=map_schema,
+                    remote_json_schema=True,
+                )
+                try:
+                    candidate = candidate_from_event_map(
+                        focused_map_repair.beats, parse_event_map_response(response),
+                    )
+                except ValueError as exc:
+                    issue = str(exc)
+                    repaired = recover_music_arc_event_map(focused_map_repair.beats, contract)
+                    if repaired is None:
+                        break
+                    try:
+                        candidate = candidate_from_event_map(focused_map_repair.beats, repaired)
+                    except ValueError:
+                        break
+                return expand_and_checkpoint(candidate, quality_notes_for(candidate))
+
             self._emit_planning_progress(message="Planning progression across the whole song...",
                                          current=0, total=len(clips), stage="music_creative_arc")
             repair_context = ""
@@ -2878,23 +3237,29 @@ class MusicVideoPlanner(BasePlanner):
                     "Develop only those later beats into distinct visible progression. Exact flagged pairs and evidence: "
                     + json.dumps(pair_details, ensure_ascii=False)
                     + "\nOriginal valid outline to edit in place:\n"
-                    + json.dumps(baseline, ensure_ascii=False)
+                    + json.dumps(outline_response_payload(baseline), ensure_ascii=False)
                 )
             elif issue:
                 repair_context = (
-                    "\nRepair this outline's structural or source-assignment issue: " + issue
-                    + "\nPreserve valid beats, cast, and pacing. Keep immutable source actions exactly once and in order."
+                    "\nThe previous outline could not be normalized: " + issue
+                    + "\nMake one bounded correction using the fixed timeline in the original request. "
+                    "Return exactly one beat for each supplied group and preserve valid creative details, "
+                    "the requested cast and pacing, and every immutable source action exactly once and in order."
                 )
                 if best_outline:
                     repair_context += "\nBest previously accepted outline:\n" + json.dumps(
-                        best_outline, ensure_ascii=False,
+                        outline_response_payload(best_outline), ensure_ascii=False,
                     )
             response = self._call_llm_json(
                 user_prompt=prompt + repair_context,
-                system_prompt="Direct a complete music video. Output only the requested JSON structure.",
+                system_prompt=outline_system_prompt,
                 max_tokens=max(2048, 160 * len(groups) + 1024),
                 temperature=0.55, thinking_budget=0,
                 json_schema=response_schema,
+                remote_json_schema=True,
+            )
+            saw_empty_outline_response = (
+                saw_empty_outline_response or response_has_no_outline_rows(response)
             )
             try:
                 candidate = parse_candidate(response, baseline=baseline)
@@ -2917,6 +3282,19 @@ class MusicVideoPlanner(BasePlanner):
                     # malformed, or still-repetitive optional edit cannot abort it.
                     chosen = best_outline or baseline
                     return expand_and_checkpoint(chosen, quality_notes_for(chosen))
+            except EventMapRepairRequired as exc:
+                issue = str(exc)
+                if baseline is not None:
+                    # A valid baseline is already safe; a later optional edit
+                    # cannot invalidate its source-event ownership.
+                    return expand_and_checkpoint(baseline, quality_notes_for(baseline))
+                focused_map_repair = exc
+                checkpoint = copy.deepcopy(self._planning_resume_checkpoint)
+                checkpoint["music_creative_outline_draft"] = {
+                    "beats": exc.beats, "assignments": exc.assignments, "issue": issue,
+                }
+                self._publish_planning_checkpoint(checkpoint)
+                continue
             except ValueError as exc:
                 issue = str(exc)
                 if baseline is not None:
@@ -2924,7 +3302,27 @@ class MusicVideoPlanner(BasePlanner):
                     return expand_and_checkpoint(baseline, quality_notes_for(baseline))
         if baseline is not None:
             return expand_and_checkpoint(baseline, quality_notes_for(baseline))
-        raise RuntimeError("Music-video whole-song planning needs revision: " + issue)
+        if len(groups) >= 12 and focused_map_repair is None:
+            try:
+                outline = plan_sections()
+            except RuntimeError as error:
+                raise RuntimeError(f"Music-video whole-song planning needs revision. {error}") from error
+            return expand_and_checkpoint(outline, quality_notes_for(outline))
+        message = "Music-video whole-song planning needs revision: " + issue
+        if focused_map_repair is not None:
+            message += (
+                " The visual outline was saved. Retry planning to repair the source-action "
+                "assignments without asking the writer to recreate the outline."
+            )
+        if saw_empty_outline_response:
+            message += (
+                " No usable structured outline was returned after JSON repair. "
+                "Check the adjacent LLM completion telemetry; if it shows "
+                "finish=length and answer=0 with reasoning consuming the request "
+                "limit, adjust the provider reasoning/output-token settings. "
+                "Missing actions were not inferred."
+            )
+        raise RuntimeError(message)
 
     # ── Character Building ───────────────────────────────────────────
 
@@ -3958,6 +4356,19 @@ MUSIC VIDEO RULES:
 - Keep anatomy and proportions stable. Convey energy through natural expression,
   gesture, movement, and camera work; do not invent expanding, pulsing, or bulging
   body parts. Preserve any transformation the Scene Concept explicitly requests.
+- Preserve the requested visual medium, rendering style and explicit style exclusions
+  in every visual_style field and video_prompt. Apply them to the whole frame,
+  including subjects, environments, backgrounds and shading, rather than merely
+  naming the medium in a character description. Identity references do not override
+  the Scene Concept's explicit target style. A camera or lighting change does not
+  change the rendering medium unless the user requests that change.
+- An opening or closing pose is an endpoint, not a full-clip freeze instruction.
+  For movement-led performances, describe visible development across the shot's
+  actual duration: restrained beat accents can build into the requested energetic
+  movement. Do not finish the action early and hold a static image for the rest
+  of the shot unless that pause is requested or deliberately motivated. Preserve
+  explicit stillness and timed holds. A requested loop should return to the opening
+  composition, camera and pose.
 
 {physical_continuity_rules}
 
@@ -3999,6 +4410,7 @@ Notes:
 KEEP MUSIC-VIDEO PROMPTS SIMPLE:
 For each scene, the music drives the pacing and energy. You only need to identify:
   - WHO is in frame ({"preserve user-supplied proper names and pair them with useful visible traits" if preserve_names else "the performer, by descriptor — never by name"})
+  - VISUAL MEDIUM and rendering style, including explicit exclusions, across the entire frame
   - CAMERA MOVEMENT (push-in, pull-back, orbit, handheld, low angle, etc.)
   - ATMOSPHERIC ELEMENTS (smoke, pyro, crowd cheering, lighting flashes, etc.)
   - The performer's BODY MOVEMENT in broad strokes (head bob, arms raised,

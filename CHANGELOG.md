@@ -3,6 +3,494 @@
 All notable changes to Maestro are documented here. The upstream WanGP
 pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 
+## [4.2.0] — 2026-11-23
+
+Public Main and Dev release. See the [v4.2.0 release notes](docs/RELEASE_NOTES_V4.2.0.md).
+
+### Director and creative workflows
+
+- Preserve named H3 References dialogue speakers through prompt enhancement.
+  Validate dialogue and reference attribution in every window before rendering.
+  Allow complementary images to describe one subject while retaining separate
+  identities for distinct saved characters.
+- Checkpoint accepted music-video plans and repair failed batches while keeping
+  story events in order. Scope each shot's visual and voice references to its
+  cast and recover completed clips during assembly.
+- Audition a new singing voice in Director with **Sung by**. SeedVC can convert
+  lead vocals or duet parts while retaining the accompaniment and song timing.
+- In Director Delivery, export timed song lyrics as an SRT caption track and
+  queue upscaling for a selected shot or an already joined cut.
+- Anchor the start or end of a supported Director shot to a neighboring take.
+  Dependent shots are marked for regeneration when their source take changes.
+- Preview Recipes with short, muted video samples and apply them with their
+  required model, media and prompt guidance. MCP clients can read recipe
+  guidance too.
+- Extract and edit up to four Remake keyframes in Studio Image and return them to
+  their original slots. Experimental BFS Aligned Swap uses one identity image
+  with the original clip's framing and soundtrack.
+- **Keep source audio (output only)** in Studio References copies the selected
+  reference soundtrack into the finished clip without passing it to H3 as
+  driving audio. Remember the choice when reusing the clip's settings.
+
+### Models and acceleration
+
+- Add pDMD 2- and 4-step presets for MiniMax H3 Image text-to-image and reference
+  editing, alongside the native 6-step reset preset.
+- Add experimental H3 HyperFlow Flash 14B for Frames and References with 4, 6 and
+  8 Euler steps and optional two-pass generation.
+- Add the WanGP v20.10 pi-H3 FL2VA 2- and 4-step Frames recipes, plus dedicated
+  Pruned and Full DWD models that produce pixels in the final denoising pass.
+  The DWD variants load their matching accelerator LoRAs automatically.
+  Apply low-rank and bias changes in Pruned timestep layers, and match the
+  published audio/video schedule, seeded noise and audio tail.
+- Add experimental LongCat Avatar 1.6 Distilled with 25 fps output, an 8-step
+  scheduler and streamed audio conditioning.
+- Add experimental ZONOS3 Mini speech with support for 43 languages, 27 built-in
+  voices, reference voice cloning and delivery controls.
+
+### Reliability and performance
+
+- Use the driving media for Studio References and Avatar automatic duration,
+  respecting its window geometry. Track denoising speed per pass.
+- Add Face Refiner blending, face selection, audio guidance and before/after
+  comparison.
+- Select H3 attention head splitting from available VRAM in Auto mode and reduce
+  peak VAE conversion memory. Independently configure manual splitting.
+- Add Extreme attention input chunking for supported model paths and optional
+  SageGP Precise, Fast and Adaptive attention. Availability depends on the GPU
+  and installed kernels. Extreme chunking trades some speed for lower peak VRAM.
+- Assemble supported native sliding-window MP4s incrementally, preserving audio
+  and frame timing. Window assembly is scoped to the active job.
+- Pin optional WGPKernels 1.5.0, correct Wan 2.2 guidance defaults and respect
+  compile opt-outs. Fix FlashVSR streamed cache shapes and padding, omit
+  unsupported fields from compatible Gemini requests and improve LTX 2.5
+  second-pass failure reporting and cleanup.
+- Fix legacy Python 3.10 updates in Pinokio by resolving the pinned ONNX Runtime
+  GPU wheel across the configured package indexes. Retrying Update completes
+  setup if an older launcher hit this error after pulling the fix.
+  [Issue #241](https://github.com/Blizaine/Maestro/issues/241)
+
+## [4.1.1] — 2026-11-10
+
+- Reserve GPU memory for reference-heavy MiniMax H3 Image renders. Auto-Tune
+  switches fully resident models to a streaming profile based on available
+  VRAM and RAM, retaining the requested canvas and all references.
+
+## [4.1.0] — 2026-11-10
+
+- Add experimental MiniMax H3 Image to Studio Image Generate. Generate from text
+  or edit with up to 16 ordered source images at native 1K, 2K and 4K.
+- Add H3 Remake for replacing people or editing a scene, Regenerate 2K, H3
+  accelerator options, Director final takes and RelayVSR 2× video upscaling.
+- Add exact-text CPU title cards to the agent creation workflow and optional
+  detached opening, intertitle and end cards in Director planning. Keep cards
+  separate from character references; wrap opening/end cards around the muxed
+  master to preserve soundtrack synchronization. Audio-locked intertitles need
+  an explicitly reserved Editor timeline.
+- Add agent-authored finishing into a new editable Editor project: ordered
+  clips/cards, narration, music and sound effects, gains, fades, declared speech
+  ducking and optional software export.
+- Add actual-media take inspection with software decoding, five sampled stills,
+  a contact sheet and optional audio preview delivered directly to MCP clients.
+  Creative judgments remain explicit agent observations, never an automatic pass.
+- Add durable, owner-scoped polish budgets for selected Director takes. Reuse
+  original request IDs after uncertain responses; source fingerprints and receipt
+  guards prevent stale or repeated retakes.
+- Accept the pinned PDD adapter's BF16 head tensors and fit them in FP32. Retain
+  PTD's separate format checks. Improve Director source-action actor/origin
+  validation without relaxing genuine ordering or object requirements.
+- Retain H3 reference voice handoff diagnostics without claiming that prompting
+  guarantees identity or voice matching.
+- Recover stale Agent Access registrations on Windows when complete OS process
+  enumeration proves the recorded PID is absent. Preserve conservative refusal
+  for live processes and incomplete or unavailable process checks.
+
+- Restore a recorded video's duration when loading MCP/API or older clip
+  settings without Studio's duration-planning hint. Do not reinterpret a saved
+  single clip as a new prompt-based Auto timeline; retain explicit saved
+  planning modes and continuation geometry.
+- Allow experimental 4–12 denoising steps for Pika H3 Flex Frames and References.
+  Keep the released six-step schedule as the recommended default, preserve the
+  selected count when reusing settings, and retain the managed adapter, guidance
+  and video/audio shifts. Other counts are sampling experiments, not trained
+  quality presets.
+
+See [v4.1.0 release notes](docs/RELEASE_NOTES_V4.1.0.md) and the
+[agent filmmaking guide](docs/Agent-Filmmaking.md).
+
+## Repository maintenance - 2026-10-31
+
+- Organize public integration records and testing guides under `docs/technical/`
+  and `docs/testing/`, with linked indexes.
+- Move optional developer launchers to `tests/pinokio/`, the shared profile helper
+  to `scripts/pinokio/`, contribution guidance to `.github/`, and the launcher
+  icon to `docs/images/`. Remove the unused legacy UI screenshot.
+- Archive maintainer working plans privately and remove them from the public
+  branch tree. Extend the repository guard to reject private notes, local
+  configuration and runtime artifacts without printing their contents.
+
+## [4.0.0] — 2026-11-04
+
+Public Main and Dev release. Experimental features and validation limits remain
+documented in the [release notes](docs/RELEASE_NOTES_V4.0.0.md).
+
+**4 November — Release preparation and reliability:** add optional ComfyUI
+model-folder reuse, typed API workflow imports, component pickers and explicit
+Native/Comfy routing, including supported Director paths. ComfyUI remains
+separately managed and off by default. Fix wrapped H3 encoder namespaces,
+Director scene-image handling with no image-generation model, selected join
+codecs/containers, suspended preview recovery and several runtime name errors.
+Reference enhancement now distinguishes character, motion and scene videos,
+keeps vocal IDs separate from Subject IDs, and preserves authored speech when
+repairing a rejected draft. Recover a narrowly identifiable final dialogue-tag
+typo, avoid shorter automatic word targets for supplied lines, keep named props
+from stealing dialogue ownership, and include actual failures in repair requests.
+Update the README image and release documentation.
+
+**2 November — Agent Access and testing updates:** built-in Local MCP and
+authenticated Remote MCP can be enabled independently. Add scoped clients,
+model-aware authoring guides, saved references, asset transfers and agent-authored
+Studio/Director plans, including native song analysis for music videos. Existing
+Pinokio and LAN browser access remains available. Pika References now accepts
+exact source-audio conditioning; fix independent-shot offsets, character-label
+bindings and native Director module identity. Add experimental FastH3 LoRAs,
+shared Turbo LoRA filters, failed-job settings/LoRA details, speech chunk status,
+shorter Editor tracks and an adjustable timeline divider. Keep checkpoint-table
+compatibility fitting on CPU even under a different global tensor device.
+
+Label public Dev v4.0.0 in preparation for the next public Main release.
+The first visit to v4 switches existing and new browser profiles to Graphite
+Studio in Dark mode. Apply that one-time change before the UI mounts, then
+retain any theme or appearance the user chooses afterward, including across
+reloads and v4 patch updates. Other preferences stay unchanged.
+
+Include the upgraded Editor, reviewable Auto-edit, animated titles in Studio
+and Editor, chroma key and transparent MOV export; compact pinned Studio
+controls, mobile/startup recovery and a resizable gallery thumbnail panel.
+Near-widescreen gallery videos retain native proportions without edge gaps.
+
+Add experimental Pika H3 Flex Frames/References to their default enabled
+lists, retaining explicit workflow visibility choices. Enable native H3
+sliding windows with generated motion/boundary/stereo-audio history and
+canonical References inputs, fixed six-evaluation sampling and exact joined
+frame totals. Preserve saved sequence geometry and native single-pass durations.
+
+The release also includes the post-Main v3.3 ports and fixes: MOSS reference
+editors/caches/HQ vision, Fibo 2.0, Qwen reference caches, H3 accelerators/PTD/
+two-pass generation, FlashVSR+ Turbo, optional kernels, Worlds and Profile 0.
+Image prompt guides preserve requested media/styles, model-switch validation
+is repaired, and successful HTTP access lines are quiet by default.
+
+See the [v4.0.0 release notes and limits](docs/RELEASE_NOTES_V4.0.0.md) for the
+reviewed three-workstation qualification and later regression coverage.
+
+**31 October — Reference enhancement fixes:** use the selected media's character
+and voice bindings consistently in Enhance Now, Enhance on generation, and H3
+generation. Scene and style references no longer shift character IDs; composition
+and object references remain separate from character identity. Reconcile older
+tagged prompts from explicit identity evidence, and reject conflicting speaker
+cues before voice selection. Accept harmless dialogue spacing and line wrapping
+without weakening checks for changed words, language, speaker ownership, turn
+order, or duplicated dialogue. Verified prompt attribution with Qwen and Gemma
+for both Scene and Composition; these checks do not certify rendered quality.
+
+## [3.3.0] - 2026-10-26
+
+**Gallery:** resize the thumbnail panel with a draggable, keyboard-accessible
+divider. Previews scale with its width, and the main gallery shares the available
+space. A gallery-toolbar button replaces the protruding tab and phone's floating
+opener; panel width and desktop visibility are remembered per browser.
+
+**Appearance:** add Graphite Studio, a matte charcoal theme with flat orange
+actions, quieter neutral borders and a matching light variant. It is the
+default for fresh browser profiles; saved theme choices remain unchanged.
+The header uses a flat rounded-square M mark that follows the selected theme's
+accent color.
+Dark, Light and Auto modes apply the same palette before the UI mounts.
+
+**27 October image and terminal fixes:** add Krea 2 generation/edit prompt guides;
+preserve requested image media and styles across Studio, raw image writers and
+Director image rules; distinguish FLUX 3 Base from the distilled variant. Remove
+forced photograph/static-pose wording and unconditional source-lighting rules.
+Fix FLUX 3 image generation rejecting unrelated model-mode settings. Quiet
+successful HTTP access logs while retaining failures, warnings and startup logs.
+
+**27 October Dev follow-up:** MOSS SFT/HQ reference editors and caching, HQ v5
+vision conditioning, model-switch validation and native reference geometry;
+Fibo 2.0 and rectangular VAE decoding; H3 PTD and optional two-pass refinement;
+experimental queued Worlds and opt-in VMM/Profile 0. Includes the integration
+fixes found during bounded three-workstation pilots and subsequent workstation
+01 user tests. These are functional checks, not matched speedup or general
+editing-quality claims. See the release notes for compatibility and limits.
+
+Public Dev testing release of the first October WanGP porting batch. Main
+remains v3.2.5. See the [v3.3.0 Dev release notes](docs/RELEASE_NOTES_V3.3.0.md).
+
+- Add optional WGPKernels 1.4.2 / GGUF CUDA 1.0.29 installers with supported-stack
+  checks, hash-pinned assets, stale-version upgrades and newer-manual-pin retention.
+- Add opt-in Qwen Image 2.1 INT8 VRAM/RAM reference caches with conservative
+  memory guards, independent CFG branches and scheduled-LoRA invalidation.
+- Add four pinned LightX2V H3 standard accelerator recipes and apply their
+  video flow shifts at runtime without changing fixed distilled schedules.
+- Add separate FlashVSR+ Turbo upscaling through Post Processing, Tools and
+  Editor, retaining saved FlashVSR v1.1 selections and model-specific caches.
+- These ports have CPU regression/build coverage; matched GPU speed, memory
+  and quality validation is pending. See [port scope](docs/WanGP-October-2026-Ports.md).
+
+## [3.2.5] - 2026-10-24
+
+Public Main and Dev release of the 23–24 October Dev updates. See the
+[v3.2.5 release notes](docs/RELEASE_NOTES_V3.2.5.md).
+
+Updates promoted from Dev, 23–24 October:
+
+- Enable full Fish acceleration on supported RTX 30-series runtimes with
+  Fish-specific SDPA attention, Triton and FLA checks. Preserve explicit Legacy
+  choices and the existing GPU cache/graph memory guards.
+- Add Fish Drama 3 Small with a pinned audio.cpp runtime, bounded streaming
+  synthesis, expert offload for smaller GPUs, voice references, Auto duration
+  and explicit native completion/cap evidence. Keep the full Fish models.
+- Improve speech draft recovery and exact-anchor performance directions;
+  retain incomplete drafts, skipped edits and clear review reasons.
+- Let Speech Write follow the selected clip duration unless the brief or a
+  positive draft-length override supplies a target. Count spoken words without
+  cues, attempt bounded short/repeated-section recovery, and warn about
+  incomplete or substantially overlong drafts while preserving available text.
+- Improve Fish's writer guide and output contracts for inline delivery cues
+  and word-level performance tags. Preserve all seven paired delivery tags
+  and local phoneme spans through cuts, keep speaker cues correctly scoped,
+  and allow 60 seconds of recent complete-turn history for new settings.
+  Preserve saved history choices and record effective per-part conditioning.
+  Native writer compliance and voice continuity still need listening tests.
+- Tune Fish one-frame expert execution with reusable scratch, direct output
+  casting and parallel down projections with ordered FP32 reduction. Add bounded
+  packed-expert GPU caching when the complete bank does not fit, and a separate
+  audio-tower sampling graph while CPU routing/cache transfers remain eager.
+  Verify placement and preserve cache/RNG rollback, with CPU/eager fallbacks.
+  Honor Fish's declared vLLM offload support instead of silently selecting
+  Legacy outside profiles 1/3. Keep unsupported FP8 formats on CPU and leave
+  GPU/staging-RAM headroom. Native INT4/cache checks passed on 24GB, 12GB and
+  8GB cards; short full and Small speech runs subsequently completed on both
+  smaller workstations. See the release notes for measured scope and limits.
+- Preserve complete enhanced speech scripts when normal storytelling phrases
+  or dialogue refrains repeat. The generic prompt repetition cleaner could
+  truncate Fish narration mid-sentence and discard its ending.
+- Add native whole-frame CUDA Graph decoding for Fish's vLLM engine when all
+  dense decode weights and complete expert banks are resident on one GPU.
+  Capture each speech part after prefill, restoring caches and RNG after warmup;
+  retain eager decoding for offloaded profiles or unavailable capture. Preserve
+  EOS, uncapped sampling, cancellation, duration bounds and long-form reports.
+  Traverse MMGP's parent references and tied weights once, so empty LoRA hooks
+  cannot cause a recursion error and silently disable graph capture.
+- In one matched short RTX 4090 take, graph decoding took 1.66s instead of
+  26.76s for the same 131 frames; decoded audio samples matched exactly.
+  Whole-job time was 21s instead of 45s, including loading/reference work.
+- Remove redundant GPU-to-CPU expert-ID bound checks from Fish's internal
+  top-k routing path, avoiding eighty CUDA scalar reads per decoded frame.
+  Preserve direct-call validation and CPU behavior. The isolated speedup from
+  this bound-check change alone has not been measured.
+- Add saved Speech writer instructions and approximate draft-length targets.
+  Long stories/dialogues use bounded planning and section drafting with
+  continuity, continuation and review warnings instead of a single 2k response.
+  Fish synthesizes long scripts in safe chunks into one file with a one-hour
+  whole-output bound, bounded codec/history context and incomplete-part reports.
+- Add Fish-only Auto speech length with a script/context-bounded safety budget
+  and an optional manual maximum. Preserve saved positive limits and fix the UI
+  replacing sub-30-second Fish limits with the model's longer default. Duration
+  is a maximum rather than a pacing target; natural pauses still depend on Fish.
+- Fix Fish Drama 3's Top-k 0 path to disable the cap instead of becoming
+  greedy. Use no-cap defaults for new Fish speech settings and expose Top-k /
+  Top-p in Advanced Generation. This addresses an upstream-documented silence
+  trigger; complete speech and voice similarity still need a matched render.
+- Support Eros Max beta6's retained BF16 main layers and 11 additional INT8
+  projections, validating every quantized layer. Identify the verified beta6
+  hybrid by its file identity/checksum, enable both modes with its original
+  FL2VA adapter basis, and apply its creator's 8–12-step 10/3 recipe.
+  Preserve FP32 output-head compute locks through quantized loading and retain
+  FP32 scale storage when adapting the BF16 CPU fallback.
+- Clarify that importing a Ref2VA/hybrid H3 checkpoint enables Frames and
+  References with one shared file. Prevent stale per-workflow visibility
+  defaults from hiding newly imported companions; preserve existing opt-outs.
+- Adjust Auto-owned native H3 placement on Windows 16GB RTX 50-series / 64GB
+  RAM hosts: use Profile 4 and retain the existing workspace guard's feasible
+  residency allowance instead of imposing an additional 3 GiB ceiling. Preserve
+  manual settings, clamped-workload protection and the other hardware tiers.
+  This addresses identified placement differences; recovery of the reported
+  RTX 5080 slowdown still needs a matched hardware test. See the
+  [16GB H3 placement review](docs/H3-16GB-placement.md).
+- Support the mixed W4A8/INT8 ConvRot layout used by the 13GB Eros Max beta5
+  checkpoint, including per-layer W4A8 weight groups of 4, 8 and 16. Preserve
+  per-layer validation and reject conflicting descriptors. Accept finite
+  BF16/FP16 AdaLN curves through the runtime's existing FP32 interpolation.
+  Retry transient bounded descriptor reads once and show specific
+  access/network/range failures. See the
+  [H3 checkpoint import guide](docs/H3-checkpoint-import.md).
+- Reuse a completed soundtrack cache entry when concurrent preparation windows
+  collide on Windows. Failed publication still raises when no usable cache
+  exists, and each request cleans up its own temporary file.
+- Recover H3 Director plans with repeated source-action allocations or missing
+  physical-continuity metadata using at most two compact repair requests.
+  Preserve accepted shot content, timing, dialogue and camera instructions;
+  keep strict validation and retain failures when metadata cannot be repaired.
+- Update the speech result wiring regression to cover both full Fish and Small
+  partial-output reports and warnings after the shared architecture path changed.
+- Preserve manual Fish duration selections when a newer UI connects to an older
+  backend without the newer speech capability fields. Keep Auto unavailable
+  there and clamp zero to the supported minimum before submission.
+- Avoid a native CPU BF16 INT8 kernel crash exposed by the mixed-checkpoint
+  regression. Use bounded blocks of explicit CPU math while preserving stored
+  FP32 scales, BF16 rounding and bias behavior. CUDA execution is unchanged.
+  Retain numeric loader coverage and expose native fault traces in CI.
+
+## [3.2.0] - 2026-10-22
+
+Public Main and Dev release, including the 20–22 October Dev preview fixes. See the
+[v3.2.0 release notes](docs/RELEASE_NOTES_V3.2.0.md).
+
+Dev follow-up fixes, 22 October:
+
+- Prioritize Studio/Director model controls during UI startup, defer gallery
+  scans and writer discovery, and load hidden panels on first use. Recover
+  failed startup reads automatically with a visible Retry control, including
+  mobile reconnects after a server restart. Compress large model-control JSON
+  and hashed UI assets without changing media or event-stream delivery.
+- Keep mobile mode, workflow and reference controls visible when browser chrome
+  or a restored tab changes the viewport height. Compact the sidecar only for
+  a focused text field with an actual keyboard-height reduction; restore its
+  controls on blur and browser return without requiring a refresh.
+- Show workspace loading throughout initial gallery startup, including saved
+  folder restoration, so model controls no longer hand off to a blank gallery
+  or premature empty-state message before the media request starts.
+- Fix H3 enhancement falsely treating motion-video retention entries as new
+  characters. Save writer drafts and specific rejection reasons locally for
+  Studio and Director, including failed/interrupted requests. Review them in
+  Studio's prompt history or the Director Dashboard.
+- Preserve accepted multi-window prompts during focused repairs and retain
+  usable camera cards when a repair call fails. Keep incomplete schedules
+  reviewable without replacing them with one repeated original paragraph.
+- Give video soundtracks explicit audio roles in Studio and Director: preserve
+  soundtrack, voice, music/sound style, sound effect, ignore, or the previous
+  generative audio-reference behavior. Existing saved checkbox settings retain
+  their meaning. See [H3 reference audio and draft recovery](docs/H3-Reference-Audio-and-Drafts.md).
+- Restore all fifteen optimized MiniMax-Music3 downloads from a surviving
+  Hugging Face snapshot, repair three local-writer vision projector downloads
+  while reusing existing cached filenames, and correct the hidden Z-Image
+  eight-step ControlNet BF16 export and YuE2 model-weight license link.
+- Carry each Director shot's visual style into the complete H3 frame, including
+  subjects and backgrounds. Preserve it through saved projects, resume, native
+  timeline splits and individual clip reruns, while keeping edited prompts
+  authoritative.
+- Stop treating the noun in choreography descriptions such as "dancing with
+  spins" as a mandatory story action, or the requester in "I want" as its actor.
+  Keep genuine first-person actions and the original creative brief intact.
+- Clarify music-video planning instructions for rendering style, visible
+  performance across a clip, and matching loop composition and camera position.
+  Preserve explicitly requested stillness and timed holds.
+
+Dev follow-up fixes, 21 October:
+
+- Use checked video-track bounds for Viggle Animate's timeline, source frame and
+  submitted trim so a longer soundtrack cannot trigger a false out-of-range
+  error. Recheck restored settings, clear bounds across source/workflow changes,
+  and validate ranges before character preparation. Reconcile measured full-file
+  audio tails while retaining rejection of genuinely invalid selections.
+- Repair H3 VDN Full and Pruned module/default-LoRA downloads and the bundled
+  eight-step Turbo preset after the old Hugging Face revision stopped serving
+  them. Redirect the four known obsolete URLs retained in saved presets and
+  reuse existing local files.
+- Incorporate PR #189's conditional clone before Face Refiner overlap blending,
+  fixing inference-tensor writes on clips longer than one refinement window (#188).
+- Preserve saved Studio generations when optional Media Flow finishing fails,
+  retaining a visible warning in queue history, completion notices and output
+  processing metadata. Standalone processing jobs still report their own failures.
+  Gate Windows 11 DLSS Neural Rendering on a bounded cached native evaluation,
+  rather than installed files alone; refresh retries the probe while idle (#190).
+- Add Windows 11 DLSS internal edge padding for the output-size alignment
+  pattern reported in #190, padding frames and motion/depth guides together
+  and cropping back to the requested even-rounded dimensions. Check padded
+  native limits before worker startup and make the small availability probe
+  exercise an unaligned 1.5x request. Native RTX 5090 confirmation is pending;
+  the pinned binaries and separate Windows 10 backend are unchanged.
+- Tile WGPKernels row preparation within its native row limit and temporary
+  memory budget. Preserve valid manual INT8 backend choices when reapplying
+  Auto-tune and return the settings actually applied to the UI (#191).
+- Verify the existing Qwen 2.1 processor repair against all ten public replacement
+  assets, with fresh-install and cached-download regressions (#192).
+- Normalize unambiguous external-LLM music-arc JSON containers against Director's
+  fixed timeline, with bounded corrective retries. Keep exact group coverage,
+  unique indices and source-action assignments enforced (#193).
+- Keep the complete music-outline response format in the prompt when an LLM
+  endpoint cannot enforce structured output. Accept unambiguous row-local `beat`
+  and `prompt` aliases for `visual_beat`, while rejecting conflicting values,
+  incomplete rows and invalid timeline or source-action assignments.
+
+- Add experimental FastH3 V2 eight-step text-to-video with generated audio,
+  its trained VSA-H3 attention and fixed DMD sampling recipe. Keep it separate
+  from ordinary H3 accelerators, LoRAs and reference workflows.
+- Add experimental FastH3 OmniRef eight-step generation with ordered image,
+  video and audio references, native 32-head PDD sampling and trained VSA-H3
+  attention. Require at least one image or video reference and reject unsupported
+  continuation, Director and extra-LoRA routes instead of using an incompatible recipe.
+- Use official, pinned Omni Comfy BF16, INT8 ConvRot and FP8 exports. Reuse the
+  byte-identical earlier INT8 download. Offer the QAD-trained NVFP4 export as a
+  separate experimental model for supported Blackwell GPUs with a native kernel;
+  preserve fused quantized QKV and retained FP32 heads/AdaLN precision.
+- Repair Qwen Image 2.1 processor downloads after upstream asset moves, using
+  a verified replacement source and canonical filenames for generation and
+  prompt enhancement while reusing existing local processor files.
+- Reduce Qwen 2.1 final VAE decode memory by omitting unused temporal caches,
+  and address thin tile-boundary lines with full-sized edge tiles, at least
+  512px context in lower-memory modes, overlapping interiors and FP32 CPU blending
+  before one final pixel conversion. Denoising and final decode remain separate
+  memory stages; decoder checks do not establish that every full render fits 8GB.
+- Document source contracts, hardware requirements and validation limits. FastVideo's
+  public near-real-time OmniRef measurements used eight GB200 GPUs; Maestro does
+  not yet include its full FP4-attention/NVFP4-decoder acceleration stack.
+
+## [3.1.0] - 2026-10-19
+
+Public Main and Dev release. See the
+[v3.1.0 release notes](docs/RELEASE_NOTES_V3.1.0.md).
+
+- Restore H3 VAE x2 downloads from a verified replacement Hugging Face
+  revision after the old file URLs started returning 404. Keep the same
+  checkpoint size/SHA-256 checks and reuse existing downloads.
+- Align MOSS enhancement with the official caption/layout guidance: compile
+  top-left pixel drafts in code, preserve literal text/comments and artist tags,
+  and add character, multi-panel and collage layout controls.
+- Support mixed-precision H3 checkpoint exports with retained FP32 I/O and
+  compressed AdaLN weights, preserving their precision during loading. Missing
+  SafeTensors QKV metadata now requests an explicit layout choice. Keep optional
+  Turbo LoRA schedules separate from the base recipe and respect negated sampler advice.
+- Restore H3 References compatibility with explicitly declared legacy speaker labels
+  and repeated speakers within a clip, sharing ownership rules between generation
+  and prompt enhancement. Keep independent Subject/voice numbering and reject
+  ambiguous bindings; stop treating shot and production labels as character names.
+- Repair Viggle Animate and Face Refiner downloads after the upstream Hugging
+  Face repository removed older revisions. Reuse existing cached files.
+- Preserve H3's decoded 8-bit pixels in Face Refiner instead of applying its
+  legacy floating-point conversion twice, which washed out refined faces.
+- Enable compatible FLUX 3 Klein LoRAs for Distilled and Base, including
+  native/Diffusers naming conversion and per-step multiplier schedules; restore
+  the existing LoRAs & presets controls for these models.
+- Add the Flux 3 Klein Civitai browser filter for Distilled and Base tags and
+  route supported Civitai/Hugging Face LoRA imports to the shared `flux3_klein` folder.
+- Add the MOSS Image Civitai filter and native LoRA imports for Base and SFT,
+  with per-step multiplier schedules during generation.
+- Recognize Civitai's explicit Krea 2 Turbo label for checkpoint imports and
+  LoRAs, retaining checkpoint layout validation and the correct Turbo recipe.
+  Interpret supported NVFP4 packed tensor dimensions using verified scale
+  descriptors instead of rejecting them as a mismatched architecture.
+- Release Recast timeline tracking arrays before generation after their mask,
+  reference and shot files are saved. Record SCAIL-2 placement/workload settings
+  and actionable host-memory diagnostics without changing generation defaults.
+- Add MOSS Image 5B Base and SFT with public, pinned BF16/INT8 ConvRot
+  downloads, native text conditioning and Euler sampling. Image Generate gains a
+  MOSS layout editor with centered-pixel boxes, exact text fields and a dedicated
+  canvas-aware prompt-enhancement guide. SFT is enabled once in the image picker;
+  Base is available through Manage models. These models generate from text and
+  layouts; they do not accept reference images or masks.
+
 ## [3.0.0] - 2026-10-18
 
 Public Main and Dev release. Supersedes the unreleased

@@ -41,10 +41,26 @@ from services.text_integrity import repair_payload, repair_text
 # most once, making field-level repeat loops unrepresentable.
 _GENERIC_ARRAY_SCHEMA = {"type": "array", "items": {"type": "object"}, "minItems": 1}
 
+
+def _remote_json_schema_rejected(error: Exception) -> bool:
+    """Return whether a remote endpoint explicitly rejected JSON Schema."""
+
+    message = str(error).casefold()
+    format_markers = ("response_format", "json_schema", "json schema", "structured output")
+    rejection_markers = (
+        "unsupported", "not supported", "unknown", "unrecognized", "invalid",
+        "not accepted", "does not accept", "does not support", "rejected",
+    )
+    return (
+        any(marker in message for marker in format_markers)
+        and any(marker in message for marker in rejection_markers)
+    )
+
 # Checkpoints persist creative planning across restarts.  Increment this when
 # the meaning of stored planner rows changes so a repaired runtime never
 # replays structurally valid but semantically stale outlines.
 _PLANNING_CHECKPOINT_SCHEMA_VERSION = 2
+_MAX_DIRECTOR_TITLE_CARD_SUGGESTIONS = 12
 
 
 class BasePlanner(ABC):
@@ -67,6 +83,62 @@ class BasePlanner(ABC):
         self._planning_resume_checkpoint: dict[str, Any] = {}
         self._planning_checkpoint_kind = ""
         self._planning_checkpoint_fingerprint = ""
+        self._director_title_cards: list[dict[str, Any]] = []
+
+    def reset_plan_metadata(self) -> None:
+        """Clear detached project-level metadata before a new plan starts."""
+
+        self._director_title_cards = []
+
+    def get_plan_title_cards(self) -> list[dict[str, Any]]:
+        """Return a defensive copy of title-card suggestions found in LLM output."""
+
+        return copy.deepcopy(self._director_title_cards)
+
+    def _record_plan_title_cards(self, values: Any) -> None:
+        if isinstance(values, dict):
+            candidates = [values]
+        elif isinstance(values, list):
+            candidates = values
+        else:
+            print(
+                "[Planner] Ignoring malformed title-card suggestions; "
+                "expected an object or array."
+            )
+            return
+
+        def signature(item: dict[str, Any]) -> str:
+            # Deduplicate repeated batch suggestions by their authored copy
+            # and placement even if a later batch restates renderer defaults.
+            stable = {
+                "text": item.get("text"),
+                "subtitle": item.get("subtitle", ""),
+                "role": item.get("role", "intertitle"),
+                "after_clip": item.get("after_clip"),
+            }
+            return json.dumps(
+                stable, ensure_ascii=False, sort_keys=True, default=str
+            )
+
+        seen = {signature(item) for item in self._director_title_cards}
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                print(
+                    "[Planner] Ignoring malformed title-card suggestion; "
+                    "expected an object."
+                )
+                continue
+            candidate_signature = signature(candidate)
+            if candidate_signature in seen:
+                continue
+            if len(self._director_title_cards) >= _MAX_DIRECTOR_TITLE_CARD_SUGGESTIONS:
+                print(
+                    "[Planner] Ignoring excess title-card suggestions; "
+                    f"the per-plan limit is {_MAX_DIRECTOR_TITLE_CARD_SUGGESTIONS}."
+                )
+                break
+            self._director_title_cards.append(copy.deepcopy(candidate))
+            seen.add(candidate_signature)
 
     # ── Durable long-form planning helpers ──────────────────────────
 
@@ -553,6 +625,7 @@ class BasePlanner(ABC):
         frequency_penalty: float = 0.3,
         presence_penalty: float = 0.1,
         json_schema: Optional[dict] = None,
+        remote_json_schema: bool = False,
     ) -> list[dict]:
         """Call LLM and parse JSON array response with retry on failure.
 
@@ -636,21 +709,30 @@ class BasePlanner(ABC):
             # their unconstrained first attempt and rely on the retry net.
             if json_schema is not None:
                 kwargs["json_schema"] = json_schema
+                if remote_json_schema:
+                    kwargs["remote_json_schema"] = True
         try:
             response = gen_fn(**kwargs)
         except Exception as e:
-            if "json_schema" not in kwargs:
+            if "json_schema" not in kwargs or (
+                remote_json_schema and not _remote_json_schema_rejected(e)
+            ):
                 raise
             # Never let the grammar make planning WORSE than before it
             # existed — a rejecting server (old llama-server binary, odd
             # provider) drops the constraint and runs the call as-is.
             print(f"[Planner] Grammar-constrained call failed ({e}); retrying unconstrained")
             kwargs.pop("json_schema", None)
+            kwargs.pop("remote_json_schema", None)
             response = gen_fn(**kwargs)
 
         parsed = self._parse_json_response(response)
         if parsed is not None:
             return parsed
+
+        from services.enhancement_diagnostics import record_rejection
+        record_rejection(["The writer response could not be parsed as the requested JSON plan."],
+                         stage="Director JSON parsing")
 
         # Retry once with explicit JSON fix instruction + a hard JSON
         # grammar. The grammar (caller's schema, or the generic array-of-
@@ -659,12 +741,19 @@ class BasePlanner(ABC):
         # 12B looped 96K chars of pseudo-JSON straight through it).
         # Thinking goes OFF here (grammar requires it; see llm_service).
         print("[Planner] JSON parse failed, retrying with fix prompt + JSON grammar...")
+        object_root = bool(json_schema and json_schema.get("type") == "object")
+        root_instruction = (
+            "Please output ONLY a JSON object matching the requested fields. "
+            "Just the raw JSON object starting with { and ending with }.\n\n"
+            if object_root else
+            "Please output ONLY a JSON array of objects. "
+            "Just the raw JSON array starting with [ and ending with ].\n\n"
+        )
         fix_prompt = (
             "Your previous response was not valid JSON. "
-            "Please output ONLY a JSON array of objects. "
             "No markdown fences, no explanation, no thinking tags. "
-            "Just the raw JSON array starting with [ and ending with ].\n\n"
-            f"Original request:\n{user_prompt}"
+            + root_instruction
+            + f"Original request:\n{user_prompt}"
         )
         retry_kwargs = dict(
             prompt=fix_prompt,
@@ -678,13 +767,18 @@ class BasePlanner(ABC):
             enable_thinking=False,
             json_schema=json_schema or _GENERIC_ARRAY_SCHEMA,
         )
+        if remote_json_schema:
+            retry_kwargs["remote_json_schema"] = True
         try:
             response2 = gen_fn(**retry_kwargs)
         except Exception as e:
+            if remote_json_schema and not _remote_json_schema_rejected(e):
+                raise
             # Same degradation contract as attempt 1: fall back to the
             # historical unconstrained retry (thinking budget restored).
             print(f"[Planner] Grammar-constrained retry failed ({e}); retrying unconstrained")
             retry_kwargs.pop("json_schema", None)
+            retry_kwargs.pop("remote_json_schema", None)
             retry_kwargs.pop("enable_thinking", None)
             retry_kwargs["thinking_budget"] = 2048
             response2 = gen_fn(**retry_kwargs)
@@ -693,6 +787,8 @@ class BasePlanner(ABC):
             return parsed2
 
         print("[Planner] JSON parse failed on retry, returning empty list")
+        record_rejection(["The repaired response still could not be parsed as the requested JSON plan."],
+                         stage="Director JSON repair")
         return []
 
     def _parse_json_response(self, text: str) -> Optional[list[dict]]:
@@ -707,11 +803,35 @@ class BasePlanner(ABC):
 
         def normalized_items(value: Any) -> list[dict]:
             repaired = repair_payload(value)
+
+            def detach_row_title_cards(rows: Any) -> list[dict]:
+                if not isinstance(rows, list):
+                    rows = [rows]
+                detached = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        detached.append(row)
+                        continue
+                    row = dict(row)
+                    self._record_plan_title_cards(row.pop("title_cards", None))
+                    metadata = row.get("metadata")
+                    if isinstance(metadata, dict) and "title_cards" in metadata:
+                        metadata = dict(metadata)
+                        self._record_plan_title_cards(metadata.pop("title_cards"))
+                        if metadata:
+                            row["metadata"] = metadata
+                        else:
+                            row.pop("metadata", None)
+                    detached.append(row)
+                return detached
+
             if isinstance(repaired, list):
-                return repaired
-            if isinstance(repaired, dict) and "shots" in repaired:
-                shots = repaired["shots"]
-                return shots if isinstance(shots, list) else [shots]
+                return detach_row_title_cards(repaired)
+            if isinstance(repaired, dict):
+                self._record_plan_title_cards(repaired.get("title_cards"))
+                if "shots" in repaired:
+                    return detach_row_title_cards(repaired["shots"])
+                return detach_row_title_cards(repaired)
             return [repaired]
 
         # Strip thinking tags (Qwen <think>...</think> and Gemma <|channel>thought\n...<channel|>)

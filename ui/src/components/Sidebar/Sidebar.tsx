@@ -1,12 +1,12 @@
-import { Settings, X } from 'lucide-react'
-import { useEffect, useLayoutEffect, useMemo, useState, type CSSProperties } from 'react'
-import { useStore } from '../../stores/useStore'
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useState, type CSSProperties } from 'react'
+import { ALIGNED_REMAKE_SWAP_MODEL, remakeEditSubMode, useStore } from '../../stores/useStore'
 import { AvatarControls } from './AvatarControls'
 import { ViggleControls } from './ViggleControls'
 import { useIsMobileSidecar } from '../../lib/useIsMobile'
 import { GenerationModeSelector } from './GenerationModeSelector'
 import { InputsPanel } from './InputsPanel'
 import { OmniReferenceSection } from './OmniReferenceSection'
+import { SourceAudioTranscriptControls } from './SourceAudioTranscriptControls'
 import { PromptInput } from './PromptInput'
 import { ImageRefSection } from './ImageRefSection'
 import { AudioModeSection } from './AudioModeSection'
@@ -16,24 +16,41 @@ import { SfxControls } from './SfxControls'
 import { MixerControls } from './MixerControls'
 import { StudioFooter } from './StudioFooter'
 import { MultiClipEditor } from './MultiClipEditor'
-import { DirectorChat } from './DirectorChat'
 import { RestyleControls } from './RestyleControls'
 import { InpaintControls } from './InpaintControls'
 import { OutpaintControls } from './OutpaintControls'
 import { RetakeControls } from './RetakeControls'
 import { EditAnythingControls } from './EditAnythingControls'
 import { RecastControls } from './RecastControls'
+import { EditClipTaskSelector } from './EditClipTaskSelector'
+import { ViggleRemakeControls } from './ViggleRemakeControls'
 import { BlendControls } from './BlendControls'
 import { AnchorReturnBanner } from './AnchorReturnBanner'
 import { VoiceRefSection } from './VoiceRefSection'
 import { ToolsPanel } from './ToolsPanel'
 import { HardwareStatusBar } from './HardwareStatusBar'
 import { VideoWorkflowSelector } from './VideoWorkflowSelector'
+import { ComfyUIEngineControl } from './ComfyUIEngineControl'
 import { ImageWorkflowSelector } from './ImageWorkflowSelector'
 import { ImageWorkflowControls } from './ImageWorkflowControls'
 import { ControlVideoSection } from './ControlVideoSection'
-import { AppModeToggle, MaestroBrand } from '../AppModeNavigation'
+import { SidebarHeader } from './SidebarHeader'
 import { CharacterToolbarContext, PromptDock, SidebarLayoutContext } from './SidebarPanels'
+import { StartupStatus } from '../StartupStatus'
+
+const DirectorChat = lazy(() => import('./DirectorChat').then(module => ({default: module.DirectorChat})))
+const StudioTitlesPanel = lazy(() => import('../../editor/StudioTitlesPanel').then(module => ({
+  default: module.StudioTitlesPanel,
+})))
+
+function isKeyboardInput(element: Element | null): boolean {
+  if (element instanceof HTMLTextAreaElement) return !element.disabled && !element.readOnly
+  if (element instanceof HTMLInputElement) {
+    return !element.disabled && !element.readOnly
+      && ['text', 'search', 'email', 'number', 'password', 'tel', 'url'].includes(element.type)
+  }
+  return element instanceof HTMLElement && element.isContentEditable
+}
 
 function inputRevealBounds(input: HTMLElement) {
   if (input instanceof HTMLTextAreaElement) {
@@ -51,7 +68,7 @@ function inputRevealBounds(input: HTMLElement) {
   return input.getBoundingClientRect()
 }
 
-export function Sidebar() {
+export function Sidebar({ onOpenWorlds, embedded = false }: { onOpenWorlds?: () => void; embedded?: boolean } = {}) {
   const toggleSettings = useStore(s => s.toggleSettings)
   const generationMode = useStore(s => s.generationMode)
   const imageMode = useStore(s => s.params.image_mode)
@@ -63,6 +80,8 @@ export function Sidebar() {
   const selectedModel = useStore(s => s.models.find(model => model.model_type === s.params.model_type))
   const isMobile = useIsMobileSidecar()
   const [characterSlot, setCharacterSlot] = useState<HTMLDivElement | null>(null)
+  const [enhancementSlot, setEnhancementSlot] = useState<HTMLDivElement | null>(null)
+  const [titlesFooterHost, setTitlesFooterHost] = useState<HTMLDivElement | null>(null)
   const [sidebarElement, setSidebarElement] = useState<HTMLElement | null>(null)
   const [settingsElement, setSettingsElement] = useState<HTMLDivElement | null>(null)
   const layout = useMemo(() => ({ sidebar: sidebarElement, settings: settingsElement }), [sidebarElement, settingsElement])
@@ -72,25 +91,57 @@ export function Sidebar() {
     const viewport = window.visualViewport
     let fullHeight = viewport.height
     let width = window.innerWidth
+    let focusFrame = 0
     const resize = () => {
-      // iOS browsers can shrink innerHeight along with the visual viewport.
-      // Retain the unobscured height; reset it when the orientation changes.
-      fullHeight = width === window.innerWidth ? Math.max(fullHeight, viewport.height) : viewport.height
+      const input = document.activeElement
+      const insideKeyboardSurface = !!sidebarElement?.contains(input)
+        || !!input?.closest('[data-sidebar-overlay]')
+      const editing = sidebarOpen && insideKeyboardSurface && isKeyboardInput(input)
+      // Browser chrome and restored tabs can leave innerHeight much taller
+      // than the visible page without a keyboard. Measure the actual viewport
+      // while idle, retaining that baseline only during text entry. This also
+      // handles iOS shrinking innerHeight together with an actual keyboard.
+      const unzoomed = Math.abs(viewport.scale - 1) < 0.01
+      fullHeight = width !== window.innerWidth || !editing || !unzoomed
+        ? viewport.height : Math.max(fullHeight, viewport.height)
       width = window.innerWidth
-      const keyboardOpen = viewport.height < Math.max(fullHeight, window.innerHeight) - 100
+      const keyboardOpen = editing && unzoomed && viewport.height < fullHeight - 100
       setVisibleViewport(previous => (
         previous?.height === viewport.height && previous.top === viewport.offsetTop && previous.keyboardOpen === keyboardOpen
           ? previous : { height: viewport.height, top: viewport.offsetTop, keyboardOpen }
       ))
     }
+    const focusChanged = () => {
+      // Focusout precedes focusin when using the keyboard's Next button. Wait
+      // until the new target is focused before resetting the height baseline.
+      cancelAnimationFrame(focusFrame)
+      focusFrame = requestAnimationFrame(resize)
+    }
+    const restore = () => {
+      if (document.visibilityState !== 'visible') return
+      fullHeight = viewport.height
+      width = window.innerWidth
+      resize()
+    }
     resize()
     viewport.addEventListener('resize', resize)
     viewport.addEventListener('scroll', resize)
+    window.addEventListener('resize', resize)
+    window.addEventListener('pageshow', restore)
+    document.addEventListener('visibilitychange', restore)
+    document.addEventListener('focusin', focusChanged)
+    document.addEventListener('focusout', focusChanged)
     return () => {
+      cancelAnimationFrame(focusFrame)
       viewport.removeEventListener('resize', resize)
       viewport.removeEventListener('scroll', resize)
+      window.removeEventListener('resize', resize)
+      window.removeEventListener('pageshow', restore)
+      document.removeEventListener('visibilitychange', restore)
+      document.removeEventListener('focusin', focusChanged)
+      document.removeEventListener('focusout', focusChanged)
     }
-  }, [isMobile])
+  }, [isMobile, sidebarOpen, sidebarElement])
   useEffect(() => {
     if (!isMobile || !sidebarOpen) return
     // iOS can scroll the document to an old caret position while opening the
@@ -148,6 +199,7 @@ export function Sidebar() {
   const toolsTool = useStore(s => s.toolsTool)
   const toolsUpscaleMedia = useStore(s => s.toolsUpscaleMedia)
   const videoWorkflow = useStore(s => s.studioVideoWorkflow)
+  const isTitles = isVideo && videoWorkflow === 'titles'
   const imageWorkflow = useStore(s => s.studioImageWorkflow)
   const isUpscale = isTools && toolsTool === 'upscale'
   const isImageUpscale = isUpscale && toolsUpscaleMedia === 'image'
@@ -164,6 +216,8 @@ export function Sidebar() {
   const isOutpaint = isEdit && editSubMode === 'outpaint'
   const isEditAnything = isEdit && editSubMode === 'edit_anything'
   const isRecast = isEdit && editSubMode === 'recast'
+  const remakeMode = remakeEditSubMode(selectedModel?.model_type)
+  const isRemakeControls = isEdit && remakeMode !== null && remakeMode === editSubMode
   const isOmniReference = isVideo && Boolean(
     selectedModel?.omni_reference
     || selectedModel?.director?.video_strategy === 'omni_reference'
@@ -178,10 +232,12 @@ export function Sidebar() {
   const isBlend = isVideo && imageMode === 4
   const isDirector = sidebarMode === 'director'
   const isI2vOnly = modelOptions?.i2v_class && !modelOptions?.t2v_class
-  const hasPrompt = !isStandaloneTool && !isAnimate && !(isAudio && ['sfx', 'mixer', 'music'].includes(audioSubMode))
+  const hasPrompt = !isStandaloneTool && !isAnimate && !isTitles && !(isAudio && ['sfx', 'mixer', 'music'].includes(audioSubMode))
 
   // Video Transform controls backed by the legacy edit-mode engines.
-  const editControls = (
+  const editControls = isRemakeControls ? (
+    <ViggleRemakeControls key={selectedModel?.model_type} aligned={selectedModel?.model_type === ALIGNED_REMAKE_SWAP_MODEL} />
+  ) : (
     <>
       {isRetake && (
         <>
@@ -219,21 +275,30 @@ export function Sidebar() {
   const studioControls = (
     <SidebarLayoutContext.Provider value={layout}>
     <CharacterToolbarContext.Provider value={characterSlot}>
+      <>
       <div data-testid="studio-body-scroll" className="studio-scroll-body flex min-h-0 flex-1 flex-col">
       {/* Prompt Edit/Recast → Image Mode round-trip banner. Visible while
           a boundary anchor or Recast reference is being edited; null otherwise. */}
-      <AnchorReturnBanner />
+      {!isTitles && <AnchorReturnBanner />}
 
-      <div data-testid="studio-workflow-header" className="studio-workflow-header flex shrink-0 flex-col gap-2 px-3 pb-2 pt-3">
+      {!embedded && <div data-testid="studio-workflow-header" className="studio-workflow-header flex shrink-0 flex-col gap-2 px-3 pb-2 pt-3">
         <GenerationModeSelector />
 
         {/* Studio's user-facing hierarchy is media first, workflow second.
             The workflow selectors route into the legacy video/avatar/tools
             engines so saved jobs and API behavior remain compatible. */}
-        {isVideoWorkspace && <VideoWorkflowSelector />}
+        {isVideoWorkspace && <VideoWorkflowSelector onOpenWorlds={onOpenWorlds} />}
         {isImageWorkspace && <ImageWorkflowSelector />}
         {isAudioWorkspace && <AudioSubModeToggle />}
-      </div>
+        {(isVideoWorkspace || isImageWorkspace || isAudioWorkspace) && (
+          <ComfyUIEngineControl modelType={selectedModel?.model_type || ''} kind={isImageWorkspace ? 'image' : isAudioWorkspace ? 'audio' : 'video'} />
+        )}
+      </div>}
+      {isTitles ? (
+        <Suspense fallback={<p role="status" className="m-3 text-xs text-text-muted">Loading Titles…</p>}>
+          <StudioTitlesPanel footerHost={titlesFooterHost} />
+        </Suspense>
+      ) : (
       <div className="studio-composition mx-3 flex grow shrink-0 basis-auto flex-col rounded-2xl border border-border bg-bg-primary/30" data-has-prompt={hasPrompt}>
       <div data-testid="studio-controls-scroll" className={`${hasPrompt ? 'studio-inputs shrink-0' : 'grow shrink-0'} flex min-w-0 flex-col gap-3 p-2.5 [&>*]:shrink-0`}>
         {isUpscale ? (
@@ -248,6 +313,7 @@ export function Sidebar() {
           <ControlVideoSection galleryOnly />
         )}
         {/* Video Transform workflows use the established Edit engines. */}
+        {isEdit && ['retake', 'recast', 'edit_anything', 'restyle'].includes(editSubMode) && <EditClipTaskSelector />}
         {isEdit && editControls}
 
         {/* Blend mode manages its own duration (overlap_sec) and its own
@@ -269,6 +335,7 @@ export function Sidebar() {
           </div>
         )}
         {isReferencesWorkflow && <OmniReferenceSection />}
+        {(isFramesWorkflow || isReferencesWorkflow) && <SourceAudioTranscriptControls />}
         {isBlend && <BlendControls />}
 
         {/* Image workflows expose only the inputs their native pipeline uses. */}
@@ -299,13 +366,24 @@ export function Sidebar() {
       </div>
 
       {hasPrompt && (
-        <PromptDock>{isMultiClip ? <MultiClipEditor /> : <PromptInput />}</PromptDock>
+        <PromptDock toolbarHost={enhancementSlot}>{isMultiClip ? <MultiClipEditor /> : <PromptInput />}</PromptDock>
       )}
       </div>
+      )}
       </div>
-      {!isStandaloneTool && <StudioFooter onCharacterSlot={setCharacterSlot} onAnchor={setSettingsElement} />}
+      {/* Keep generation controls outside the scrolling prompt/input body. */}
+      {!isStandaloneTool && !isTitles && <StudioFooter onCharacterSlot={setCharacterSlot} onEnhancementSlot={hasPrompt && !isMultiClip ? setEnhancementSlot : undefined} onAnchor={setSettingsElement} />}
+      <div ref={setTitlesFooterHost} data-testid="titles-footer-host" className="studio-footer shrink-0" hidden={!isTitles} />
+      </>
     </CharacterToolbarContext.Provider>
     </SidebarLayoutContext.Provider>
+  )
+
+  if (embedded) return (
+    <div ref={setSidebarElement} className="maestro-sidebar flex h-full min-h-0 w-full min-w-0 flex-col bg-bg-secondary" data-testid="editor-ai-controls">
+      <StartupStatus />
+      {studioControls}
+    </div>
   )
 
   // Mobile: overlay drawer
@@ -322,20 +400,9 @@ export function Sidebar() {
           data-keyboard-open={visibleViewport?.keyboardOpen ?? false}
           className={`maestro-sidebar fixed top-0 h-dvh w-[380px] max-w-[94vw] bg-bg-secondary border-r border-border z-50 flex flex-col transition-[left] duration-300 ease-in-out ${sidebarOpen ? 'left-0' : '-left-full'}`}>
           {/* Header */}
-          <div className="shrink-0 px-4 py-3 border-b border-border flex items-center justify-between">
-            <MaestroBrand compact />
-            <div className="flex items-center gap-1.5">
-              <AppModeToggle size="sm" />
-              <button
-                onClick={() => setSidebarOpen(false)}
-                aria-label="Close sidecar"
-                className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-              >
-                <X size={16} />
-              </button>
-            </div>
-          </div>
-          {isDirector ? <DirectorChat /> : studioControls}
+          <SidebarHeader mobile onSettings={toggleSettings} onClose={() => setSidebarOpen(false)} />
+          <StartupStatus />
+          {isDirector ? <Suspense fallback={<p role="status" className="m-3 text-xs text-text-muted">Loading Director…</p>}><DirectorChat /></Suspense> : studioControls}
           <div className="studio-hardware shrink-0"><HardwareStatusBar /></div>
         </aside>
       </>
@@ -346,20 +413,9 @@ export function Sidebar() {
   return (
     <aside ref={setSidebarElement} className="maestro-sidebar w-[420px] h-full bg-bg-secondary border-r border-border flex flex-col shrink-0">
       {/* Header */}
-      <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
-        <MaestroBrand />
-        <div className="flex items-center gap-2">
-          <AppModeToggle />
-          <button
-            onClick={toggleSettings}
-            className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-            title="Settings"
-          >
-            <Settings size={16} />
-          </button>
-        </div>
-      </div>
-      {isDirector ? <DirectorChat /> : studioControls}
+      <SidebarHeader onSettings={toggleSettings} onClose={() => setSidebarOpen(false)} />
+      <StartupStatus />
+      {isDirector ? <Suspense fallback={<p role="status" className="m-3 text-xs text-text-muted">Loading Director…</p>}><DirectorChat /></Suspense> : studioControls}
       <div className="studio-hardware shrink-0"><HardwareStatusBar /></div>
     </aside>
   )

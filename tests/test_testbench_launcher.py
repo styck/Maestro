@@ -14,43 +14,192 @@ class TestBenchLauncherTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         return json.loads(result.stdout)
 
+    def test_missing_runtime_markers_never_auto_start_an_update(self):
+        for target, environment in (("sm_89", "app/env"), ("sm_120", "app/env-rtx50")):
+            with self.subTest(target=target):
+                menu = self.evaluate("""
+const launcher=require('./pinokio.js');
+const info={exists:name=>name===%s,running:()=>false,local:()=>null};
+launcher.menu({gpu:'nvidia',gpu_target:%s,gpu_driver:'610.88',platform:'win32'},info)
+  .then(v=>process.stdout.write(JSON.stringify(v)));
+""" % (json.dumps(environment), json.dumps(target)))
+                upgrade = next(item for item in menu if item.get("href") == "update.js")
+                self.assertFalse(upgrade.get("default", False))
+                self.assertFalse(any(item.get("default") for item in menu))
+                if target == "sm_89":
+                    self.assertTrue(any(item.get("href") == "start.js" for item in menu))
+
+    def test_running_compatibility_app_keeps_web_ui_with_missing_runtime_markers(self):
+        menu = self.evaluate("""
+const launcher=require('./pinokio.js');
+const info={exists:name=>name==='app/env',running:name=>name==='start.js',
+  local:()=>({url:'http://127.0.0.1:49999',port:'49999'})};
+launcher.menu({gpu:'nvidia',gpu_target:'sm_89',gpu_driver:'610.88',platform:'win32'},info)
+  .then(v=>process.stdout.write(JSON.stringify(v)));
+""")
+        self.assertEqual(menu[0]["href"], "http://127.0.0.1:49999/?maestro_ui_policy=lan-v2")
+        self.assertTrue(menu[0]["default"])
+        self.assertFalse(any(item.get("href") == "update.js" for item in menu))
+
+    def test_existing_update_still_shows_its_progress(self):
+        menu = self.evaluate("""
+const launcher=require('./pinokio.js');
+const info={exists:name=>name==='app/env',running:name=>name==='update.js',local:()=>null};
+launcher.menu({gpu:'nvidia',gpu_target:'sm_89',gpu_driver:'610.88',platform:'win32'},info)
+  .then(v=>process.stdout.write(JSON.stringify(v)));
+""")
+        self.assertEqual(menu[0]["href"], "update.js")
+        self.assertEqual(menu[0]["text"], "Updating")
+
     def test_menu_keeps_web_ui_default_and_passes_captured_backend(self):
         menu = self.evaluate("""
 const launcher=require('./pinokio.js');
 const info={exists:()=>true,running:n=>n==='start.js',local:()=>({url:'http://127.0.0.1:49999',port:'49999'})};
 launcher.menu({gpu:'nvidia',gpu_target:'sm_86',platform:'win32'},info).then(v=>process.stdout.write(JSON.stringify(v)));
 """)
-        self.assertEqual(menu[0]["href"], "http://127.0.0.1:49999")
+        self.assertEqual(menu[0]["href"], "http://127.0.0.1:49999/?maestro_ui_policy=lan-v2")
         self.assertTrue(menu[0]["default"])
         actions = next(item for item in menu if item["text"] == "Developer tests")["menu"][:5]
         self.assertEqual(len(actions), 5)
-        self.assertTrue(all(action["params"]["base_url"] == menu[0]["href"] for action in actions))
+        self.assertEqual(actions[0]["href"], "tests/pinokio/test_bench.js?mode=smoke")
+        self.assertTrue(all(action["params"]["base_url"] == "http://127.0.0.1:49999" for action in actions))
         self.assertFalse(any(action.get("default") for action in actions))
 
+    def test_menu_reports_the_nested_bench_uri_as_running(self):
+        menu = self.evaluate("""
+const launcher=require('./pinokio.js');
+const info={exists:()=>true,
+  running:n=>n==='start.js'||n==='tests/pinokio/test_bench.js',
+  local:()=>({url:'http://127.0.0.1:49999',port:'49999'})};
+launcher.menu({gpu:'nvidia',gpu_target:'sm_86',platform:'win32'},info).then(v=>process.stdout.write(JSON.stringify(v)));
+""")
+        bench = next(item for item in menu if item["text"] == "Developer tests (running)")
+        self.assertEqual(bench["menu"][0]["href"], "tests/pinokio/test_bench.js?mode=smoke")
+        self.assertEqual(bench["menu"][5]["href"], "tests/pinokio/test_bench_enable.js")
+
+    def test_menu_still_reports_a_pre_migration_bench_as_running(self):
+        menu = self.evaluate("""
+const launcher=require('./pinokio.js');
+const info={exists:()=>true,
+  running:n=>n==='start.js'||n==='test_bench.js',
+  local:()=>({url:'http://127.0.0.1:49999',port:'49999'})};
+launcher.menu({gpu:'nvidia',gpu_target:'sm_86',platform:'win32'},info).then(v=>process.stdout.write(JSON.stringify(v)));
+""")
+        self.assertTrue(any(item["text"] == "Developer tests (running)" for item in menu))
+
     def test_3080_uses_compatibility_environment_and_structured_argv(self):
-        launcher = self.evaluate("require('./test_bench.js')({gpu:'nvidia',gpu_target:'sm_86',platform:'win32'}).then(v=>process.stdout.write(JSON.stringify(v)))")
+        launcher = self.evaluate("require('./tests/pinokio/test_bench.js')({gpu:'nvidia',gpu_target:'sm_86',platform:'win32'}).then(v=>process.stdout.write(JSON.stringify(v)))")
         step = launcher["run"][0]
         self.assertEqual(step["method"], "shell.run")
         self.assertEqual(step["params"]["venv"], "env")
-        self.assertEqual(step["params"]["path"], "app")
+        self.assertEqual(step["params"]["path"], "../../app")
         self.assertEqual(step["params"]["message"]["_"][:3], ["python", "-m", "testbench"])
         self.assertFalse(launcher.get("daemon", False))
 
     def test_4090_uses_same_marker_fallback_as_normal_start(self):
-        launcher = self.evaluate("require('./test_bench.js')({gpu:'nvidia',gpu_target:'sm_89',gpu_driver:'610.88',platform:'win32'}).then(v=>process.stdout.write(JSON.stringify(v)))")
+        launcher = self.evaluate("require('./tests/pinokio/test_bench.js')({gpu:'nvidia',gpu_target:'sm_89',gpu_driver:'610.88',platform:'win32'}).then(v=>process.stdout.write(JSON.stringify(v)))")
         environment = launcher["run"][0]["params"]["venv"]
-        self.assertIn("app/env-sol/.maestro_sol_runtime_v1.installed", environment)
+        self.assertIn("../../app/env-sol/.maestro_sol_runtime_v1.installed", environment)
         self.assertIn("'env-sol' : 'env'", environment)
 
     def test_ssh_setup_checks_a_fresh_receipt_after_elevation(self):
-        launcher = self.evaluate("require('./test_ssh_setup.js')({which:()=>null}).then(v=>process.stdout.write(JSON.stringify(v)))")
+        launcher = self.evaluate("require('./tests/pinokio/test_ssh_setup.js')({which:()=>null}).then(v=>process.stdout.write(JSON.stringify(v)))")
         elevated, verification = launcher["run"]
         self.assertTrue(elevated["params"]["sudo"])
         self.assertFalse(verification["params"].get("sudo", False))
         command = elevated["params"]["message"]["_"]
-        self.assertIn("{{path.resolve(cwd, 'app', 'scripts', 'setup_test_ssh.ps1')}}", command)
+        self.assertEqual(elevated["params"]["path"], "../../app")
+        self.assertIn("{{path.resolve(cwd, '../../app', 'scripts', 'setup_test_ssh.ps1')}}", command)
         self.assertEqual(verification["params"]["message"]["_"], command + ["-VerifyOnly"])
         self.assertIn("-RunId", command)
+
+    def test_all_relocated_launcher_descriptors_resolve_the_profile_and_app_paths(self):
+        descriptors = self.evaluate("""
+const kernel = {gpu:'nvidia',gpu_target:'sm_89',gpu_driver:'610.88',platform:'win32',which:()=>null};
+Promise.all([
+  require('./tests/pinokio/test_bench_enable.js')(kernel),
+  require('./tests/pinokio/test_ssh_client.js')(kernel),
+  require('./tests/pinokio/test_ssh_setup.js')(kernel),
+]).then(value => process.stdout.write(JSON.stringify(value)));
+""")
+        enable, client, setup = descriptors
+        self.assertEqual(enable["run"][0]["params"]["path"], "../../app")
+        self.assertIn("../../app/env-sol/.maestro_sol_runtime_v1.installed", enable["run"][0]["params"]["venv"])
+        self.assertEqual(client["run"][0]["params"]["path"], "../../app")
+        self.assertEqual(client["run"][0]["params"]["message"]["_"][1], "scripts/test_ssh_client.py")
+        self.assertEqual(setup["run"][1]["params"]["path"], "../../app")
+        self.assertTrue((ROOT / "scripts" / "pinokio" / "launcher_profile.js").is_file())
+        self.assertFalse((ROOT / "launcher_profile.js").exists())
+        self.assertTrue((ROOT / "docs" / "images" / "maestro-icon.png").is_file())
+        self.assertFalse((ROOT / "maestro_simplified_icon_alpha.png").exists())
+
+    def test_core_launcher_modules_load_after_the_profile_move(self):
+        loaded = self.evaluate("""
+const launchers = [
+  'install.js', 'pinokio.js', 'start.js', 'start_classic.js',
+  'start_sol.js', 'sol_install.js', 'torch.js', 'update.js',
+];
+for (const launcher of launchers) require('./' + launcher);
+process.stdout.write(JSON.stringify(launchers));
+""")
+        self.assertEqual(len(loaded), 8)
+
+    def test_existing_update_descriptor_still_pulls_before_using_the_root_torch_launcher(self):
+        update = self.evaluate("""
+require('./update.js')({gpu:'nvidia',gpu_target:'sm_89',gpu_driver:'610.88',platform:'win32'})
+  .then(value => process.stdout.write(JSON.stringify(value)));
+""")
+        run = update["run"]
+        self.assertEqual(run[0]["method"], "shell.run")
+        self.assertEqual(run[0]["params"]["message"], "git pull")
+        self.assertEqual(run[1]["method"], "jump")
+        self.assertTrue(any(
+            step.get("method") == "script.start" and step.get("params", {}).get("uri") == "torch.js"
+            for step in run
+        ))
+        self.assertFalse(any(
+            step.get("method") == "script.start" and step.get("params", {}).get("uri") == "scripts/pinokio/launcher_profile.js"
+            for step in run
+        ))
+
+
+    def test_legacy_update_retries_after_the_fix_was_already_pulled(self):
+        result = self.evaluate("""
+const vm = require('node:vm');
+const {runtimeProfile} = require('./scripts/pinokio/launcher_profile');
+const kernel = {gpu:'nvidia', gpu_target:'sm_89', gpu_driver:'577.00', platform:'win32'};
+const runtime = runtimeProfile(kernel);
+Promise.all([require('./update.js')(kernel), require('./install.js')(kernel)]).then(([update, install]) => {
+  const marker = 'app/env/.maestro_legacy_requirements_v1.installed';
+  const files = new Set([runtime.marker, runtime.flashMarker, 'ui/dist/index.html', 'ui/dist/assets']);
+  const route = update.run.find(step => step.method === 'jump').params.id.slice(2, -2);
+  const select = stdout => vm.runInNewContext(route, {input: {stdout}, exists: file => files.has(file)});
+  const interrupted = select('Already up to date.');
+  files.add(marker);
+  const installerStep = install.run.find(step =>
+    step.params?.message?.[0]?.startsWith('uv pip install -r requirements.txt'));
+  const updateStep = update.run.find(step =>
+    typeof step.params?.message === 'string'
+    && step.params.message.startsWith('uv pip install -r requirements.txt'));
+  process.stdout.write(JSON.stringify({
+    interrupted, ready: select('Already up to date.'), newCommits: select('Updating abc1234..def5678'),
+    installerCommand: installerStep.params.message[0], updateStep: updateStep.params,
+    finishStep: update.run.at(-1), installerMarker: install.run.find(step => step.method === 'fs.write')
+  }));
+});
+""")
+        self.assertEqual(result["interrupted"], "build")
+        self.assertEqual(result["ready"], "uptodate")
+        self.assertEqual(result["newCommits"], "build")
+        update = result["updateStep"]
+        self.assertEqual((update["path"], update["venv"], update["venv_python"]),
+                         ("app", "env", "3.10"))
+        self.assertEqual(update["message"], result["installerCommand"])
+        self.assertIn("--index-strategy unsafe-best-match", update["message"])
+        for step in (result["finishStep"], result["installerMarker"]):
+            self.assertTrue(step["when"])
+            self.assertEqual(step["method"], "fs.write")
+            self.assertEqual(step["params"]["path"], "app/env/.maestro_legacy_requirements_v1.installed")
 
 
 if __name__ == "__main__":

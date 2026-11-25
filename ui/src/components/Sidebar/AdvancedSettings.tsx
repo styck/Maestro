@@ -6,6 +6,8 @@ import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
 import { Qwen21Controls } from './Qwen21Controls'
 import { KreaIdentityControls } from './KreaIdentityControls'
+import { FishSpeechSampling } from './FishSpeechSampling'
+import { SpeechWriterSettings } from './SpeechWriterSettings'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
 import { Yue2LoraSelector } from './Yue2LoraSelector'
 import { selectedMusicStyles } from '../../lib/musicStyles'
@@ -305,7 +307,8 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   if (String(modelOptions?.architecture || '').startsWith('minimax_h3')) {
     if (params.minimax_h3_turbo_mode && modelOptions?.minimax_h3_turbo) items.performance.push('H3 Turbo')
     if (params.override_attention === 'sol') items.performance.push('H3 Sol Engine')
-    if (params.override_attention === 'sla') items.performance.push('H3 SLA')
+    if (params.override_attention === 'sage2') items.performance.push('Sage2')
+    if (params.override_attention === 'sla') items.performance.push(modelOptions?.minimax_h3_pika_flex && modelOptions.sla_attention_status?.supported !== true ? 'H3 SLA (dense fallback)' : 'H3 SLA')
     if (params.override_attention === 'veda') items.performance.push('H3 Veda')
     if (params.skip_steps_cache_type === 'first_block') items.performance.push('First Block Cache')
     if (generationMode !== 'audio' && params.custom_settings?.audio_refinement === 'enabled') items.finishing.push('Audio refinement')
@@ -379,7 +382,10 @@ function useAdvancedActiveSections(): Record<AdvancedSectionKey, string[]> {
   ) items.generation.push('Negative prompt')
   if (params.model_type === 'yue2') items.loras.push(...(instrumental
     ? ['YuE2 instrumental LoRA'] : selectedMusicStyles(params.custom_settings).map(() => 'YuE2 music LoRA')))
-  if (params.model_type !== 'yue2' && !modelOptions?.loras_disabled && !(generationMode === 'avatar' && editSubMode === 'outpaint')) {
+  if (params.model_type !== 'yue2' && !modelOptions?.loras_disabled
+    && (!modelOptions?.experimental_loras_available || params.minimax_h3_experimental_loras === true)
+    && !(generationMode === 'avatar' && editSubMode === 'outpaint')) {
+    if (modelOptions?.experimental_loras_available) items.loras.push('Experimental LoRAs')
     for (const l of params.activated_loras) items.loras.push(`LoRA: ${l.replace(/\.(safetensors|sft)$/i, '')}`)
   }
   if (!isScailEdit && generationMode !== 'audio' && spatialUpsampling) items.finishing.push(`Upscaling (${spatialUpsampling})`)
@@ -489,6 +495,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
   const isSfx = isAudio && audioSubMode === 'sfx'
   const isAudioOnly = modelOptions?.audio_only || isSfx
   const isVideo = generationMode === 'video'
+  const isTitles = useStore(s => s.generationMode === 'video' && s.studioVideoWorkflow === 'titles')
   const isAvatar = generationMode === 'avatar'
   const isOutpaint = isAvatar && editSubMode === 'outpaint'
   const isRecast = isAvatar && editSubMode === 'recast'
@@ -522,7 +529,10 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
     model_type: params.model_type,
     architecture: modelOptions?.architecture,
   })
+  const experimentalLorasAvailable = modelOptions?.experimental_loras_available === true
+  const experimentalLorasEnabled = params.minimax_h3_experimental_loras === true
   const canUseLoras = !isYue2 && !isOutpaint && !modelOptions?.loras_disabled
+    && (!experimentalLorasAvailable || experimentalLorasEnabled)
   const showH3LongSequenceExperiments = (
     H3_LONG_SEQUENCE_TESTS_VISIBLE
     && isVideo
@@ -633,8 +643,25 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
 
               {/* Presets belong with the creative adapter controls so users can
                   save or restore a setup before adjusting its LoRAs. */}
-              <AdvancedSection section="loras" title={canUseLoras || isYue2 ? 'LoRAs & presets' : 'Presets'} activeItems={activeSections.loras} open={sections.loras} onToggle={expanded => toggleSection('loras', expanded)}>
+              <AdvancedSection section="loras" title={canUseLoras || isYue2 || experimentalLorasAvailable ? 'LoRAs & presets' : 'Presets'} activeItems={activeSections.loras} open={sections.loras} onToggle={expanded => toggleSection('loras', expanded)}>
               <PresetManager />
+
+              {experimentalLorasAvailable && <div className="mb-3 rounded-lg border border-border bg-bg-tertiary px-2.5 py-2">
+                <label className="flex items-center gap-2 text-xs text-text-secondary">
+                  <input type="checkbox" checked={experimentalLorasEnabled}
+                    onChange={event => setParam('minimax_h3_experimental_loras', event.target.checked)}
+                    className="accent-accent-blue" />
+                  Enable LoRAs (experimental)
+                </label>
+                <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+                  {modelOptions?.minimax_h3_pika_flex
+                    ? 'Try ordinary H3 style/character LoRAs alongside the required Pika adapter. Quality and individual adapter compatibility are unverified. Six steps is recommended; other step counts are experimental. Extra Turbo/PDD/VDN/PTD and DoRA adapters are unavailable.'
+                    : 'Try ordinary H3 style/character LoRAs with FastH3. Output quality is unverified. Additional Turbo/PDD adapters remain unavailable.'}
+                </p>
+                {!experimentalLorasEnabled && params.activated_loras.length > 0 && <p className="mt-1 text-[10px] text-text-muted">
+                  Saved LoRA selections are inactive while this is off.
+                </p>}
+              </div>}
 
               {/* Keep creative adapters near the top so users can choose them
                   before working through the lower-level tuning controls.
@@ -654,11 +681,15 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
               {showReferenceDetail && modelOptions && <label className="block space-y-1.5 text-xs text-text-secondary">
                 <span>Reference detail</span>
                 <select aria-label="Reference detail" value={params.minimax_h3_reference_detail ?? modelOptions.omni_reference_detail_default ?? 'match'}
-                  onChange={event => setParam('minimax_h3_reference_detail', event.target.value as 'match' | 'max')}
+                  onChange={event => setParam('minimax_h3_reference_detail', event.target.value as 'match' | 'max' | 'ptd768')}
                   className="w-full rounded-lg border border-border bg-bg-tertiary px-2 py-2 text-xs">
                   {(modelOptions.omni_reference_detail_choices ?? [['Match output (faster)', 'match'], ['High detail (official PDD recipe)', 'max']]).map(([label, value]) => <option key={value} value={value}>{label}</option>)}
                 </select>
-                <span className="block text-[10px] text-text-muted">Match output avoids reference upscaling. High detail uses the official 2048px short-edge preparation and can require more memory and time.</span>
+                <span className="block text-[10px] text-text-muted">
+                  {(params.minimax_h3_reference_detail ?? modelOptions.omni_reference_detail_default) === 'ptd768'
+                    ? 'PTD RefAsymOPD fixes reference preparation to a 768px short edge as part of its eight-hop recipe.'
+                    : 'Match output avoids reference upscaling. High detail uses the official 2048px short-edge preparation and can require more memory and time.'}
+                </span>
               </label>}
 
               {/* The Qwen conditioner is shared by every H3 transformer.
@@ -882,6 +913,9 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                     </div>
                   )}
 
+                  <FishSpeechSampling />
+                  <SpeechWriterSettings />
+
                   {/* Guidance Scale */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
@@ -899,28 +933,48 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
                   {/* Auto-Split */}
                   {modelOptions?.custom_settings_def?.filter(setting => (
                     !isKreaImageEdit || !KREA_IDENTITY_SETTING_KEYS.includes(setting.id as typeof KREA_IDENTITY_SETTING_KEYS[number])
-                  )).map(setting => (
-                    <div key={setting.id}>
-                      <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">{setting.name}</label>
-                      <input
-                        type="number"
-                        placeholder="Empty = disabled"
-                        value={String((params.custom_settings as Record<string, unknown> | undefined)?.[setting.id] ?? '')}
-                        onChange={e => {
-                          const val = e.target.value.trim()
-                          const cs = { ...(params.custom_settings || {}) } as Record<string, unknown>
-                          if (val === '') {
-                            delete cs[setting.id]
-                          } else {
-                            cs[setting.id] = parseFloat(val)
-                          }
-                          setParam('custom_settings', Object.keys(cs).length > 0 ? cs : undefined)
-                        }}
-                        className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
-                      />
-                      <p className="text-[10px] text-text-muted mt-1">{setting.label}</p>
-                    </div>
-                  ))}
+                  )).map(setting => {
+                    const customSettings = params.custom_settings as Record<string, unknown> | undefined
+                    const value = customSettings?.[setting.id] ?? setting.default ?? ''
+                    const update = (nextValue: string | number) => {
+                      const next = { ...(customSettings || {}) }
+                      if (nextValue === '') delete next[setting.id]
+                      else next[setting.id] = nextValue
+                      setParam('custom_settings', Object.keys(next).length > 0 ? next : undefined)
+                    }
+                    return (
+                      <div key={setting.id}>
+                        <label htmlFor={`custom-setting-${setting.id}`} className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">{setting.name}</label>
+                        {setting.type === 'dropdown' && setting.choices?.length ? (
+                          <select
+                            id={`custom-setting-${setting.id}`}
+                            aria-label={setting.name}
+                            value={String(value)}
+                            onChange={event => update(event.target.value)}
+                            className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
+                          >
+                            {setting.choices.map(([label, choice]) => (
+                              <option key={String(choice)} value={String(choice)}>{label}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            id={`custom-setting-${setting.id}`}
+                            type="number"
+                            placeholder="Empty = disabled"
+                            value={String(value)}
+                            onChange={event => {
+                              const raw = event.target.value.trim()
+                              if (raw === '') update('')
+                              else update(parseFloat(raw))
+                            }}
+                            className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
+                          />
+                        )}
+                        <p className="text-[10px] text-text-muted mt-1">{setting.label}</p>
+                      </div>
+                    )
+                  })}
 
                   {/* Compressor Settings — shown when Smooth Speaker Volumes is enabled */}
                   {params.tts_dynaudnorm && (
@@ -1414,7 +1468,7 @@ export function AdvancedSettings({ compact = false }: { compact?: boolean }) {
               {/* Dedicated SCAIL edit endpoints own their source video,
                   edited/reference frames, masks, and process selection. */}
               {(modelOptions?.guide_preprocessing || modelOptions?.guide_custom_choices) &&
-                !isScailEdit && params.model_type !== 'viggle_animate' && !modelOptions?.minimax_h3_media_sources && (
+                !isTitles && !isScailEdit && params.model_type !== 'viggle_animate' && !modelOptions?.minimax_h3_media_sources && (
                 <ControlVideoSection />
               )}
 

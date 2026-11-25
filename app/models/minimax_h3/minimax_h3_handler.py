@@ -48,6 +48,9 @@ _TEXT_ENCODER_BF16 = "Qwen3-VL-32B-Instruct-layer50_bf16.safetensors"
 _TEXT_ENCODER_INT8 = "Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors"
 _TEXT_ENCODER_GGUF_Q2 = "qwen3vl-32B-MiniMax-H3-Q2_K.gguf"
 _TEXT_ENCODER_GGUF_Q4 = "qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf"
+_DISTILLED_ENCODER_REVISION = "4e6c06ff7dd1c781b3265c16fcacc5f8efbf1e51"
+_DISTILLED_ENCODER_FOLDER = "P-H3-Image-Qwen3-VL-4B"
+_DISTILLED_ENCODER_FILE = "P-H3-Image-Qwen3-VL-4B_int8_convrot.safetensors"
 _AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 try:
     from .vae_upsampler import (
@@ -375,11 +378,62 @@ def normalize_h3_window_geometry(inputs: dict, model_def: dict) -> None:
     Rounding that total to 345 silently adds a fourth window.
     """
 
-    if any((model_def or {}).get(key) for key in (
+    model_def = model_def or {}
+    if model_def.get("minimax_h3_pika_flex"):
+        from .pika_flex import pika_flex_sequence_enabled
+
+        minimum = int(model_def.get("frames_minimum") or _H3_MIN_FRAMES)
+        maximum = int(model_def.get("frames_maximum") or _H3_MAX_FRAMES)
+        step = int(model_def.get("frames_steps") or _H3_FRAME_STEP)
+        reference = bool(model_def.get("omni_reference"))
+        sequence_enabled = pika_flex_sequence_enabled(
+            inputs,
+            reference=reference,
+        )
+        if sequence_enabled:
+            try:
+                total = max(minimum, int(inputs.get("video_length", minimum)))
+            except (TypeError, ValueError, OverflowError):
+                total = minimum
+            window = normalize_h3_clip_frame_count(
+                inputs.get("sliding_window_size", minimum),
+                minimum_frames=minimum,
+                maximum_frames=maximum,
+                frame_step=step,
+            )
+            overlap_value = inputs.get(
+                "sliding_window_overlap",
+                _H3_OVERLAP_DEFAULT,
+            )
+            inputs["sliding_window_overlap"] = normalize_h3_overlap_frames(
+                overlap_value,
+                window_frames=window,
+            )
+            inputs["sliding_window_size"] = window
+        else:
+            total = normalize_h3_clip_frame_count(
+                inputs.get("video_length", minimum),
+                minimum_frames=minimum,
+                maximum_frames=maximum,
+                frame_step=step,
+            )
+            # Single-pass requests ignore stale legacy window fields. They can
+            # still use the full 362-frame native endpoint.
+            inputs["sliding_window_size"] = total
+            inputs["sliding_window_overlap"] = 0
+
+        # The joined Flex timeline is exact; only individual native passes
+        # follow the 17*n+5 grid.
+        inputs["video_length"] = total
+        inputs["sliding_window_discard_last_frames"] = 0
+        inputs["minimax_h3_multi_window"] = sequence_enabled and not reference
+        inputs["minimax_h3_reference_sequence"] = sequence_enabled and reference
+        return
+    if any(model_def.get(key) for key in (
         "omni_reference", "audio_only", "minimax_h3_viggle",
     )):
         return  # These workflows own their separate timing rules.
-    maximum = int((model_def or {}).get("frames_maximum") or _H3_MAX_FRAMES)
+    maximum = int(model_def.get("frames_maximum") or _H3_MAX_FRAMES)
     window = normalize_h3_clip_frame_count(
         inputs.get("sliding_window_size", maximum), maximum_frames=maximum,
     )
@@ -407,6 +461,113 @@ def normalize_h3_window_geometry(inputs: dict, model_def: dict) -> None:
     inputs["sliding_window_discard_last_frames"] = resolve_h3_long_sequence_discard_frames(
         inputs.get("custom_settings"), enabled=multi_window and total > window,
     )
+
+
+def validate_pika_flex_single_pass_request(inputs: dict, model_def: dict) -> None:
+    """Validate single-pass or explicit rolling Pika Flex geometry."""
+
+    model_def = model_def or {}
+    if not model_def.get("minimax_h3_pika_flex"):
+        return
+
+    if inputs.get("minimax_h3_extended_duration") is True:
+        raise ValueError("Pika H3 Flex does not support extended duration.")
+
+    from .pika_flex import pika_flex_sequence_enabled, validate_pika_flex_request
+
+    reference = bool(model_def.get("omni_reference"))
+    sequence_enabled = pika_flex_sequence_enabled(
+        inputs,
+        reference=reference,
+    )
+
+    multi_prompts_type = inputs.get("multi_prompts_gen_type", 0)
+    try:
+        requests_multi_clip = int(multi_prompts_type or 0) == 3
+    except (TypeError, ValueError, OverflowError):
+        requests_multi_clip = False
+    if (
+        inputs.get("minimax_h3_multi_window") is True
+        or inputs.get("minimax_h3_reference_sequence") is True
+        or requests_multi_clip
+        or bool(inputs.get("per_clip_frames"))
+    ):
+        if requests_multi_clip or bool(inputs.get("per_clip_frames")):
+            raise ValueError(
+                "Pika H3 Flex does not support independent multi-clip generation."
+            )
+
+    if (
+        reference
+        and sequence_enabled
+        and inputs.get("minimax_h3_sequence_continuity") is False
+    ):
+        raise ValueError(
+            "Pika H3 Flex References requires native motion/audio continuation."
+        )
+
+    validate_pika_flex_request(
+        inputs,
+        allow_frames=not reference,
+        allow_references=reference,
+        allow_continuation=sequence_enabled,
+        allow_exact_drive_audio=reference,
+    )
+
+    try:
+        requested_frames = float(inputs.get("video_length", 124))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Pika H3 Flex video_length must be a whole frame count.") from error
+    if not requested_frames.is_integer():
+        raise ValueError("Pika H3 Flex video_length must be a whole frame count.")
+
+    minimum = int(model_def.get("frames_minimum") or _H3_MIN_FRAMES)
+    maximum = int(model_def.get("frames_maximum") or _H3_MAX_FRAMES)
+    step = int(model_def.get("frames_steps") or _H3_FRAME_STEP)
+    total_frames = int(requested_frames)
+    if total_frames < minimum:
+        raise ValueError(
+            f"Pika H3 Flex requires at least {minimum} frames per native pass."
+        )
+    if not sequence_enabled:
+        if total_frames > maximum:
+            raise ValueError(
+                f"Pika H3 Flex supports at most {maximum} frames per native pass."
+            )
+        if (total_frames - 5) % step:
+            raise ValueError(
+                "Pika H3 Flex requires native passes on the 17*n+5 frame grid."
+            )
+        return
+
+    try:
+        window_frames = int(
+            inputs.get("sliding_window_size", min(maximum, total_frames))
+        )
+        overlap_frames = int(
+            inputs.get("sliding_window_overlap", _H3_OVERLAP_DEFAULT)
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Pika H3 Flex sequence window geometry must use whole frames.") from error
+    if (
+        window_frames < minimum
+        or window_frames > maximum
+        or (window_frames - 5) % step
+    ):
+        raise ValueError(
+            f"Pika H3 Flex sequence windows must use {minimum}–{maximum} frames "
+            "on the 17*n+5 grid."
+        )
+    if (
+        overlap_frames < 1
+        or overlap_frames > window_frames - step
+        or (overlap_frames - 1) % step
+    ):
+        raise ValueError(
+            "Pika H3 Flex sequence overlap must use the 17*n+1 frame grid and "
+            "leave a legal native target."
+        )
+
 
 # First Block Cache is intentionally opt-in. It compares a compact signature
 # from block one and can reuse the remaining 49-block residual when adjacent
@@ -498,6 +659,21 @@ def _text_encoder_variants() -> dict[str, dict]:
                     _DEEPBEEP_REVISION,
                     deepbeep_folder,
                     _TEXT_ENCODER_BF16,
+                )
+            ],
+        },
+        "distilled_4b": {
+            "name": "Distilled Qwen3-VL 4B (Experimental)",
+            "size_hint": (
+                "~5.1 GB download · faster prompt encoding and lower memory use. "
+                "Trained for still images; check video prompt and reference fidelity."
+            ),
+            "URLs": [
+                _hf_url(
+                    _DEEPBEEP_REPO,
+                    _DISTILLED_ENCODER_REVISION,
+                    _DISTILLED_ENCODER_FOLDER,
+                    _DISTILLED_ENCODER_FILE,
                 )
             ],
         },
@@ -1059,6 +1235,46 @@ def _h3_resolution_pixels(value) -> int:
     return max(1, width * height)
 
 
+def _pika_flex_estimated_memory_policy(policy: dict | None) -> dict | None:
+    """Copy the compatible H3 profile with conservative Flex Auto limits."""
+
+    if not isinstance(policy, dict):
+        return None
+    from copy import deepcopy
+
+    result = deepcopy(policy)
+    checkpoint = str(result.get("checkpoint") or "pruned").strip().lower()
+    note = (
+        "Conservative 124-frame Auto window estimated from the compatible H3 "
+        "memory profile; Pika Flex adapter runs have not been measured."
+    )
+    for band in result.get("resolution_bands", []):
+        if not isinstance(band, dict):
+            continue
+        for tier in band.get("vram_tiers", []):
+            if isinstance(tier, dict) and tier.get("frames") is not None:
+                tier["frames"] = 124
+    recommendations = result.get("resource_recommendations")
+    if isinstance(recommendations, dict):
+        recommendations["version"] = (
+            f"{recommendations.get('version', 'h3')}-pika-flex-estimated"
+        )
+        for tier in recommendations.get("tiers", []):
+            if not isinstance(tier, dict):
+                continue
+            if str(tier.get("checkpoint") or "").strip().lower() != checkpoint:
+                continue
+            if tier.get("frames") is not None:
+                tier["frames"] = 124
+            tier["basis"] = "estimated"
+            tier["note"] = note
+            tier["reference_margin_steps"] = 0
+    result["reference_margin_steps"] = 0
+    result["recommendation_basis"] = "estimated"
+    result["recommendation_note"] = note
+    return result
+
+
 def recommended_h3_window_profile(
     total_vram_gb,
     resolution,
@@ -1073,6 +1289,35 @@ def recommended_h3_window_profile(
     should recommend the supplied lower resolution instead of presenting the
     model's minimum legal window as though it were memory-safe.
     """
+
+    model_def = model_def or {}
+    if model_def.get("minimax_h3_pika_flex"):
+        # Use H3's existing memory shape only as a starting point, then keep
+        # Auto at Flex's legal minimum until a Pika adapter profile is measured.
+        # The returned checkpoint name and provenance prevent H3 evidence from
+        # being presented as measured Pika performance.
+        base_model_def = dict(model_def)
+        base_model_def.pop("minimax_h3_pika_flex", None)
+        profile = recommended_h3_window_profile(
+            total_vram_gb,
+            resolution,
+            base_model_def,
+            total_ram_gb,
+        )
+        base_checkpoint = profile.get("checkpoint")
+        if profile.get("supported") and profile.get("frames"):
+            profile["frames"] = max(
+                1,
+                int(model_def.get("frames_minimum") or _H3_MIN_FRAMES),
+            )
+        profile["base_profile_checkpoint"] = base_checkpoint
+        profile["checkpoint"] = "pika_flex_estimated"
+        profile["recommendation_basis"] = "estimated"
+        profile["recommendation_note"] = (
+            "Conservative 124-frame Auto window estimated from the compatible "
+            "H3 profile; Pika Flex adapter runs have not been measured."
+        )
+        return profile
 
     model_def = model_def or {}
     full_checkpoint = bool(model_def.get("minimax_h3_full_checkpoint", False))
@@ -1103,7 +1348,6 @@ def recommended_h3_window_profile(
         if fused_turbo
         else ("full" if full_checkpoint else "pruned")
     )
-
     try:
         total_vram_gb = float(total_vram_gb)
     except (TypeError, ValueError):
@@ -1322,6 +1566,9 @@ def apply_h3_omni_sequence_memory_policy(
         "omni_reference"
     ):
         return None
+    pika_flex = bool((model_def or {}).get("minimax_h3_pika_flex"))
+    if pika_flex and inputs.get("minimax_h3_reference_sequence") is not True:
+        return None
     hardware = hardware or {}
     minimum = max(1, int(model_def.get("frames_minimum") or _H3_MIN_FRAMES))
     maximum = max(minimum, int(model_def.get("frames_maximum") or _H3_MAX_FRAMES))
@@ -1330,7 +1577,9 @@ def apply_h3_omni_sequence_memory_policy(
         total_vram_gb = float(hardware.get("gpu_vram_gb") or 0)
         total_frames = int(inputs.get("video_length") or minimum)
         requested_clip = int(
-            inputs.get("minimax_h3_sequence_clip_frames") or maximum
+            (inputs.get("sliding_window_size") if pika_flex else None)
+            or inputs.get("minimax_h3_sequence_clip_frames")
+            or maximum
         )
     except (TypeError, ValueError):
         return None
@@ -1343,6 +1592,24 @@ def apply_h3_omni_sequence_memory_policy(
     resolution = _normalize_h3_resolution(
         inputs.get("resolution", "864x480")
     )
+    if total_vram_gb <= 0 and pika_flex:
+        effective_clip = requested_clip if manual_override else minimum
+        inputs["minimax_h3_sequence_clip_frames"] = effective_clip
+        return {
+            "gpu_vram_gb": 0.0,
+            "resolution": resolution,
+            "requested_clip_frames": requested_clip,
+            "effective_clip_frames": effective_clip,
+            "recommended_clip_frames": minimum,
+            "output_frames": total_frames,
+            "checkpoint": "pika_flex_estimated",
+            "recommendation_basis": "estimated",
+            "recommendation_note": (
+                "Conservative 124-frame Auto window; Pika Flex adapter runs "
+                "have not been measured."
+            ),
+            "manual_override": manual_override,
+        }
     profile = recommended_h3_omni_sequence_profile(
         total_vram_gb,
         resolution,
@@ -1368,6 +1635,8 @@ def apply_h3_omni_sequence_memory_policy(
             "output_frames": total_frames,
             "fallback_resolution": fallback,
             "checkpoint": profile["checkpoint"],
+            "recommendation_basis": profile.get("recommendation_basis"),
+            "recommendation_note": profile.get("recommendation_note", ""),
             "manual_override": False,
         }
 
@@ -1382,6 +1651,8 @@ def apply_h3_omni_sequence_memory_policy(
         "recommended_clip_frames": safe_clip,
         "output_frames": total_frames,
         "checkpoint": profile["checkpoint"],
+        "recommendation_basis": profile.get("recommendation_basis"),
+        "recommendation_note": profile.get("recommendation_note", ""),
         "manual_override": manual_override,
         "reference_margin_frames": int(
             profile.get("reference_margin_frames") or 0
@@ -1408,6 +1679,10 @@ def apply_h3_native_omni_memory_policy(
     if (
         not isinstance(inputs, dict)
         or not (model_def or {}).get("omni_reference")
+        or (
+            (model_def or {}).get("minimax_h3_pika_flex")
+            and inputs.get("minimax_h3_reference_sequence") is not True
+        )
         or inputs.get("minimax_h3_reference_sequence") is True
     ):
         return None
@@ -1593,9 +1868,17 @@ def apply_h3_window_memory_policy(
     memory lever WanGP documents for long H3 generations.
     """
 
-    if not isinstance(inputs, dict) or (model_def or {}).get("omni_reference"):
+    pika_flex = bool((model_def or {}).get("minimax_h3_pika_flex"))
+    if (
+        not isinstance(inputs, dict)
+        or ((model_def or {}).get("omni_reference") and not pika_flex)
+        or (pika_flex and inputs.get("minimax_h3_multi_window") is not True)
+    ):
         return None
-    if inputs.get("sliding_window_memory_override", False) is True:
+    if inputs.get("sliding_window_memory_override", False) is True or (
+        (model_def or {}).get("minimax_h3_pika_flex")
+        and inputs.get("minimax_h3_sequence_memory_override") is True
+    ):
         return None
     hardware = hardware or {}
     try:
@@ -1607,7 +1890,30 @@ def apply_h3_window_memory_policy(
     except (TypeError, ValueError):
         return None
     if total_vram_gb <= 0:
-        return None
+        if not pika_flex:
+            return None
+        minimum_window = max(
+            1,
+            int((model_def or {}).get("frames_minimum") or _H3_MIN_FRAMES),
+        )
+        if requested_window <= minimum_window:
+            return None
+        inputs["sliding_window_size"] = minimum_window
+        return {
+            "gpu_vram_gb": 0.0,
+            "resolution": _normalize_h3_resolution(
+                inputs.get("resolution", "864x480")
+            ),
+            "requested_window_frames": requested_window,
+            "effective_window_frames": minimum_window,
+            "output_frames": total_frames,
+            "checkpoint": "pika_flex_estimated",
+            "recommendation_basis": "estimated",
+            "recommendation_note": (
+                "Conservative 124-frame Auto window; Pika Flex adapter runs "
+                "have not been measured."
+            ),
+        }
 
     resolution = _normalize_h3_resolution(
         inputs.get("resolution", "864x480")
@@ -1638,6 +1944,8 @@ def apply_h3_window_memory_policy(
             "output_frames": total_frames,
             "fallback_resolution": fallback,
             "checkpoint": profile["checkpoint"],
+            "recommendation_basis": profile.get("recommendation_basis"),
+            "recommendation_note": profile.get("recommendation_note", ""),
         }
 
     safe_window = int(profile["frames"])
@@ -1652,6 +1960,8 @@ def apply_h3_window_memory_policy(
         "effective_window_frames": safe_window,
         "output_frames": total_frames,
         "checkpoint": profile["checkpoint"],
+        "recommendation_basis": profile.get("recommendation_basis"),
+        "recommendation_note": profile.get("recommendation_note", ""),
     }
 
 
@@ -1824,6 +2134,38 @@ def enforce_h3_source_continuation_prompt(prompt):
     )
 
 
+def _apply_dwd_recipe_settings(ui_defaults, model_def):
+    """Repair saved controls to the dedicated DWD model's trained recipe."""
+    try:
+        steps = int((model_def or {}).get("dwd", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if steps not in (2, 4):
+        return
+    ui_defaults.update(
+        {
+            "num_inference_steps": steps,
+            "guidance_phases": 1,
+            "guidance_scale": 1.0,
+            "flow_shift": 12.0,
+            "audio_flow_shift": 3.0,
+            "sample_solver": "euler",
+            "denoising_strength": 1.0,
+            "minimax_h3_turbo_mode": False,
+            "minimax_h3_turbo_preset": "",
+            "skip_steps_cache_type": "",
+            "custom_sigmas": "",
+        }
+    )
+    custom = ui_defaults.get("custom_settings")
+    custom = dict(custom) if isinstance(custom, dict) else {}
+    custom["audio_refinement"] = "none"
+    from .two_pass import H3_TWO_PASS_ENABLED
+
+    custom[H3_TWO_PASS_ENABLED] = "off"
+    ui_defaults["custom_settings"] = custom
+
+
 class family_handler:
     @staticmethod
     def query_supported_types():
@@ -1834,6 +2176,10 @@ class family_handler:
             _REF2VA_FULL_MODEL_TYPE,
             _TTS_MODEL_TYPE,
             "viggle_animate",
+            "viggle_remake_swap",
+            "viggle_remake_swap_aligned",
+            "viggle_remake_edit",
+            "minimax_h3_regenerate_ic",
         ]
 
     @staticmethod
@@ -1874,6 +2220,25 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
+        if base_model_type == "minimax_h3_regenerate_ic":
+            from models.minimax_h3.regenerate_ic import model_definition
+
+            return model_definition(family_handler.query_model_def(_REF2VA_MODEL_TYPE, model_def))
+        if base_model_type in {
+            "viggle_remake_swap",
+            "viggle_remake_swap_aligned",
+            "viggle_remake_edit",
+        }:
+            from models.minimax_h3.viggle_remake import model_definition
+
+            aligned_guide = base_model_type == "viggle_remake_swap_aligned"
+            return model_definition(
+                family_handler.query_model_def(
+                    _REF2VA_MODEL_TYPE if aligned_guide else _MODEL_TYPE,
+                    model_def,
+                ),
+                "swap_aligned" if aligned_guide else base_model_type.removeprefix("viggle_remake_"),
+            )
         if base_model_type == "viggle_animate":
             from models.minimax_h3.viggle import model_definition
             viggle_model_def = dict(model_def or {})
@@ -1898,7 +2263,26 @@ class family_handler:
         fused_turbo = bool(
             (model_def or {}).get("minimax_h3_fused_turbo", False)
         )
+        raw_dwd_steps = (model_def or {}).get("dwd", 0)
+        try:
+            dwd_steps = int(raw_dwd_steps or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "MiniMax H3 DWD must declare its trained 2-step or 4-step schedule."
+            ) from error
+        if dwd_steps not in (0, 2, 4):
+            raise ValueError(
+                "MiniMax H3 DWD is available only in its trained 2-step or 4-step variants."
+            )
         vdn = bool((model_def or {}).get("vdn", False))
+        ptd_refasymopd = bool(
+            (model_def or {}).get(
+                "minimax_h3_ptd_refasymopd",
+                (model_def or {}).get("ptd", False),
+            )
+        )
+        fasth3 = bool((model_def or {}).get("minimax_h3_fasth3", False))
+        hyperflow_flash = bool((model_def or {}).get("minimax_h3_hyperflow_flash", False))
         explicit_video_vae = (
             "minimax_h3_video_vae_filename" in (model_def or {})
         )
@@ -1911,10 +2295,30 @@ class family_handler:
         )
         dasiwa = bool((model_def or {}).get("minimax_h3_dasiwa", False))
         baked_turbo = bool((model_def or {}).get("minimax_h3_baked_turbo", False))
+        if hyperflow_flash and (full_checkpoint or fused_turbo or singularity or dasiwa or baked_turbo or ptd_refasymopd or vdn or fasth3):
+            raise ValueError("HyperFlow Flash requires its separate pruned H3 checkpoint and cannot combine with another fixed-schedule family.")
         import_profile = (model_def or {}).get("minimax_h3_import_profile")
         locked_inference_steps = bool(
-            (model_def or {}).get("lock_inference_steps", False)
+            (model_def or {}).get("lock_inference_steps", False) or dwd_steps
         )
+        if dwd_steps and (
+            base_model_type not in {_MODEL_TYPE, _FULL_MODEL_TYPE}
+            or audio_only
+            or vdn
+            or ptd_refasymopd
+            or fused_turbo
+            or fasth3
+            or hyperflow_flash
+            or singularity
+            or dasiwa
+            or baked_turbo
+            or bool(import_profile)
+            or bool((model_def or {}).get("minimax_h3_pika_flex"))
+            or bool((model_def or {}).get("minimax_h3_viggle"))
+        ):
+            raise ValueError(
+                "pi-H3 DWD requires a dedicated Pruned or Full FL2VA Frames model without another H3 variant."
+            )
         sla_attention = fused_turbo or (
             base_model_type
             in {
@@ -1975,6 +2379,42 @@ class family_handler:
             raise ValueError(
                 "MiniMax H3 Singularity v1.3 requires a Pruned Frames or References workflow."
             )
+        if ptd_refasymopd and not omni_reference:
+            raise ValueError(
+                "PTD RefAsymOPD requires a MiniMax H3 Ref2VA architecture."
+            )
+        if ptd_refasymopd and any(
+            (
+                fused_turbo,
+                fasth3,
+                vdn,
+                singularity,
+                dasiwa,
+                baked_turbo,
+                audio_only,
+            )
+        ):
+            raise ValueError(
+                "PTD RefAsymOPD is a separate Ref2VA recipe and cannot be combined "
+                "with another fixed-step, fused, audio-only, or attention variant."
+            )
+        if ptd_refasymopd and not bool((model_def or {}).get("pdd", True)):
+            raise ValueError("PTD RefAsymOPD requires its PDD output heads.")
+        two_pass_compatible = not any(
+            (
+                ptd_refasymopd,
+                fused_turbo,
+                fasth3,
+                vdn,
+                singularity,
+                dasiwa,
+                baked_turbo,
+                audio_only,
+                bool(import_profile),
+                bool((model_def or {}).get("minimax_h3_pika_flex")),
+                locked_inference_steps,
+            )
+        )
         window_memory_policy = (
             (
                 _H3_FUSED_REFERENCE_WINDOW_MEMORY_POLICY
@@ -2063,6 +2503,18 @@ class family_handler:
             "disk, RAM, and loading cost. H3 LoRAs, including Turbo, are "
             "converted automatically when their AdaLN layout differs."
         )
+        if hyperflow_flash:
+            workflow_help = (
+                "HYPERFLOW FLASH 14B\n"
+                "Use the checkpoint's endpoint-conditioned few-step schedule for synchronized H3 video and audio. "
+                "The References entry accepts ordered image, video, and audio guidance; the Frames entry accepts first/last/timed frames and supported source conditioning."
+            )
+            checkpoint_help = (
+                "EXPERIMENTAL DISTILLED CHECKPOINT\n"
+                "This is a separate 14B HyperFlow Flash checkpoint family, around 15 GB, with 4, 6 (default), or 8 Euler evaluations and fixed video/audio shifts 12/3. "
+                "A second latent-upscaled H3 pass can use 1–8 evaluations from the tail of its eight-step grid. HyperFlow Flash uses no guidance or step caching. "
+                "The existing eight-step HyperFlow Ref2VA LoRA remains a separate adapter for ordinary H3 Ref2VA."
+            )
         result = {
             "dtype": "bf16",
             "fps": 24,
@@ -2133,7 +2585,9 @@ class family_handler:
             # explicit so the UI still distinguishes Audio In from Audio Out.
             "supports_reference_audio": omni_reference,
             "no_negative_prompt": True,
-            "guidance_max_phases": 0,
+            "guidance_max_phases": 1 if ptd_refasymopd or hyperflow_flash or dwd_steps else 0,
+            "lock_guidance_phases": ptd_refasymopd or hyperflow_flash or bool(dwd_steps),
+            "lock_guidance_scale": ptd_refasymopd or hyperflow_flash or bool(dwd_steps),
             "visible_phases": 0,
             "compile": False,
             # H3's packed BF16 head-dimension-128 attention can use the
@@ -2151,7 +2605,8 @@ class family_handler:
                 "dense_last_steps": 0,
                 "protect_audio": True,
             },
-            "first_block_cache": not fused_turbo,
+            "first_block_cache": not fused_turbo and not ptd_refasymopd and not hyperflow_flash and not dwd_steps,
+            "spectrum_cache": not hyperflow_flash and not dwd_steps,
             "first_block_cache_thresholds": _FIRST_BLOCK_CACHE_THRESHOLDS,
             "skip_steps_multiplier_choices": _FIRST_BLOCK_CACHE_STRENGTHS,
             "skip_steps_multiplier_label": "First Block Cache Threshold",
@@ -2165,7 +2620,11 @@ class family_handler:
             "auto_resolution_budgets": _H3_AUTO_RESOLUTION_BUDGETS,
             "auto_resolution_fallbacks": _H3_AUTO_RESOLUTION_FALLBACKS,
             "profiles_dir": (
-                ["minimax_h3", "minimax_h3_fl2va"]
+                (["minimax_h3_hyperflow_ref2va"] if omni_reference else [])
+                if hyperflow_flash
+                else []
+                if dwd_steps
+                else (["minimax_h3", "minimax_h3_fl2va"]
                 if not (
                     audio_only
                     or omni_reference
@@ -2176,7 +2635,7 @@ class family_handler:
                     or baked_turbo
                     or import_profile
                 )
-                else ["minimax_h3"]
+                else ["minimax_h3"])
             ),
             "minimax_h3_assets_root": _ASSETS_ROOT,
             "text_encoder_folder": _ASSETS_ROOT,
@@ -2192,7 +2651,7 @@ class family_handler:
             # to INT8 does not download a second ~20B transformer.
             "compatible_model_paths": (
                 {}
-                if full_checkpoint or fused_turbo or singularity
+                if full_checkpoint or fused_turbo or singularity or hyperflow_flash
                 else {
                     (
                         _REF2VA_TRANSFORMER
@@ -2220,7 +2679,7 @@ class family_handler:
             ),
             "compatible_model_qkv_layouts": (
                 {}
-                if full_checkpoint or fused_turbo or singularity
+                if full_checkpoint or fused_turbo or singularity or hyperflow_flash
                 else {
                     (
                         _WANGP_REF2VA_PRUNED_TRANSFORMER
@@ -2249,7 +2708,11 @@ class family_handler:
                 )
             },
             "minimax_h3_full_checkpoint": full_checkpoint,
+            "dwd": dwd_steps,
             "minimax_h3_fused_turbo": fused_turbo,
+            "minimax_h3_hyperflow_flash": hyperflow_flash,
+            "minimax_h3_ptd_refasymopd": ptd_refasymopd,
+            "minimax_h3_two_pass_compatible": two_pass_compatible,
             "minimax_h3_singularity": singularity,
             "minimax_h3_model_id": (
                 (_SINGULARITY_MODEL_ID if omni_reference else _SINGULARITY_FRAMES_MODEL_ID)
@@ -2293,12 +2756,16 @@ class family_handler:
             "source_sha256": str((model_def or {}).get("source_sha256") or ""),
             "source_size_bytes": (model_def or {}).get("source_size_bytes"),
             "model_size_gb": (model_def or {}).get("model_size_gb"),
-            "lock_inference_steps": False if fused_turbo else locked_inference_steps,
+            "lock_inference_steps": (
+                True
+                if ptd_refasymopd or dwd_steps
+                else (False if fused_turbo else locked_inference_steps)
+            ),
             "inference_steps_min": (
-                _H3_FUSED_MIN_EVALUATIONS if fused_turbo else 1
+                8 if ptd_refasymopd else (dwd_steps if dwd_steps else (_H3_FUSED_MIN_EVALUATIONS if fused_turbo else 1))
             ),
             "inference_steps_max": (
-                _H3_FUSED_MAX_EVALUATIONS if fused_turbo else 50
+                8 if ptd_refasymopd else (dwd_steps if dwd_steps else (_H3_FUSED_MAX_EVALUATIONS if fused_turbo else 50))
             ),
             "inference_steps_label": (
                 "Total Steps" if fused_turbo else "Inference Steps"
@@ -2310,12 +2777,14 @@ class family_handler:
             ),
             "minimax_h3_qkv_layout": (
                 "grouped"
-                if fused_turbo or singularity
+                if fused_turbo or singularity or hyperflow_flash
                 else ("interleaved" if full_checkpoint else "contiguous")
             ),
             "minimax_h3_sampler": (
                 "res_multistep" if fused_turbo else "euler"
             ),
+            "minimax_h3_video_shift": 12.0,
+            "minimax_h3_audio_shift": 3.0,
             "minimax_h3_video_vae_filename": (
                 video_vae_filename
             ),
@@ -2347,6 +2816,9 @@ class family_handler:
             ),
             "selector_help": f"{workflow_help}\n\n{checkpoint_help}",
             "lora_compatibility_note": (
+                "PTD RefAsymOPD uses eight independent hop adapters and its pinned PDD output heads. Do not add another Turbo/PDD accelerator."
+                if ptd_refasymopd
+                else
                 "The LightX2V Ref2VA Turbo4 adapter is the default "
                 "four-step accelerator at strength 1. Select only one H3 Turbo "
                 "or PDD adapter; other H3 LoRAs remain experimental."
@@ -2400,6 +2872,13 @@ class family_handler:
                     "sliding_window_defaults": sliding_window_defaults,
                 }
             )
+            if ptd_refasymopd:
+                from models.minimax_h3.ptd import PTD_REFERENCE_DETAIL
+
+                result["omni_reference_detail_choices"] = [
+                    ("PTD Recipe (768px short edge)", PTD_REFERENCE_DETAIL)
+                ]
+                result["omni_reference_detail_default"] = PTD_REFERENCE_DETAIL
         else:
             result["sliding_window_defaults"] = sliding_window_defaults
             result["sliding_window_memory_policy"] = window_memory_policy
@@ -2452,7 +2931,7 @@ class family_handler:
                     "minimax_h3_media_sources": True,
                 }
             )
-        result["custom_settings"] = [
+        result["custom_settings"] = ([] if hyperflow_flash else [
             {"id": "h3_mask_mode", "name": "Mask Denoising Mode", "label": "Mask Denoising Mode",
              "type": "dropdown", "default": "grouped_rows",
              "choices": [("Grouped Rows (clean fixed region)", "grouped_rows"),
@@ -2460,9 +2939,198 @@ class family_handler:
             {"id": "audio_refinement", "name": "Audio Refinement Extra Phase", "label": "Audio Refinement Extra Phase",
              "type": "dropdown", "default": "none",
              "choices": [("Off", "none"), ("Enabled — 6 extra steps", "enabled")]},
-        ]
+        ])
+        if two_pass_compatible:
+            from models.minimax_h3.two_pass import (
+                H3_PHASE2_ACCELERATOR_STRENGTH,
+                H3_PHASE2_NOISE,
+                H3_PHASE2_STEPS,
+                H3_TWO_PASS_ENABLED,
+                H3_TWO_PASS_DEFAULTS,
+            )
+
+            result["custom_settings"].extend(
+                [
+                    {
+                        "id": H3_TWO_PASS_ENABLED,
+                        "name": "H3 Two-Pass Latent Upscaling",
+                        "label": "H3 Two-Pass Latent Upscaling",
+                        "type": "dropdown",
+                        "default": "off",
+                        "choices": [("Off", "off"), ("On", "on")],
+                        "description": "Off by default. Phase 2 settings below are inactive until this is On.",
+                    },
+                    {
+                        "id": H3_PHASE2_STEPS,
+                        "name": "H3 Phase 2 Steps",
+                        "label": "H3 Phase 2 Steps",
+                        "type": "int",
+                        "default": H3_TWO_PASS_DEFAULTS[H3_PHASE2_STEPS],
+                        "min": 2,
+                        "max": 12,
+                        "step": 1,
+                        "description": "Used only when H3 Two-Pass Latent Upscaling is On.",
+                    },
+                    {
+                        "id": H3_PHASE2_NOISE,
+                        "name": "H3 Phase 2 Noise",
+                        "label": "H3 Phase 2 Noise",
+                        "type": "float",
+                        "default": H3_TWO_PASS_DEFAULTS[H3_PHASE2_NOISE],
+                        "min": 0.05,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "description": "Starting noise for phase 2; used only when H3 Two-Pass is On.",
+                    },
+                    {
+                        "id": H3_PHASE2_ACCELERATOR_STRENGTH,
+                        "name": "H3 Phase 2 Accelerator Strength",
+                        "label": "H3 Phase 2 Accelerator Strength",
+                        "type": "float",
+                        "default": H3_TWO_PASS_DEFAULTS[H3_PHASE2_ACCELERATOR_STRENGTH],
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "description": "Phase 2 strength for selected Turbo adapters; used only when H3 Two-Pass is On.",
+                    },
+                ]
+            )
+        if hyperflow_flash:
+            result["inference_steps_min"] = 4
+            result["inference_steps_max"] = 8
+            result["inference_steps_step"] = 2
+            result["inference_steps_label"] = "Flash Steps"
+            result["inference_steps_help"] = "Choose 4, 6 (default), or 8 evaluations on the checkpoint's fixed schedule."
+            result["minimax_h3_unaccelerated_default_steps"] = 6
+            result["minimax_h3_sampler"] = "euler"
+            result["minimax_h3_video_shift"] = 12.0
+            result["minimax_h3_audio_shift"] = 3.0
+            result["minimax_h3_hyperflow_flash"] = True
+            result["minimax_h3_accelerators_allowed"] = False
+            result["minimax_h3_two_pass_compatible"] = True
+            result["flow_shift"] = False
+            result["minimax_h3_transformer_working_vram_gb"] = 10
+            result["sample_solvers"] = [("Euler", "euler")]
+            result["first_block_cache"] = False
+            result["spectrum_cache"] = False
+            result["sol_attention"] = False
+            result["sla_attention"] = False
+            result["sla_attention_default"] = False
+            result["sla_attention_experimental"] = False
+            result["veda_attention"] = False
+            result["veda_attention_experimental"] = False
+            result["override_attention"] = "sdpa"
+            result["compatible_model_paths"] = {}
+            result["compatible_model_qkv_layouts"] = {}
+            result["preset_profiles_dir"] = []
+            result["minimax_h3_default_turbo_preset"] = ""
+            result["minimax_h3_turbo_mode_default"] = False
+            result["minimax_h3_model_id"] = str((model_def or {}).get("minimax_h3_model_id") or "")
+            result["lora_compatibility_note"] = (
+                "Ordinary H3 LoRAs are mapped approximately to Flash's two-time AdaLN inputs. "
+                "The existing eight-step HyperFlow Ref2VA offset LoRA belongs to ordinary H3 Ref2VA and is not used by this checkpoint."
+            )
+            if two_pass_compatible:
+                result["custom_settings"] = [
+                    setting for setting in result["custom_settings"]
+                    if setting.get("id") not in {
+                        H3_PHASE2_NOISE,
+                        H3_PHASE2_ACCELERATOR_STRENGTH,
+                    }
+                ]
+                for setting in result["custom_settings"]:
+                    if setting.get("id") == "h3_phase2_steps":
+                        setting.update({"min": 1, "max": 8, "default": 3,
+                                        "description": "Phase 2 uses the selected number of evaluations from the tail of HyperFlow Flash's eight-step grid."})
+            else:
+                result["custom_settings"] = []
+        if dwd_steps:
+            result.update(
+                {
+                    "dwd": dwd_steps,
+                    "minimax_h3_dwd": True,
+                    "minimax_h3_model_id": str(
+                        (model_def or {}).get("minimax_h3_model_id")
+                        or (
+                            f"minimax_h3_full_pi_dwd_{dwd_steps}step"
+                            if full_checkpoint
+                            else f"minimax_h3_pi_dwd_{dwd_steps}step"
+                        )
+                    ),
+                    "minimax_h3_two_pass_compatible": False,
+                    "minimax_h3_accelerators_allowed": False,
+                    "minimax_h3_sampler": "euler",
+                    "minimax_h3_video_shift": 12.0,
+                    "minimax_h3_audio_shift": 3.0,
+                    "lock_inference_steps": True,
+                    "inference_steps_min": dwd_steps,
+                    "inference_steps_max": dwd_steps,
+                    "inference_steps_label": "Denoising Steps",
+                    "inference_steps_help": (
+                        f"pi-H3 DWD uses exactly {dwd_steps} Euler evaluations on its trained schedule."
+                    ),
+                    "guidance_max_phases": 1,
+                    "lock_guidance_phases": True,
+                    "lock_guidance_scale": True,
+                    "sample_solvers": [("Euler", "euler")],
+                    "flow_shift": False,
+                    "first_block_cache": False,
+                    "spectrum_cache": False,
+                    "preset_profiles_dir": [],
+                    "profiles_dir": [],
+                    "custom_settings": [],
+                    "minimax_h3_default_turbo_preset": "",
+                    "minimax_h3_turbo_mode_default": False,
+                    "minimax_h3_video_vae_auto": False,
+                    "minimax_h3_video_vae_choices": [],
+                    "lora_compatibility_note": (
+                        "Use only the matching pi-H3 DWD adapter shipped with this model. "
+                        "The model uses its trained pixel head and one-pass schedule."
+                    ),
+                    "selector_help": (
+                        "pi-H3 DWD Frames\n"
+                        f"This dedicated {dwd_steps}-step model uses the trained pixel decoder "
+                        "instead of the video VAE. It keeps standard H3 Frames conditioning "
+                        "and synchronized audio; use full denoising, Euler, CFG 1, and the "
+                        "fixed 12/3 video/audio shifts."
+                    ),
+                }
+            )
+            result.pop("vae_upsamplers", None)
         if fused_turbo or (model_def or {}).get("lock_inference_steps", False):
             result["custom_settings"] = result["custom_settings"][:1]
+        if ptd_refasymopd:
+            from models.minimax_h3.ptd import PTD_INFOS
+
+            result.update(
+                {
+                    "minimax_h3_ptd_refasymopd": True,
+                    "ptd": True,
+                    "pdd": True,
+                    "lock_inference_steps": True,
+                    "inference_steps_min": 8,
+                    "inference_steps_max": 8,
+                    "inference_steps_label": "Denoising Steps",
+                    "inference_steps_help": "PTD RefAsymOPD uses exactly eight Euler evaluations.",
+                    "guidance_max_phases": 1,
+                    "lock_guidance_phases": True,
+                    "lock_guidance_scale": True,
+                    "minimax_h3_transformer_working_vram_gb": 10,
+                    "minimax_h3_video_shift": 12.0,
+                    "minimax_h3_audio_shift": 3.0,
+                    "minimax_h3_sampler": "euler",
+                    "first_block_cache": False,
+                    "flow_shift": False,
+                    "omni_reference_detail_default": "ptd768",
+                    "omni_reference_detail_choices": [
+                        ("PTD Recipe (768px short edge)", "ptd768")
+                    ],
+                    "selector_help": (
+                        PTD_INFOS + "\n\n" + result["selector_help"]
+                    ),
+                    "custom_settings": [],
+                }
+            )
         if not omni_reference:
             result.update({"video_guide_outpainting": [0], "outpainting_quantize_margins": 32,
                            "video_guide_outpainting_label": "Extend the H3 Control Video canvas"})
@@ -2541,6 +3209,33 @@ class family_handler:
             })
             if baked_turbo:
                 result["custom_settings"] = result["custom_settings"][:1]
+        if (model_def or {}).get("minimax_h3_fasth3"):
+            fast_omni = bool((model_def or {}).get("minimax_h3_fasth3_omniref"))
+            if base_model_type != (_REF2VA_MODEL_TYPE if fast_omni else _MODEL_TYPE) or any((fused_turbo, singularity, dasiwa, vdn, bool(import_profile))):
+                raise ValueError("FastH3 V2 requires its separate text-to-video workflow.")
+            if fast_omni:
+                from models.minimax_h3.fasth3_omniref import capabilities as fasth3_capabilities
+            else:
+                from models.minimax_h3.fasth3 import fasth3_capabilities
+            result.update(fasth3_capabilities())
+        if (model_def or {}).get("minimax_h3_pika_flex"):
+            if base_model_type not in {_MODEL_TYPE, _REF2VA_MODEL_TYPE} or any(
+                (fused_turbo, singularity, dasiwa, vdn, bool(import_profile))
+            ):
+                raise ValueError("Pika H3 Flex requires its separate Frames or References model.")
+            from models.minimax_h3.pika_flex_assets import pika_flex_capabilities
+
+            result.update(pika_flex_capabilities(reference=omni_reference))
+            memory_policy_key = (
+                "omni_sequence_memory_policy"
+                if omni_reference
+                else "sliding_window_memory_policy"
+            )
+            pika_memory_policy = _pika_flex_estimated_memory_policy(
+                result.get(memory_policy_key)
+            )
+            if pika_memory_policy is not None:
+                result[memory_policy_key] = pika_memory_policy
         return result
 
     @staticmethod
@@ -2584,6 +3279,8 @@ class family_handler:
         if not isinstance(model_def, dict):
             return model_def
         context = runtime_context if isinstance(runtime_context, dict) else {}
+        resolved = model_def
+
         selection = context.get("minimax_h3_video_vae")
         if selection is not None:
             selection = str(selection).strip().lower()
@@ -2595,37 +3292,78 @@ class family_handler:
                 )
             if selection != "auto":
                 filename = VIDEO_VAE_VARIANT_FILENAMES[selection]
-                if (
+                if not (
                     model_def.get("minimax_h3_video_vae_filename") == filename
                     and model_def.get("minimax_h3_video_vae_auto") is False
                     and model_def.get("minimax_h3_video_vae_variant") == selection
                 ):
-                    return model_def
-                resolved = dict(model_def)
-                resolved["minimax_h3_video_vae_filename"] = filename
-                resolved["minimax_h3_video_vae_auto"] = False
-                resolved["minimax_h3_video_vae_variant"] = selection
-                return resolved
+                    resolved = dict(model_def)
+                    resolved["minimax_h3_video_vae_filename"] = filename
+                    resolved["minimax_h3_video_vae_auto"] = False
+                    resolved["minimax_h3_video_vae_variant"] = selection
 
-        if model_def.get("minimax_h3_video_vae_auto") is not True:
-            return model_def
-        quantization = str(
-            context.get("transformer_quantization") or ""
-        ).strip().lower()
-        filename = (
-            _VIDEO_VAE_INT8_CONVROT
-            if quantization == "int8"
-            else _VIDEO_VAE
-        )
-        variant = "full_int8" if quantization == "int8" else "full"
         if (
-            model_def.get("minimax_h3_video_vae_filename") == filename
-            and model_def.get("minimax_h3_video_vae_variant") == variant
+            selection is None or selection == "auto"
+        ) and resolved.get("minimax_h3_video_vae_auto") is True:
+            quantization = str(
+                context.get("transformer_quantization") or ""
+            ).strip().lower()
+            filename = (
+                _VIDEO_VAE_INT8_CONVROT
+                if quantization == "int8"
+                else _VIDEO_VAE
+            )
+            variant = "full_int8" if quantization == "int8" else "full"
+            if not (
+                resolved.get("minimax_h3_video_vae_filename") == filename
+                and resolved.get("minimax_h3_video_vae_variant") == variant
+            ):
+                resolved = dict(resolved)
+                resolved["minimax_h3_video_vae_filename"] = filename
+                resolved["minimax_h3_video_vae_variant"] = variant
+
+        from models.minimax_h3.two_pass import parse_two_pass_toggle
+
+        if resolved.get("minimax_h3_regenerate_ic"):
+            return resolved
+        enabled = parse_two_pass_toggle(context.get("minimax_h3_two_pass"))
+        if not enabled:
+            if (
+                "minimax_h3_latent_upscaler_enabled" in resolved
+                or "minimax_h3_latent_upscaler_filename" in resolved
+                or "minimax_h3_two_pass_enabled" in resolved
+            ):
+                resolved = dict(resolved)
+                resolved.pop("minimax_h3_latent_upscaler_enabled", None)
+                resolved.pop("minimax_h3_latent_upscaler_filename", None)
+                resolved.pop("minimax_h3_two_pass_enabled", None)
+            return resolved
+
+        forbidden = (
+            "minimax_h3_pika_flex",
+            "minimax_h3_ptd_refasymopd",
+            "minimax_h3_fused_turbo",
+            "minimax_h3_fasth3",
+            "minimax_h3_vdn",
+            "vdn",
+            "minimax_h3_dasiwa",
+            "minimax_h3_baked_turbo",
+            "minimax_h3_singularity",
+            "minimax_h3_audio_only",
+        )
+        if resolved.get("minimax_h3_two_pass_compatible") is not True or any(
+            resolved.get(key) for key in forbidden
         ):
-            return model_def
-        resolved = dict(model_def)
-        resolved["minimax_h3_video_vae_filename"] = filename
-        resolved["minimax_h3_video_vae_variant"] = variant
+            raise ValueError(
+                "MiniMax H3 two-pass latent upscaling is available only for "
+                "compatible standard H3 models."
+            )
+        from models.minimax_h3.latent_upscaler import LATENT_UPSCALER_FILE
+
+        resolved = dict(resolved)
+        resolved["minimax_h3_two_pass_enabled"] = True
+        resolved["minimax_h3_latent_upscaler_enabled"] = True
+        resolved["minimax_h3_latent_upscaler_filename"] = LATENT_UPSCALER_FILE
         return resolved
 
     @staticmethod
@@ -2713,6 +3451,45 @@ class family_handler:
             if fused_turbo
             else []
         )
+        ptd_asset_downloads = []
+        if (model_def or {}).get("minimax_h3_ptd_refasymopd") is True:
+            from models.minimax_h3.ptd import (
+                PTD_FOLDER,
+                PTD_HEAD_FILE,
+                PTD_REPO,
+                PTD_REVISION,
+            )
+
+            ptd_asset_downloads.append(
+                {
+                    "repoId": PTD_REPO,
+                    "revision": PTD_REVISION,
+                    "sourceFolderList": [PTD_FOLDER],
+                    # PTD_FOLDER already includes the full local path beneath
+                    # the checkpoint root. A second target folder here makes
+                    # WGP download to `minimax_h3/ptd_refasymopd/<PTD_FOLDER>`
+                    # while load_model resolves `<PTD_FOLDER>/<file>`.
+                    "targetFolderList": [None],
+                    "fileList": [[PTD_HEAD_FILE]],
+                }
+            )
+        latent_upscaler_downloads = []
+        if (model_def or {}).get("minimax_h3_latent_upscaler_enabled") is True:
+            from models.minimax_h3.latent_upscaler import (
+                LATENT_UPSCALER_FILE,
+                LATENT_UPSCALER_REPO,
+                LATENT_UPSCALER_REVISION,
+            )
+
+            latent_upscaler_downloads.append(
+                {
+                    "repoId": LATENT_UPSCALER_REPO,
+                    "revision": LATENT_UPSCALER_REVISION,
+                    "sourceFolderList": [""],
+                    "targetFolderList": [_ASSETS_ROOT],
+                    "fileList": [[LATENT_UPSCALER_FILE]],
+                }
+            )
         dialogue_downloads = ([{"repoId": "DeepBeepMeep/Wan2.1", "sourceFolderList": ["whisper_medium"],
                                "fileList": [["config.json", "model.safetensors"]]}]
                               if base_model_type == _TTS_MODEL_TYPE else [])
@@ -2753,7 +3530,7 @@ class family_handler:
             from models.minimax_h3.viggle import REPO, REVISION, PROMPT_FILE
             return vae_downloads + [{"repoId": REPO, "revision": REVISION,
                 "sourceFolderList": ["viggle_animate"], "fileList": [[PROMPT_FILE]]}]
-        return vae_downloads + x2_vae_downloads + attribution_downloads + dialogue_downloads + [
+        return vae_downloads + x2_vae_downloads + attribution_downloads + ptd_asset_downloads + latent_upscaler_downloads + dialogue_downloads + [
             {
                 "repoId": _OFFICIAL_REPO,
                 "revision": _OFFICIAL_REVISION,
@@ -2780,13 +3557,21 @@ class family_handler:
         from .minimax_h3_main import MiniMaxH3Model
         from .video_vae import video_vae_offload_models
 
-        if (model_def or {}).get("minimax_h3_viggle"):
+        resolved_model_def = dict(model_def or {})
+        if resolved_model_def.get("minimax_h3_ptd_refasymopd") is True:
+            from models.minimax_h3.ptd import PTD_FOLDER, PTD_HEAD_FILE
+
+            resolved_model_def["minimax_h3_ptd_head_path"] = fl.locate_file(
+                os.path.join(PTD_FOLDER, PTD_HEAD_FILE)
+            )
+
+        if resolved_model_def.get("minimax_h3_viggle"):
             from services.managed_preprocessors import ensure_minimax_h3_lora_affine_maps
             ensure_minimax_h3_lora_affine_maps("viggle", widths=(8,))
 
         model = MiniMaxH3Model(
             model_filename=model_filename,
-            model_def=model_def or {},
+            model_def=resolved_model_def,
             text_encoder_filename=text_encoder_filename,
             dtype=dtype,
             minimax_h3_text_encoder=kwargs.get(
@@ -2801,6 +3586,8 @@ class family_handler:
             **video_vae_offload_models(model.vae),
             "audio_vae": model.audio_vae,
         }
+        if model.latent_upscaler is not None:
+            pipe["latent_upscaler"] = model.latent_upscaler
         if not model.viggle:
             # Profile the two Qwen towers independently. Text-only FL2VA
             # never needs the vision tower, while Ref2VA can release it
@@ -2809,6 +3596,8 @@ class family_handler:
             # single co-resident conditioner.
             pipe.update({"text_encoder": model.conditioner.language_model,
                          "vision_encoder": model.conditioner.visual})
+            if model.conditioner.qwen.text_connector is not None:
+                pipe["text_connector"] = model.conditioner.qwen.text_connector
         if model.audio_only:
             from .dialogue import load_dialogue_whisper
             model.dialogue_whisper = load_dialogue_whisper()
@@ -2817,6 +3606,11 @@ class family_handler:
             "pipe": pipe,
             "workingVRAM": {
                 "transformer": int((model_def or {}).get("minimax_h3_transformer_working_vram_gb", 10) * 1024),
+                **(
+                    {"latent_upscaler": 2048}
+                    if model.latent_upscaler is not None
+                    else {}
+                ),
             },
         }
 
@@ -2827,10 +3621,6 @@ class family_handler:
             normalize_settings(ui_defaults, validate_media=False)
             ui_defaults.setdefault("resolution", "auto480p")
             return
-        omni_reference = base_model_type in {
-            _REF2VA_MODEL_TYPE,
-            _REF2VA_FULL_MODEL_TYPE,
-        }
         fused_turbo = bool(
             (model_def or {}).get("minimax_h3_fused_turbo", False)
         )
@@ -2875,6 +3665,33 @@ class family_handler:
         if base_model_type == _TTS_MODEL_TYPE:
             ui_defaults.update({"resolution": "32x32", "duration_seconds": 15, "video_length": 362,
                                 "sliding_window_size": 362, "audio_prompt_type": "", "multi_prompts_gen_type": 2})
+        if (model_def or {}).get("minimax_h3_hyperflow_flash"):
+            ui_defaults.update({
+                "num_inference_steps": 6,
+                "guidance_phases": 1,
+                "guidance_scale": 1.0,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "sample_solver": "euler",
+                "minimax_h3_turbo_mode": False,
+                "minimax_h3_turbo_preset": "",
+                "skip_steps_cache_type": "",
+                "override_attention": "sdpa",
+            })
+        if (model_def or {}).get("minimax_h3_fasth3"):
+            ui_defaults.update({"num_inference_steps": 8, "flow_shift": 12.0 if (model_def or {}).get("minimax_h3_fasth3_omniref") else 10.0,
+                                "audio_flow_shift": 3.0, "override_attention": "sdpa",
+                                "minimax_h3_turbo_mode": False, "minimax_h3_turbo_preset": "",
+                                "video_length": 124, "sliding_window_size": 124,
+                                "multi_prompts_gen_type": 2,
+                                "minimax_h3_multi_window": False, "minimax_h3_reference_sequence": False})
+        if (model_def or {}).get("minimax_h3_pika_flex"):
+            from models.minimax_h3.pika_flex_assets import pika_flex_defaults
+
+            ui_defaults.update(pika_flex_defaults(
+                reference=base_model_type == _REF2VA_MODEL_TYPE,
+                attention=ui_defaults.get("override_attention"),
+            ))
         import_profile = (model_def or {}).get("minimax_h3_import_profile")
         if import_profile:
             ui_defaults.update({"num_inference_steps": import_profile["default_steps"],
@@ -2883,12 +3700,39 @@ class family_handler:
                                 "minimax_h3_turbo_mode": False, "minimax_h3_turbo_preset": ""})
             if (model_def or {}).get("minimax_h3_baked_turbo"):
                 ui_defaults.update({"override_attention": "", "skip_steps_cache_type": ""})
+        if (model_def or {}).get("minimax_h3_ptd_refasymopd") is True:
+            from models.minimax_h3.ptd import PTD_REFERENCE_DETAIL
+
+            ui_defaults.update(
+                {
+                    "num_inference_steps": 8,
+                    "video_length": _H3_MIN_FRAMES,
+                    "sliding_window_size": _H3_MIN_FRAMES,
+                    "resolution": "864x480",
+                    "guidance_scale": 1.0,
+                    "guidance_phases": 1,
+                    "flow_shift": 12.0,
+                    "audio_flow_shift": 3.0,
+                    "sample_solver": "euler",
+                    "minimax_h3_reference_detail": PTD_REFERENCE_DETAIL,
+                    "skip_steps_cache_type": "",
+                    "denoising_strength": 1.0,
+                    "masking_strength": 1.0,
+                    "minimax_h3_multi_window": False,
+                    "minimax_h3_reference_sequence": False,
+                }
+            )
+        _apply_dwd_recipe_settings(ui_defaults, model_def)
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
         if base_model_type == "viggle_animate":
             from models.minimax_h3.viggle import normalize_settings
             normalize_settings(ui_defaults, validate_media=False)
+            return
+        if (model_def or {}).get("preserve_guide_frame_count"):
+            # Source media preparation already owns the exact published
+            # timeline and canvas. Only the denoising pass needs H3 alignment.
             return
         # Saved settings created before this family existed cannot need a
         # migration, but imported presets still need valid H3 geometry.
@@ -2909,6 +3753,9 @@ class family_handler:
         from models.minimax_h3.duration import apply_h3_duration_override
         model_def = apply_h3_duration_override(ui_defaults, model_def or {})
         maximum_frames = int(model_def.get("frames_maximum") or _H3_MAX_FRAMES)
+        pika_flex = bool(model_def.get("minimax_h3_pika_flex"))
+        minimum_frames = int(model_def.get("frames_minimum") or _H3_MIN_FRAMES)
+        frame_step = int(model_def.get("frames_steps") or _H3_FRAME_STEP)
 
         try:
             requested_frames = int(ui_defaults.get("video_length", 124))
@@ -2923,10 +3770,62 @@ class family_handler:
             omni_reference
             and ui_defaults.get("minimax_h3_reference_sequence") is True
         )
+        pika_sequence = False
+        if pika_flex:
+            from .pika_flex import pika_flex_sequence_enabled
+
+            pika_sequence = pika_flex_sequence_enabled(
+                ui_defaults,
+                reference=omni_reference,
+            )
         outpaint_text = str(ui_defaults.get("video_guide_outpainting") or "").strip()
         outpainting = bool(outpaint_text) and not outpaint_text.startswith("#")
         exact_outpaint_timeline = outpainting and ui_defaults.get("minimax_h3_multi_window") is True
-        if not omni_reference:
+        if pika_flex:
+            if pika_sequence:
+                # Only each native window follows Pika's 17*n+5 lattice.
+                # Preserve the exact joined timeline so, for example, two
+                # 124-frame windows with 18-frame overlap remain 230 frames.
+                ui_defaults["video_length"] = max(
+                    minimum_frames,
+                    requested_frames,
+                )
+                try:
+                    requested_window = int(
+                        ui_defaults.get("sliding_window_size", minimum_frames)
+                    )
+                except (TypeError, ValueError):
+                    requested_window = minimum_frames
+                ui_defaults["sliding_window_size"] = normalize_h3_clip_frame_count(
+                    requested_window,
+                    minimum_frames=minimum_frames,
+                    maximum_frames=maximum_frames,
+                    frame_step=frame_step,
+                )
+                ui_defaults["sliding_window_overlap"] = normalize_h3_overlap_frames(
+                    ui_defaults.get("sliding_window_overlap", _H3_OVERLAP_DEFAULT),
+                    window_frames=ui_defaults["sliding_window_size"],
+                )
+            else:
+                # Direct Pika passes can use the native 362-frame maximum.
+                # Ignore stale legacy window values so they cannot shorten
+                # an explicit single-pass duration.
+                ui_defaults["video_length"] = normalize_h3_clip_frame_count(
+                    requested_frames,
+                    minimum_frames=minimum_frames,
+                    maximum_frames=maximum_frames,
+                    frame_step=frame_step,
+                )
+                ui_defaults["sliding_window_size"] = ui_defaults["video_length"]
+                ui_defaults["sliding_window_overlap"] = 0
+            ui_defaults["minimax_h3_multi_window"] = (
+                pika_sequence and not omni_reference
+            )
+            ui_defaults["minimax_h3_reference_sequence"] = (
+                pika_sequence and omni_reference
+            )
+            ui_defaults["minimax_h3_extended_duration"] = False
+        elif not omni_reference:
             normalize_h3_window_geometry(ui_defaults, model_def)
         elif requested_frames <= maximum_frames + 1 and not exact_outpaint_timeline:
             ui_defaults["video_length"] = min(
@@ -2943,42 +3842,115 @@ class family_handler:
                 requested_frames,
             )
 
-        try:
-            requested_window = int(
-                ui_defaults.get("sliding_window_size", maximum_frames)
+        if pika_flex:
+            if not pika_sequence:
+                ui_defaults["sliding_window_size"] = ui_defaults["video_length"]
+        else:
+            try:
+                requested_window = int(
+                    ui_defaults.get("sliding_window_size", maximum_frames)
+                )
+            except (TypeError, ValueError):
+                requested_window = maximum_frames
+            aligned_window = align_num_frames(max(1, requested_window))
+            ui_defaults["sliding_window_size"] = min(
+                maximum_frames,
+                max(_H3_MIN_FRAMES, aligned_window),
             )
-        except (TypeError, ValueError):
-            requested_window = maximum_frames
-        aligned_window = align_num_frames(max(1, requested_window))
-        ui_defaults["sliding_window_size"] = min(
-            maximum_frames,
-            max(_H3_MIN_FRAMES, aligned_window),
-        )
         if (
-            not omni_reference
+            not pika_flex and not omni_reference
             and ui_defaults.get("minimax_h3_multi_window") is not True
         ):
             ui_defaults["video_length"] = min(
                 ui_defaults["video_length"],
                 ui_defaults["sliding_window_size"],
             )
-        raw_overlap = ui_defaults.get(
-            "sliding_window_overlap",
-            _H3_OVERLAP_DEFAULT,
-        )
-        # Existing Maestro H3 presets used a zero/one-frame anchor. Upgrade
-        # that legacy default once for both FL2VA and Ref2VA.
-        if settings_version < 2.58 and raw_overlap in (None, 0, 1, "1"):
-            raw_overlap = _H3_OVERLAP_DEFAULT
-        ui_defaults["sliding_window_overlap"] = normalize_h3_overlap_frames(
-            raw_overlap,
-            window_frames=ui_defaults["sliding_window_size"],
-        )
+        if pika_flex:
+            ui_defaults["sliding_window_overlap"] = (
+                normalize_h3_overlap_frames(
+                    ui_defaults.get(
+                        "sliding_window_overlap",
+                        _H3_OVERLAP_DEFAULT,
+                    ),
+                    window_frames=ui_defaults["sliding_window_size"],
+                )
+                if pika_sequence
+                else 0
+            )
+        else:
+            raw_overlap = ui_defaults.get(
+                "sliding_window_overlap",
+                _H3_OVERLAP_DEFAULT,
+            )
+            # Existing Maestro H3 presets used a zero/one-frame anchor. Upgrade
+            # that legacy default once for both FL2VA and Ref2VA.
+            if settings_version < 2.58 and raw_overlap in (None, 0, 1, "1"):
+                raw_overlap = _H3_OVERLAP_DEFAULT
+            ui_defaults["sliding_window_overlap"] = normalize_h3_overlap_frames(
+                raw_overlap,
+                window_frames=ui_defaults["sliding_window_size"],
+            )
         ui_defaults["sliding_window_discard_last_frames"] = 0
         ui_defaults["resolution"] = _normalize_h3_resolution(
-            ui_defaults.get("resolution", "864x480"), preserve_canvas=outpainting,
+            ui_defaults.get("resolution", "864x480"),
+            preserve_canvas=outpainting or bool((model_def or {}).get("minimax_h3_pika_flex")),
         )
         ui_defaults["guidance_scale"] = 1.0
+        if (model_def or {}).get("minimax_h3_pika_flex"):
+            from models.minimax_h3.pika_flex_assets import pika_flex_defaults
+            from models.minimax_h3.pika_flex import normalize_pika_flex_steps
+
+            try:
+                requested_steps = normalize_pika_flex_steps(
+                    ui_defaults.get("num_inference_steps")
+                )
+            except ValueError:
+                # Saved settings may predate the exposed range. Migrate an
+                # unsupported legacy value to the official six-step default.
+                requested_steps = normalize_pika_flex_steps()
+
+            ui_defaults.update(pika_flex_defaults(
+                reference=omni_reference,
+                attention=ui_defaults.get("override_attention"),
+            ))
+            # Keep the selected experimental count and already validated
+            # role-specific sequence switch/geometry when restoring the other
+            # model-owned recipe settings.
+            ui_defaults["num_inference_steps"] = requested_steps
+            ui_defaults["minimax_h3_multi_window"] = (
+                pika_sequence and not omni_reference
+            )
+            ui_defaults["minimax_h3_reference_sequence"] = (
+                pika_sequence and omni_reference
+            )
+            if pika_sequence:
+                try:
+                    requested_window = int(
+                        ui_defaults.get("sliding_window_size", minimum_frames)
+                    )
+                except (TypeError, ValueError):
+                    requested_window = minimum_frames
+                ui_defaults["sliding_window_size"] = normalize_h3_clip_frame_count(
+                    requested_window,
+                    minimum_frames=minimum_frames,
+                    maximum_frames=maximum_frames,
+                    frame_step=frame_step,
+                )
+                ui_defaults["sliding_window_overlap"] = normalize_h3_overlap_frames(
+                    ui_defaults.get("sliding_window_overlap", _H3_OVERLAP_DEFAULT),
+                    window_frames=ui_defaults["sliding_window_size"],
+                )
+            else:
+                ui_defaults["sliding_window_size"] = ui_defaults["video_length"]
+                ui_defaults["sliding_window_overlap"] = 0
+        if (model_def or {}).get("minimax_h3_fasth3"):
+            ui_defaults.update({"num_inference_steps": 8, "flow_shift": 12.0 if (model_def or {}).get("minimax_h3_fasth3_omniref") else 10.0,
+                                "audio_flow_shift": 3.0, "override_attention": "sdpa",
+                                "minimax_h3_turbo_mode": False, "minimax_h3_turbo_preset": "",
+                                "skip_steps_cache_type": "", "minimax_h3_extended_duration": False,
+                                "minimax_h3_multi_window": False, "minimax_h3_reference_sequence": False,
+                                "sliding_window_size": ui_defaults.get("video_length", 124)})
+            ui_defaults["multi_prompts_gen_type"] = 2
         if (model_def or {}).get("minimax_h3_fused_turbo", False):
             try:
                 ui_defaults["num_inference_steps"] = (
@@ -3022,6 +3994,7 @@ class family_handler:
             "first_block",
         }:
             ui_defaults["skip_steps_cache_type"] = ""
+        _apply_dwd_recipe_settings(ui_defaults, model_def)
 
     @staticmethod
     def custom_prompt_preprocess(
@@ -3077,6 +4050,68 @@ class family_handler:
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
         """Enforce H3's single-pass and continuation geometry server-side."""
+        if (model_def or {}).get("minimax_h3_pika_flex"):
+            from models.minimax_h3.pika_flex_assets import pika_flex_capabilities
+
+            reference = base_model_type == _REF2VA_MODEL_TYPE
+            try:
+                validate_pika_flex_single_pass_request(inputs, model_def)
+                capabilities = pika_flex_capabilities(reference=reference)
+                allowed = {
+                    value for preset in capabilities["resolution_presets"].values()
+                    for value in preset["values"].values()
+                }
+                if inputs.get("resolution") not in allowed:
+                    tiers = capabilities["resolution_preset_order"]
+                    tier_list = ", ".join(tiers[:-1]) + f", or {tiers[-1]}"
+                    raise ValueError(
+                        f"Pika H3 Flex requires one of its configured {tier_list} canvas sizes."
+                    )
+                if float(inputs.get("fps", 24)) != 24:
+                    raise ValueError("Pika H3 Flex requires 24 fps.")
+            except (ValueError, TypeError) as error:
+                return str(error)
+            return None
+        if (
+            base_model_type in {
+                "viggle_remake_swap",
+                "viggle_remake_swap_aligned",
+                "viggle_remake_edit",
+            }
+            or (model_def or {}).get("minimax_h3_aligned_guide") is True
+        ):
+            from models.minimax_h3.viggle_remake import validate_remake_inputs
+
+            try:
+                aligned_guide = (model_def or {}).get("minimax_h3_aligned_guide") is True
+                if aligned_guide and (
+                    (model_def or {}).get("omni_reference") is not True
+                    or (model_def or {}).get("minimax_h3_lora_workflow") != "ref2va"
+                ):
+                    return "BFS Aligned Swap requires its Ref2VA model profile."
+                validate_remake_inputs(inputs, aligned_guide=aligned_guide)
+                if aligned_guide:
+                    from models.minimax_h3.viggle_remake import (
+                        validate_aligned_guide_lora_names,
+                    )
+
+                    validate_aligned_guide_lora_names(
+                        inputs.get("activated_loras") or ()
+                    )
+            except ValueError as error:
+                return str(error)
+            return None
+        if base_model_type == "minimax_h3_regenerate_ic":
+            return None if inputs.get("video_guide") else "Choose a source draft for Regenerate 2K IC."
+        if (model_def or {}).get("minimax_h3_fasth3"):
+            if (model_def or {}).get("minimax_h3_fasth3_omniref"):
+                from models.minimax_h3.fasth3_omniref import validate_request as validate_fasth3_request
+            else:
+                from models.minimax_h3.fasth3 import validate_fasth3_request
+            try:
+                validate_fasth3_request(inputs)
+            except (ValueError, TypeError) as error:
+                return str(error)
         if base_model_type == "viggle_animate":
             from models.minimax_h3.viggle import normalize_settings
             try:
@@ -3103,6 +4138,236 @@ class family_handler:
             except ValueError as error:
                 return str(error)
         custom = inputs.get("custom_settings") or {}
+        try:
+            from models.minimax_h3.two_pass import (
+                H3_TWO_PASS_ENABLED,
+                has_h3_edit_mask_or_outpainting,
+                normalize_two_pass_settings,
+                resolve_h3_sample_solver,
+                two_pass_unavailable_reason,
+            )
+
+            two_pass_settings = normalize_two_pass_settings(custom, model_def)
+        except (ValueError, TypeError) as error:
+            return str(error)
+
+        hyperflow_flash = model_def.get("minimax_h3_hyperflow_flash") is True
+        if hyperflow_flash:
+            from models.minimax_h3.two_pass import resolve_h3_sample_solver
+            from models.minimax_h3.turbo import (
+                find_minimax_h3_accelerators,
+                minimax_h3_turbo_preset_for_path,
+            )
+
+            try:
+                steps = int(inputs.get("num_inference_steps", 6))
+                phases = int(inputs.get("guidance_phases", 1))
+                scale = float(inputs.get("guidance_scale", 1.0))
+                video_shift = float(inputs.get("flow_shift", 12.0))
+                audio_shift = float(inputs.get("audio_flow_shift", 3.0))
+                strength = float(inputs.get("denoising_strength", 1.0))
+            except (TypeError, ValueError):
+                return "HyperFlow Flash requires 4, 6, or 8 Euler evaluations, CFG 1, and fixed shifts 12/3."
+            if steps not in (4, 6, 8):
+                return "HyperFlow Flash phase 1 supports exactly 4, 6, or 8 evaluations."
+            solver = resolve_h3_sample_solver(inputs.get("sample_solver"), model_def)
+            if solver != "euler":
+                return "HyperFlow Flash requires the Euler sampler."
+            if phases != 1:
+                return "Use the H3 Two-Pass setting for HyperFlow Flash's second phase."
+            if scale != 1.0 or video_shift != 12.0 or audio_shift != 3.0:
+                return "HyperFlow Flash requires guidance scale 1 and video/audio shifts 12/3."
+            if strength != 1.0:
+                return "HyperFlow Flash requires full denoising strength 1.0."
+            if inputs.get("skip_steps_cache_type") not in (None, ""):
+                return "HyperFlow Flash does not support step caching."
+            if custom.get("audio_refinement", "none") == "enabled":
+                return "HyperFlow Flash does not support Audio Refinement."
+            if inputs.get("_face_refinement") or inputs.get("face_refinement"):
+                return "HyperFlow Flash does not support face refinement."
+            if has_h3_edit_mask_or_outpainting(inputs):
+                return "HyperFlow Flash does not support video edit masks or outpainting."
+            selected_loras = (
+                inputs.get("activated_loras")
+                or inputs.get("loras_selected")
+                or ()
+            )
+            selected_loras = (
+                selected_loras
+                if isinstance(selected_loras, (list, tuple))
+                else [selected_loras]
+            )
+            old_hyperflow = any(
+                (minimax_h3_turbo_preset_for_path(str(path)) or {}).get("id")
+                == "hyperflow-ref2va-8step"
+                for path in selected_loras
+            )
+            if old_hyperflow:
+                return (
+                    "The existing eight-step HyperFlow Ref2VA LoRA is for the "
+                    "ordinary H3 Ref2VA checkpoint, not HyperFlow Flash."
+                )
+            if find_minimax_h3_accelerators(selected_loras):
+                return (
+                    "HyperFlow Flash has its own checkpoint schedule and does "
+                    "not support additional H3 Turbo, PDD, Pika, or DMAD accelerators."
+                )
+            inputs.update({
+                "sample_solver": "euler",
+                "guidance_scale": 1.0,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "skip_steps_cache_type": "",
+                "minimax_h3_turbo_mode": False,
+                "minimax_h3_turbo_preset": "",
+            })
+        dwd_steps = int(model_def.get("dwd", 0) or 0)
+        if dwd_steps:
+            if base_model_type not in {_MODEL_TYPE, _FULL_MODEL_TYPE}:
+                return "pi-H3 DWD requires a dedicated FL2VA Frames model."
+            try:
+                steps = int(inputs.get("num_inference_steps", dwd_steps))
+                phases = int(inputs.get("guidance_phases", 1))
+                guidance_scale = float(inputs.get("guidance_scale", 1.0))
+                video_shift = float(inputs.get("flow_shift", 12.0))
+                audio_shift = float(inputs.get("audio_flow_shift", 3.0))
+                denoising_strength = float(
+                    inputs.get("denoising_strength", 1.0)
+                )
+            except (TypeError, ValueError):
+                return f"pi-H3 DWD requires its fixed {dwd_steps}-step Euler recipe."
+            if steps != dwd_steps:
+                return f"pi-H3 DWD requires exactly {dwd_steps} denoising evaluations."
+            if resolve_h3_sample_solver(inputs.get("sample_solver"), model_def) != "euler":
+                return "pi-H3 DWD requires the Euler sampler."
+            if phases != 1:
+                return "pi-H3 DWD requires exactly one guidance phase."
+            if guidance_scale != 1.0:
+                return "pi-H3 DWD requires guidance scale 1.0 (CFG 1)."
+            if video_shift != 12.0 or audio_shift != 3.0:
+                return "pi-H3 DWD requires video/audio flow shifts 12/3."
+            if denoising_strength != 1.0:
+                return "pi-H3 DWD requires full denoising strength 1.0."
+            if two_pass_settings[H3_TWO_PASS_ENABLED] == "on":
+                return "pi-H3 DWD does not support H3 Two-Pass."
+            if custom.get("audio_refinement", "none") == "enabled":
+                return "pi-H3 DWD does not support Audio Refinement."
+            if inputs.get("_face_refinement") or inputs.get("face_refinement"):
+                return "pi-H3 DWD does not support face refinement."
+            if inputs.get("skip_steps_cache_type") not in (None, ""):
+                return "pi-H3 DWD does not support step caching."
+            raw_sigmas = inputs.get("custom_sigmas")
+            if raw_sigmas not in (None, ""):
+                from .pi_h3 import pi_h3_sigmas
+
+                try:
+                    if isinstance(raw_sigmas, str):
+                        values = [
+                            float(value.strip())
+                            for value in raw_sigmas.replace(";", ",").split(",")
+                            if value.strip()
+                        ]
+                    else:
+                        values = [float(value) for value in raw_sigmas]
+                except (TypeError, ValueError):
+                    return "pi-H3 DWD custom sigmas must match its trained schedule."
+                trained = pi_h3_sigmas(dwd_steps, 12.0)
+                if len(values) != len(trained) or any(
+                    abs(actual - expected) > 1e-5
+                    for actual, expected in zip(values, trained)
+                ):
+                    return "pi-H3 DWD custom sigmas must match its trained schedule."
+        ptd_refasymopd = (
+            model_def.get(
+                "minimax_h3_ptd_refasymopd",
+                model_def.get("ptd", False),
+            )
+            is True
+        )
+        if ptd_refasymopd:
+            if two_pass_settings[H3_TWO_PASS_ENABLED] == "on":
+                return "PTD RefAsymOPD cannot use H3 Two-Pass."
+            try:
+                steps = int(inputs.get("num_inference_steps", 8))
+                guide_phases = int(inputs.get("guidance_phases", 1))
+                guidance_scale = float(inputs.get("guidance_scale", 1.0))
+                flow_shift = float(inputs.get("flow_shift", 12.0))
+                audio_flow_shift = float(inputs.get("audio_flow_shift", 3.0))
+                denoising_strength = float(
+                    inputs.get("denoising_strength", 1.0)
+                )
+            except (TypeError, ValueError):
+                return "PTD RefAsymOPD settings must use its fixed eight-step recipe."
+            if steps != 8:
+                return "PTD RefAsymOPD requires exactly eight denoising evaluations."
+            sample_solver = resolve_h3_sample_solver(
+                inputs.get("sample_solver"), model_def
+            )
+            if sample_solver != "euler":
+                return (
+                    "PTD RefAsymOPD requires the Euler sampler; the effective "
+                    f"sampler is '{sample_solver}'. Choose Euler."
+                )
+            if guide_phases != 1:
+                return "PTD RefAsymOPD uses exactly one guidance phase."
+            if guidance_scale != 1.0:
+                return "PTD RefAsymOPD requires guidance scale 1.0 (CFG 1)."
+            if flow_shift != 12.0 or audio_flow_shift != 3.0:
+                return "PTD RefAsymOPD requires video/audio flow shifts 12/3."
+            if denoising_strength != 1.0:
+                return "PTD RefAsymOPD requires full denoising strength 1.0."
+            if inputs.get("skip_steps_cache_type") not in (None, ""):
+                return "PTD RefAsymOPD does not support skip-step caches."
+            if custom.get("audio_refinement", "none") == "enabled":
+                return "PTD RefAsymOPD does not support Audio Refinement."
+            if inputs.get("_face_refinement") or inputs.get("face_refinement"):
+                return "PTD RefAsymOPD does not support face refinement."
+            from models.minimax_h3.ptd import PTD_REFERENCE_DETAIL
+
+            inputs["minimax_h3_reference_detail"] = PTD_REFERENCE_DETAIL
+
+        if two_pass_settings[H3_TWO_PASS_ENABLED] == "on":
+            if model_def.get("minimax_h3_two_pass_compatible") is not True:
+                return "H3 Two-Pass is available only for compatible standard H3 recipes."
+            from .turbo import find_minimax_h3_pdd_loras
+
+            selected_loras = (
+                inputs.get("activated_loras")
+                or inputs.get("loras_selected")
+                or ()
+            )
+            pdd_active = bool(find_minimax_h3_pdd_loras(selected_loras))
+            video_prompt = str(inputs.get("video_prompt_type") or "")
+            control_video = "G" in video_prompt and "V" in video_prompt
+            reason = two_pass_unavailable_reason(
+                model_def,
+                pdd_active=pdd_active,
+                has_control_video=control_video,
+                has_source_video=(
+                    inputs.get("input_video") is not None
+                    or inputs.get("video_guide") is not None
+                ),
+                has_edit_mask=has_h3_edit_mask_or_outpainting(inputs),
+                denoising_strength=float(
+                    inputs.get("denoising_strength", 1.0)
+                ),
+                audio_refinement=custom.get("audio_refinement") == "enabled",
+                face_refinement=bool(
+                    inputs.get("_face_refinement")
+                    or inputs.get("face_refinement")
+                ),
+                audio_only=bool(model_def.get("minimax_h3_audio_only")),
+            )
+            if reason:
+                return reason
+            sample_solver = resolve_h3_sample_solver(
+                inputs.get("sample_solver"), model_def
+            )
+            if sample_solver != "euler":
+                return (
+                    "H3 Two-Pass requires the Euler sampler; the effective "
+                    f"sampler is '{sample_solver}'. Choose an Euler H3 recipe."
+                )
         if custom.get("audio_refinement") == "enabled":
             if (model_def or {}).get("lock_inference_steps") or (model_def or {}).get("minimax_h3_fused_turbo"):
                 return "Audio refinement is unavailable for fixed-step PDD and fused Turbo variants"

@@ -225,19 +225,6 @@ def _validate_public_checkpoint(module, paths, label, remap=None):
         raise ValueError(f"{label} checkpoint does not match FLUX 3: missing {missing}; unexpected {extra}; shape mismatches {wrong}.")
 
 
-def _has_active_loras(value) -> bool:
-    if value is None or value is False:
-        return False
-    if isinstance(value, dict):
-        phases = ("phase1", "phase2", "phase3")
-        if any(phase in value for phase in phases):
-            return any(_has_active_loras(value.get(phase)) for phase in phases)
-        return any(_has_active_loras(item) for item in value.values())
-    if isinstance(value, (tuple, list, set)):
-        return any(_has_active_loras(item) for item in value)
-    return bool(value)
-
-
 def _as_pil(image) -> Image.Image:
     if isinstance(image, Image.Image):
         return image.copy()
@@ -440,13 +427,13 @@ class model_factory:
                  input_ref_images=None, original_input_ref_images=None, video_prompt_type="",
                  input_frames=None, input_masks=None, image_start=None, callback=None,
                  set_progress_status=None, sample_solver="default", loras_slists=None,
-                 outpainting_dims=None, model_mode=None, **kwargs):
-        if _has_active_loras(loras_slists) or _has_active_loras(kwargs.get("activated_loras")):
-            raise ValueError("FLUX 3 Image Klein does not support loaded or scheduled LoRAs yet.")
+                 outpainting_dims=None, image_mode=1, model_mode=None, **kwargs):
         if input_masks is not None or _active_outpainting(outpainting_dims):
             raise ValueError("FLUX 3 Image Klein supports instruction-based reference editing, not masked inpainting or outpainting.")
-        if model_mode not in (None, 0, "0", 1, "1"):
-            raise ValueError("FLUX 3 Image Klein supports standard image generation and reference editing only.")
+        if str(image_mode).strip() not in ("1", "1.0"):
+            raise ValueError("FLUX 3 Image Klein supports Image Generate only (image_mode=1).")
+        # model_mode is shared with music-family selectors. The image workflow is
+        # selected by image_mode, so stale model_mode values must not block it.
         if str(sample_solver or "default").strip().lower() not in ("", "default", "euler"):
             raise ValueError("FLUX 3 Image Klein uses its native flow-map Euler sampler.")
         try:
@@ -527,6 +514,7 @@ class model_factory:
                     check_cancel=check_cancel,
                     negative_packed=pack([[negative_text, condition, image]]) if negative_text is not None else None,
                     guidance_scale=guide_scale,
+                    loras_slists=loras_slists,
                 )
                 check_cancel()
                 if callable(set_progress_status):

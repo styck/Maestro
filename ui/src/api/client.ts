@@ -1,5 +1,6 @@
-import type { DirectorModelCompatibility, GenerationPreview, GenerationPreviewSupport, H3WindowPlan, LTXWindowPlan, MiniMaxH3Reference, ProductionPlan, SavedOmniCharacter, ScailResolutionProfile } from '../types'
+import type { DirectorModelCompatibility, EditorOperationCreateRequest, EditorOperationRecord, EditorOperationTransitionRequest, GenerationPreview, GenerationPreviewSupport, H3WindowPlan, LTXWindowPlan, MiniMaxH3Reference, ProductionPlan, SavedOmniCharacter, ScailResolutionProfile } from '../types'
 import type { KreaIdentitySettings } from '../lib/kreaIdentityControls'
+import { getJson } from './readRequest'
 
 const BASE = ''  // same origin in production; Vite proxy handles /api in dev
 
@@ -70,10 +71,13 @@ export interface ApiOutput {
 }
 
 export interface ApiJobStatus {
+  generation_details?: import('../types').GenerationDetails | null
   enhancement?: import('../types').PromptEnhancementRecord | null
   job_id: string
   /** Stable browser-generated identity used to recover an accepted submit. */
   client_submission_id?: string | null
+  /** Exact Editor round-trip owner, when this is an Editor-linked job. */
+  editor_operation_id?: string | null
   /** Direct submits remain visible while queued for deferred AI planning. */
   show_in_gallery?: boolean
   /** Owning Director pipeline; null for ordinary Studio jobs. */
@@ -85,9 +89,13 @@ export interface ApiJobStatus {
   progress: number
   step: number
   total_steps: number
+  /** Average time per completed denoising step in the active pass. */
+  seconds_per_step?: number | null
   phase: string
   message: string
   output_files: string[]
+  /** Optional finishing failed after the original generation was saved. */
+  finishing_warnings?: string[]
   /** Small job-specific preview; absent on older backends. */
   preview?: GenerationPreview | null
   preview_notice?: string | null
@@ -121,9 +129,7 @@ export interface ApiJobStatus {
 // --- Models & Families ---
 
 export async function fetchModels(): Promise<{ families: ApiFamily[]; models: ApiModel[] }> {
-  const res = await fetch(`${BASE}/api/v1/models`)
-  if (!res.ok) throw new Error('Failed to fetch models')
-  return res.json()
+  return getJson(`${BASE}/api/v1/models`, 'Failed to fetch models')
 }
 
 export interface ModelVisibilitySettings {
@@ -135,9 +141,7 @@ export interface ModelVisibilitySettings {
 }
 
 export async function fetchModelVisibility(): Promise<ModelVisibilitySettings> {
-  const res = await fetch(`${BASE}/api/v1/model-visibility`)
-  if (!res.ok) throw new Error('Failed to fetch model visibility')
-  return res.json()
+  return getJson(`${BASE}/api/v1/model-visibility`, 'Failed to fetch model visibility')
 }
 
 export async function updateModelVisibility(params: {
@@ -216,9 +220,7 @@ export async function fetchResolutions(): Promise<ApiResolution[]> {
 // --- Model Defaults ---
 
 export async function fetchDefaults(modelType: string): Promise<Record<string, unknown>> {
-  const res = await fetch(`${BASE}/api/v1/defaults/${encodeURIComponent(modelType)}`)
-  if (!res.ok) throw new Error(`Failed to fetch defaults for ${modelType}`)
-  return res.json()
+  return getJson(`${BASE}/api/v1/defaults/${encodeURIComponent(modelType)}`, `Failed to fetch defaults for ${modelType}`)
 }
 
 // --- Generation ---
@@ -231,6 +233,7 @@ export async function submitGeneration(
   status: ApiJobStatus['status']
   h3_window_plan?: H3WindowPlan
   ltx_window_plan?: LTXWindowPlan
+  editor_operation_id?: string | null
 }> {
   const res = await fetch(`${BASE}/api/v1/generate`, {
     method: 'POST',
@@ -262,6 +265,11 @@ export async function planH3Windows(params: {
   custom_settings?: Record<string, unknown>
   sliding_window_memory_override?: boolean
   minimax_h3_extended_duration?: boolean
+  audio_guide?: string
+  audio_frame_offset?: number
+  audio_prompt_type?: string
+  source_audio_transcript_in_prompt?: boolean
+  source_audio_transcript_for_enhancement?: boolean
   has_start_image?: boolean
   has_end_image?: boolean
   image_paths?: string[]
@@ -276,7 +284,9 @@ export async function planH3Windows(params: {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'H3 window planning failed' }))
-    throw new Error(err.detail || 'H3 window planning failed')
+    throw Object.assign(new Error(err.detail || 'H3 window planning failed'), {
+      draft_history_id: res.headers.get('X-Maestro-Draft-History') || undefined,
+    })
   }
   return res.json()
 }
@@ -286,9 +296,7 @@ export interface H3WindowOverrideSettings {
 }
 
 export async function fetchH3WindowOverrides(): Promise<H3WindowOverrideSettings> {
-  const res = await fetch(`${BASE}/api/v1/h3-window-overrides`)
-  if (!res.ok) throw new Error('Failed to fetch H3 window overrides')
-  return res.json()
+  return getJson(`${BASE}/api/v1/h3-window-overrides`, 'Failed to fetch H3 window overrides')
 }
 
 export async function updateH3WindowOverrides(
@@ -319,7 +327,7 @@ export interface StudioPreferenceSettings {
   music_defaults_version?: number
   director_music_model?: string
   h3_optimizations?: {
-    override_attention?: '' | 'sol' | 'sla' | 'veda' | 'sdpa'
+    override_attention?: '' | 'sol' | 'sla' | 'veda' | 'sdpa' | 'sage2'
     skip_steps_cache_type?: '' | 'first_block'
     skip_steps_multiplier?: number
     skip_steps_start_step_perc?: number
@@ -329,9 +337,7 @@ export interface StudioPreferenceSettings {
 export type StudioPreferenceUpdate = Omit<StudioPreferenceSettings, 'configured'>
 
 export async function fetchStudioPreferences(): Promise<StudioPreferenceSettings> {
-  const res = await fetch(`${BASE}/api/v1/studio-preferences`)
-  if (!res.ok) throw new Error('Failed to fetch Studio preferences')
-  return res.json()
+  return getJson(`${BASE}/api/v1/studio-preferences`, 'Failed to fetch Studio preferences')
 }
 
 export async function updateStudioPreferences(
@@ -360,6 +366,11 @@ export async function planH3Sequence(params: {
   minimax_h3_extended_duration?: boolean
   overlap_frames?: number
   sequence_continuity?: boolean
+  audio_guide?: string
+  audio_frame_offset?: number
+  audio_prompt_type?: string
+  source_audio_transcript_in_prompt?: boolean
+  source_audio_transcript_for_enhancement?: boolean
   camera_coverage?: 'auto' | 'continuous' | 'multi_shot'
   planning_style?: 'faithful' | 'creative' | 'adaptive'
 }): Promise<H3WindowPlan> {
@@ -370,7 +381,9 @@ export async function planH3Sequence(params: {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'H3 sequence planning failed' }))
-    throw new Error(err.detail || 'H3 sequence planning failed')
+    throw Object.assign(new Error(err.detail || 'H3 sequence planning failed'), {
+      draft_history_id: res.headers.get('X-Maestro-Draft-History') || undefined,
+    })
   }
   return res.json()
 }
@@ -379,6 +392,16 @@ export async function fetchJobStatus(jobId: string): Promise<ApiJobStatus> {
   const res = await fetch(`${BASE}/api/v1/status/${encodeURIComponent(jobId)}`)
   if (!res.ok) throw new Error('Failed to fetch job status')
   return res.json()
+}
+
+export async function fetchJobBySubmission(clientId: string): Promise<ApiJobStatus | null> {
+  const response = await fetch(`${BASE}/api/v1/jobs/by-submission/${encodeURIComponent(clientId)}`)
+  if (response.status === 404) return null
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: 'Could not recover the submission receipt.' }))
+    throw new Error(error.detail || 'Could not recover the submission receipt.')
+  }
+  return response.json()
 }
 
 // --- Music: LLM song writer (Music mode Simple) ---
@@ -444,6 +467,8 @@ export async function submitToolUpscale(params: {
   dlss_depth?: string
   dlss_motion?: string
   temporal_upsampling?: string
+  _editor_operation_id?: string
+  _client_submission_id?: string
 }): Promise<{ job_id: string }> {
   const res = await fetch(`${BASE}/api/v1/tools/upscale`, {
     method: 'POST',
@@ -462,6 +487,8 @@ export async function submitToolFilmGrain(params: {
   intensity: number
   saturation: number
   workspace?: string
+  _editor_operation_id?: string
+  _client_submission_id?: string
 }): Promise<{ job_id: string }> {
   const res = await fetch(`${BASE}/api/v1/tools/film-grain`, {
     method: 'POST',
@@ -479,9 +506,12 @@ export async function submitToolRevoice(params: {
   video_path: string
   voice_ref_paths: string[]
   mode?: 'single' | 'two'
+  singing?: boolean
   diffusion_steps?: number
   cfg_rate?: number
   workspace?: string
+  _editor_operation_id?: string
+  _client_submission_id?: string
 }): Promise<{ job_id: string }> {
   const res = await fetch(`${BASE}/api/v1/tools/revoice`, {
     method: 'POST',
@@ -504,9 +534,7 @@ export interface Workspace {
 }
 
 export async function fetchWorkspaces(): Promise<{ workspaces: Workspace[]; active: string }> {
-  const res = await fetch(`${BASE}/api/v1/workspaces`)
-  if (!res.ok) throw new Error('Failed to fetch workspaces')
-  return res.json()
+  return getJson(`${BASE}/api/v1/workspaces`, 'Failed to fetch workspaces')
 }
 
 export async function setActiveWorkspace(name: string): Promise<void> {
@@ -597,6 +625,7 @@ export async function saveEditorProject(
   })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: 'Project save failed' }))
+    if (res.status === 409) throw new Error('This project changed on another device. Your edits are still here. Save a new version to keep them, or reopen the project to load the newer version.')
     throw new Error(error.detail || 'Project save failed')
   }
   return res.json()
@@ -611,6 +640,48 @@ export async function deleteEditorProject(projectId: string, workspace?: string)
     { method: 'DELETE' },
   )
   if (!res.ok) throw new Error('Failed to delete Editor project')
+}
+
+export async function createEditorOperation(
+  params: EditorOperationCreateRequest,
+): Promise<EditorOperationRecord> {
+  const res = await fetch(`${BASE}/api/v1/editor/operations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Could not create Editor AI operation' }))
+    throw new Error(error.detail || 'Could not create Editor AI operation')
+  }
+  return res.json()
+}
+
+export async function fetchEditorOperation(operationId: string): Promise<EditorOperationRecord> {
+  const res = await fetch(`${BASE}/api/v1/editor/operations/${encodeURIComponent(operationId)}`, {
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Could not recover Editor AI operation' }))
+    throw new Error(error.detail || 'Could not recover Editor AI operation')
+  }
+  return res.json()
+}
+
+export async function transitionEditorOperation(
+  operationId: string,
+  params: EditorOperationTransitionRequest,
+): Promise<EditorOperationRecord> {
+  const res = await fetch(`${BASE}/api/v1/editor/operations/${encodeURIComponent(operationId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Could not update Editor AI operation' }))
+    throw new Error(error.detail || 'Could not update Editor AI operation')
+  }
+  return res.json()
 }
 
 export async function probeEditorMedia(
@@ -666,6 +737,28 @@ export async function fetchEditorMediaPreview(
   return res.json()
 }
 
+export async function previewEditorGraphic(params: {
+  graphic: import('../types').EditorGraphic
+  width: number
+  height: number
+  assets: Record<string, import('../types').EditorAsset>
+  workspace: string
+}, signal?: AbortSignal): Promise<Blob> {
+  const res = await fetch(`${BASE}/api/v1/editor/graphics/preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+    signal,
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Unable to render this graphic overlay' }))
+    throw new Error(error.detail || error.error || 'Unable to render this graphic overlay')
+  }
+  const blob = await res.blob()
+  if (!blob.size) throw new Error('The graphic preview was empty. Check the layout and try again.')
+  return blob
+}
+
 /** Create a separate excerpt; the gallery original is never modified. */
 export async function trimGalleryMedia(
   asset: Pick<import('../types').EditorAsset, 'name' | 'origin' | 'workspace'>,
@@ -693,7 +786,8 @@ export async function fetchEditorExportCapabilities(): Promise<import('../types'
 export async function exportEditorProject(
   project: import('../types').EditorProject,
   mode: 'now' | 'queue' = 'now',
-): Promise<{ job_id: string; status: ApiJobStatus['status'] }> {
+  options?: { itemIds: string[]; format: 'prores4444' },
+): Promise<{ job_id: string; status: ApiJobStatus['status']; revision?: number }> {
   const res = await fetch(`${BASE}/api/v1/editor/export`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -701,6 +795,7 @@ export async function exportEditorProject(
       workspace: project.workspace,
       project,
       queue_mode: mode === 'queue' ? 'held' : 'now',
+      ...(options ? { item_ids: options.itemIds, format: options.format } : {}),
     }),
   })
   if (!res.ok) {
@@ -1105,6 +1200,17 @@ export interface RecipeLora {
   size_mb?: number
 }
 
+export type RecipeWorkflowStepType =
+  | 'prepare_prompt' | 'configure' | 'verify_requirements' | 'generate' | 'review' | 'iterate'
+
+export interface RecipeWorkflowStep {
+  type: RecipeWorkflowStepType
+  title: string
+  instruction: string
+  setting?: string
+  value?: string | number | boolean | null
+}
+
 export interface RecipeCard {
   id: string
   name: string
@@ -1116,11 +1222,17 @@ export interface RecipeCard {
   nsfw: boolean
   source: 'bundled' | 'user'
   thumbnail_url: string | null
+  preview_url: string | null
 }
 
 export interface Recipe extends RecipeCard {
   loras: RecipeLora[]
   params: Record<string, unknown>
+  requirements: string[]
+  model_guidance: string
+  prompt_guidance: string
+  workflow_guidance: string
+  workflow_steps: RecipeWorkflowStep[]
 }
 
 export async function fetchRecipes(): Promise<{ recipes: RecipeCard[] }> {
@@ -1210,6 +1322,7 @@ export async function updateClipPrompt(pid: string, clipIndex: number, update: {
   image_prompt?: string
   video_prompt?: string
   window_prompts?: string[]
+  shot_reference_cast?: string[] | null
 }): Promise<void> {
   const res = await fetch(`${BASE}/api/v1/director/pipelines/${encodeURIComponent(pid)}/clips/${clipIndex}/prompt`, {
     method: 'PUT',
@@ -1422,17 +1535,13 @@ export async function deletePreset(id: string): Promise<void> {
 // --- LoRAs ---
 
 export async function fetchLoras(modelType: string): Promise<{ loras: string[]; guidance_max_phases: number }> {
-  const res = await fetch(`${BASE}/api/v1/loras/${encodeURIComponent(modelType)}`)
-  if (!res.ok) throw new Error('Failed to fetch loras')
-  return res.json()
+  return getJson(`${BASE}/api/v1/loras/${encodeURIComponent(modelType)}`, 'Failed to fetch loras')
 }
 
 // --- Model Options ---
 
 export async function fetchModelOptions(modelType: string): Promise<import('../types').ModelOptions> {
-  const res = await fetch(`${BASE}/api/v1/model-options/${encodeURIComponent(modelType)}`)
-  if (!res.ok) throw new Error('Failed to fetch model options')
-  return res.json()
+  return getJson(`${BASE}/api/v1/model-options/${encodeURIComponent(modelType)}`, 'Failed to fetch model options')
 }
 
 // --- Retake ---
@@ -1444,6 +1553,7 @@ export async function submitRetake(params: {
   num_inference_steps?: number; retake_strength?: number; workspace?: string;
   retake_engine?: string; regenerate_audio?: boolean; resolution?: string;
   activated_loras?: string[]; loras_multipliers?: string;
+  _editor_operation_id?: string; _client_submission_id?: string;
 }): Promise<{ job_id: string; status: string; retake_frames: string }> {
   const res = await fetch(`${BASE}/api/v1/retake`, {
     method: 'POST',
@@ -1524,6 +1634,8 @@ export async function submitEditAnything(params: {
   activated_loras?: string[];
   loras_multipliers?: string;
   workspace?: string;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{
   job_id: string;
   status: string;
@@ -1569,6 +1681,8 @@ export async function submitRepaint(params: {
   activated_loras?: string[];
   loras_multipliers?: string;
   workspace?: string;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{
   job_id: string;
   status: string;
@@ -1671,6 +1785,8 @@ export async function submitRecast(params: {
   activated_loras?: string[];
   loras_multipliers?: string;
   workspace?: string;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{
   job_id: string;
   status: string;
@@ -1791,6 +1907,8 @@ export async function submitOutpaint(params: {
   sliding_window_overlap?: number;
   start_time?: number;
   end_time?: number;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{ job_id: string; status: string }> {
   const res = await fetch(`${BASE}/api/v1/outpaint`, {
     method: 'POST',
@@ -1897,6 +2015,20 @@ export async function mixAudio(tracks: {
 
 // --- Upload ---
 
+export async function fetchViggleSourceInfo(videoPath: string, workspace: string, signal?: AbortSignal): Promise<{
+  duration_seconds: number
+}> {
+  const res = await fetch(`${BASE}/api/v1/viggle/source-info`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({video_path: videoPath, workspace}), signal,
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({detail: 'Could not inspect the control video.'}))
+    throw new Error(error.detail || 'Could not inspect the control video.')
+  }
+  return res.json()
+}
+
 export async function uploadImage(file: File, options?: { reuseIdentical?: boolean }): Promise<{
   filename: string
   path: string
@@ -1920,9 +2052,7 @@ export async function uploadImage(file: File, options?: { reuseIdentical?: boole
 // --- System Config ---
 
 export async function fetchSystemConfig(): Promise<import('../types').SystemConfig> {
-  const res = await fetch(`${BASE}/api/v1/system-config`)
-  if (!res.ok) throw new Error('Failed to fetch system config')
-  return res.json()
+  return getJson(`${BASE}/api/v1/system-config`, 'Failed to fetch system config')
 }
 
 export async function scanModelFolders(): Promise<{ candidates: import('../types').ModelFolderCandidate[] }> {
@@ -2235,9 +2365,7 @@ export async function applySystemDetect(): Promise<import('../types').SystemDete
 // --- Services Config ---
 
 export async function fetchServicesConfig(): Promise<import('../types').ServicesConfig> {
-  const res = await fetch(`${BASE}/api/v1/services-config`)
-  if (!res.ok) throw new Error('Failed to fetch services config')
-  return res.json()
+  return getJson(`${BASE}/api/v1/services-config`, 'Failed to fetch services config')
 }
 
 export async function updateServicesConfig(
@@ -2258,9 +2386,7 @@ export async function updateServicesConfig(
 // --- LLM Service ---
 
 export async function fetchLlmStatus(): Promise<import('../types').LlmStatus> {
-  const res = await fetch(`${BASE}/api/v1/llm/status`)
-  if (!res.ok) throw new Error('Failed to fetch LLM status')
-  return res.json()
+  return getJson(`${BASE}/api/v1/llm/status`, 'Failed to fetch LLM status')
 }
 
 export async function loadLlm(
@@ -2324,31 +2450,59 @@ export async function unloadRemoteModel(params: {
 }
 
 export async function fetchLlmModels(): Promise<{ models: import('../types').LlmModelOption[] }> {
-  const res = await fetch(`${BASE}/api/v1/llm/models`)
-  if (!res.ok) throw new Error('Failed to fetch LLM models')
-  return res.json()
+  return getJson(`${BASE}/api/v1/llm/models`, 'Failed to fetch LLM models')
+}
+
+export async function planAnimatedTitle(params: {
+  brief: string; style_hint: string; frames: number; background: string; fps?: number; native_h3?: boolean
+}): Promise<{
+  plan: import('../editor/editorAnimatedTitles').TitleCreativePlan | null
+  warnings: string[]; raw_draft: string; review_required: boolean; draft_history_id?: string
+}> {
+  const response = await fetch(`${BASE}/api/v1/llm/plan-title`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params),
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: 'Title planning failed.' }))
+    throw Object.assign(new Error(error.detail || 'Title planning failed.'), {
+      draft_history_id: response.headers.get('X-Maestro-Draft-History') || undefined,
+    })
+  }
+  return response.json()
 }
 
 export async function llmEnhancePrompt(params: {
   prompt: string
   mode?: string
   model_type?: string
+  resolution?: string
   temperature?: number
   image_path?: string
   image_paths?: string[]
   duration_seconds?: number
   window_count?: number
   window_size_seconds?: number
+  window_overlap_seconds?: number
+  window_discard_seconds?: number
   activated_loras?: string[]
   tts_enhance_mode?: string
+  tts_writer_instructions?: string
+  tts_target_minutes?: number
   tts_voice_count?: number
   max_new_tokens?: number
   reference_context?: string
+  minimax_h3_references?: MiniMaxH3Reference[]
+  audio_guide?: string
+  audio_frame_offset?: number
+  audio_prompt_type?: string
+  source_audio_transcript_in_prompt?: boolean
+  source_audio_transcript_for_enhancement?: boolean
   planning_style?: 'faithful' | 'creative' | 'adaptive'
 }): Promise<{
   original: string
   enhanced: string
   warnings?: string[]
+  draft_history_id?: string
 }> {
   const res = await fetch(`${BASE}/api/v1/llm/enhance-prompt`, {
     method: 'POST',
@@ -2357,7 +2511,9 @@ export async function llmEnhancePrompt(params: {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Enhancement failed' }))
-    throw new Error(err.detail || 'Enhancement failed')
+    throw Object.assign(new Error(err.detail || 'Enhancement failed'), {
+      draft_history_id: res.headers.get('X-Maestro-Draft-History') || undefined,
+    })
   }
   return res.json()
 }
@@ -2864,6 +3020,7 @@ export type LoraUpdateStatus = 'current' | 'available' | 'unknown' | 'local' | '
 
 export interface InstalledLora {
   filename: string
+  is_acceleration?: boolean
   directory: string
   /** Resolved user-facing name, independent from the on-disk filename. */
   display_name?: string
@@ -3164,6 +3321,16 @@ export async function fetchActiveDownloads(
   const res = await fetch(`${BASE}/api/v1/downloads/active${query}`, { signal })
   if (!res.ok) throw new Error(`Failed to fetch active downloads (${res.status})`)
   return res.json()
+}
+
+export async function fetchWriterDrafts(kind: 'director' | 'interactive', id: string): Promise<import('../components/WriterDraftHistory').WriterDraft[]> {
+  const route = kind === 'director'
+    ? `/api/v1/director/pipeline/${encodeURIComponent(id)}/llm-drafts`
+    : `/api/v1/llm/drafts/${encodeURIComponent(id)}`
+  const response = await fetch(`${BASE}${route}`)
+  if (!response.ok) throw new Error('Could not load saved writer drafts.')
+  const data = await response.json()
+  return data.drafts || []
 }
 
 export async function fetchJobEnhancement(jobId: string): Promise<{

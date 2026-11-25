@@ -123,7 +123,9 @@ class MusicReviewTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(len(first), 60)
         self.assertEqual(first, cached)
-        self.assertLessEqual(call.call_args.kwargs["json_schema"]["maxItems"], 48)
+        arc_schema = call.call_args.kwargs["json_schema"]
+        self.assertEqual(arc_schema["type"], "object")
+        self.assertLessEqual(arc_schema["properties"]["beats"]["maxItems"], 48)
 
     def _arc_planner(self, contract):
         planner = MusicVideoPlanner(llm_generate=lambda **kw: "[]")
@@ -171,6 +173,11 @@ class MusicReviewTests(unittest.TestCase):
         self.assertIn("implicated later rows at zero-based indices [1]", writer.call_args.kwargs["user_prompt"])
         self.assertIn('"prior_clip_index": 0', writer.call_args.kwargs["user_prompt"])
         self.assertIn("Original valid outline to edit in place", writer.call_args.kwargs["user_prompt"])
+        repair_example = json.loads(writer.call_args.kwargs["user_prompt"].split(
+            "Original valid outline to edit in place:\n", 1,
+        )[1])
+        self.assertEqual(repair_example["source_event_clips"], {"M1": 1})
+        self.assertTrue(all("source_event_ids" not in row for row in repair_example["beats"]))
         self.assertEqual(planner._planning_resume_checkpoint["music_arc_quality_notes"], [])
 
     def test_malformed_optional_repair_keeps_valid_baseline_and_cached_notes(self):
@@ -308,7 +315,7 @@ class MusicReviewTests(unittest.TestCase):
     def test_hard_source_assignment_failure_still_raises_after_two_attempts(self):
         from services.director.music_narrative import build_music_narrative_contract
 
-        contract = build_music_narrative_contract("The traveler climbs onto a horse.")
+        contract = build_music_narrative_contract("The traveler opens a safe.")
         planner, clips = self._arc_planner(contract)
         beats = self._repeated_outline()
         for row in beats:
@@ -377,16 +384,28 @@ class MusicReviewTests(unittest.TestCase):
         for beat in beats:
             beat.pop("source_event_ids")
         invalid = {"beats": beats, "source_event_clips": {"M1": True}}
-        valid = {"beats": beats, "source_event_clips": {"M1": 1}}
-        with patch.object(planner, "_call_llm_json", side_effect=[[invalid], [valid]]) as writer:
+        valid_map = {"M1": 1}
+        with patch.object(planner, "_call_llm_json", side_effect=[[invalid], [valid_map]]) as writer:
             result = planner._plan_music_arc(clips, planner._music_narrative_contract["source"])
         self.assertEqual([row["source_event_ids"] for row in result], [[], ["M1"], [], []])
+        self.assertEqual(sum(len(row["source_event_ids"]) for row in result), 1)
         self.assertNotIn("source_event_ids", beats[0])  # Writer input is not mutated.
-        schema = writer.call_args.kwargs["json_schema"]
-        self.assertEqual(schema["type"], "object")
-        self.assertEqual(schema["properties"]["source_event_clips"]["required"], ["M1"])
-        self.assertFalse(schema["properties"]["source_event_clips"]["additionalProperties"])
-        self.assertNotIn("source_event_ids", schema["properties"]["beats"]["items"]["properties"])
+        outline_schema = writer.call_args_list[0].kwargs["json_schema"]
+        self.assertEqual(set(outline_schema["properties"]), {"beats", "source_event_clips"})
+        self.assertEqual(outline_schema["required"], ["beats", "source_event_clips"])
+        self.assertFalse(outline_schema["additionalProperties"])
+        self.assertEqual(outline_schema["properties"]["source_event_clips"]["required"], ["M1"])
+        self.assertFalse(outline_schema["properties"]["source_event_clips"]["additionalProperties"])
+        self.assertNotIn(
+            "source_event_ids",
+            outline_schema["properties"]["beats"]["items"]["properties"],
+        )
+
+        repair_schema = writer.call_args_list[1].kwargs["json_schema"]
+        self.assertEqual(set(repair_schema["properties"]), {"M1"})
+        self.assertEqual(repair_schema["required"], ["M1"])
+        self.assertFalse(repair_schema["additionalProperties"])
+        self.assertNotIn("beats", repair_schema["properties"])
 
     def test_malformed_keyed_outline_is_repaired_without_crashing(self):
         from services.director.music_narrative import build_music_narrative_contract
@@ -421,7 +440,10 @@ class MusicReviewTests(unittest.TestCase):
                     result = planner._plan_music_arc(clips, planner._music_narrative_contract["source"])
                 self.assertEqual(writer.call_count, 2)
                 self.assertEqual(result[1]["source_event_ids"], ["M1"])
-                self.assertIn("Repair this outline", writer.call_args.kwargs["user_prompt"])
+                repair_prompt = writer.call_args_list[1].kwargs["user_prompt"]
+                self.assertIn("fixed and exhaustive", repair_prompt)
+                self.assertIn("runs across the field", repair_prompt)
+                self.assertIn("exactly once and in order", repair_prompt)
 
     def test_literal_recycling_is_caught_without_blocking_intentional_refrains(self):
         quote = "The performer raises both hands and walks around the empty microphone stand."

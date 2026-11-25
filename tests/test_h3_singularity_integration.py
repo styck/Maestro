@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from functools import partial
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
+from models.minimax_h3.pi_h3 import pi_h3_adapter_steps, pi_h3_dwd_adapter_steps
 from services import director_pipeline as pipeline
 
 
@@ -39,7 +41,8 @@ def production_function(path, name, namespace=None, class_name=None):
         nodes = next(node for node in nodes if isinstance(node, ast.ClassDef)
                      and node.name == class_name).body
     function = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == name)
-    namespace = dict(namespace or {})
+    namespace = {"__name__": "models.minimax_h3.minimax_h3_main",
+                 "__package__": "models.minimax_h3", **dict(namespace or {})}
     module = ast.Module(body=[ast.ImportFrom(module="__future__",
                                            names=[ast.alias(name="annotations")], level=0),
                              function], type_ignores=[])
@@ -127,29 +130,82 @@ class SingularityIntegrationTests(unittest.TestCase):
     def test_native_validator_accepts_ref_adapter_for_frames_singularity_only(self):
         import os
         from models.minimax_h3 import turbo
+        from models.minimax_h3.lora_compatibility import validate_minimax_h3_loras
 
         validate = production_function(
             ROOT / "app/models/minimax_h3/minimax_h3_main.py", "validate_loras",
-            {"os": os, **{name: getattr(turbo, name) for name in (
+            {"os": os, "validate_minimax_h3_loras": validate_minimax_h3_loras,
+             "pi_h3_adapter_steps": pi_h3_adapter_steps, "pi_h3_dwd_adapter_steps": pi_h3_dwd_adapter_steps,
+             **{name: getattr(turbo, name) for name in (
                 "find_minimax_h3_accelerators", "find_minimax_h3_turbo_loras",
                 "find_minimax_h3_pdd_loras", "minimax_h3_turbo_preset_for_path",
                 "minimax_h3_adapter_workflow")}}, class_name="MiniMaxH3Model",
         )
         for model in MODELS:
             definition = model_definition(model)
-            stub = SimpleNamespace(model_def=definition,
+            stub = SimpleNamespace(model_def=definition, fasth3=False, dwd_steps=None,
                                    omni_reference=bool(definition.get("omni_reference")),
                                    release_special_loras=lambda: None)
             validate(stub, [FILENAME])
             self.assertTrue(stub._turbo_lora_active)
             with self.assertRaisesRegex(ValueError, "one accelerator"):
                 validate(stub, [FILENAME, "MiniMax-H3-Ref2VA-Acc-8Step.safetensors"])
-        stock_frames = SimpleNamespace(model_def={}, omni_reference=False,
+        stock_frames = SimpleNamespace(model_def={}, omni_reference=False, dwd_steps=None,
                                        release_special_loras=lambda: None)
         with self.assertRaisesRegex(ValueError, "REF2VA"):
             validate(stock_frames, [FILENAME])
 
+    def test_ptd_hop_files_are_not_reclassified_as_turbo_or_foreign_pdd(self):
+        import struct
+        from models.minimax_h3 import ptd, turbo
+        from models.minimax_h3.lora_compatibility import validate_minimax_h3_loras
+
+        def write_header(path, metadata):
+            header = json.dumps({"__metadata__": metadata}, separators=(",", ":")).encode("utf-8")
+            path.write_bytes(struct.pack("<Q", len(header)) + header)
+            return str(path)
+
+        metadata = {
+            "base_model": "minimax-h3",
+            "sampler_steps": "8",
+            "application": "lora_a,lora_b",
+            "pdd_num_steps": "32",
+            "pdd_block_size": "4",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hop_paths = [write_header(root / name, metadata) for name in ptd.PTD_LORA_FILES]
+            # Reproduce the metadata signature that caused the real PTD files
+            # to enter the generic Turbo/PDD accelerator classifier.
+            self.assertEqual(turbo.find_minimax_h3_accelerators(hop_paths), hop_paths)
+            validate = production_function(
+                ROOT / "app/models/minimax_h3/minimax_h3_main.py", "validate_loras",
+                {"os": __import__("os"), "validate_minimax_h3_loras": validate_minimax_h3_loras,
+                 "pi_h3_adapter_steps": pi_h3_adapter_steps, "pi_h3_dwd_adapter_steps": pi_h3_dwd_adapter_steps,
+                 **{name: getattr(turbo, name) for name in (
+                    "find_minimax_h3_accelerators", "find_minimax_h3_turbo_loras",
+                    "find_minimax_h3_pdd_loras", "minimax_h3_turbo_preset_for_path",
+                    "minimax_h3_adapter_workflow")}}, class_name="MiniMaxH3Model",
+            )
+            model = SimpleNamespace(
+                model_def={"omni_reference": True}, omni_reference=True,
+                ptd_refasymopd=True, fasth3=False, _fused_turbo=False, dwd_steps=None,
+                _baked_turbo=False, release_special_loras=lambda: None,
+            )
+            validate(model, hop_paths)
+            self.assertEqual(model._ptd_lora_paths, tuple(hop_paths))
+            self.assertFalse(model._turbo_lora_active)
+            self.assertFalse(model._pdd_lora_active)
+
+            foreign_pdd = write_header(
+                root / "MiniMax-H3-Ref2VA-Acc-8Step.safetensors",
+                {"pdd_num_steps": "32", "pdd_block_size": "4"},
+            )
+            with self.assertRaisesRegex(ValueError, "cannot be combined with another Turbo or PDD"):
+                validate(model, [*hop_paths, foreign_pdd])
+
     def test_loader_preserves_ref2va_lora_basis_for_shared_singularity_checkpoint(self):
+        from models.minimax_h3 import turbo
         from models.minimax_h3.singularity import validate_minimax_h3_singularity_checkpoint
 
         checkpoint = {"compressed_modulation": True, "adaln_curve_grid": 1025,
@@ -161,9 +217,12 @@ class SingularityIntegrationTests(unittest.TestCase):
                 transformer.eval = lambda: transformer
                 transformer.requires_grad_ = lambda _value: transformer
                 offload = SimpleNamespace(split_linear_modules=Mock(), load_model_data=Mock())
+                header = Mock(return_value={})
                 load = production_function(
                     ROOT / "app/models/minimax_h3/minimax_h3_main.py", "_load_transformer",
-                    {"probe_h3_checkpoint": lambda _path: checkpoint.copy(),
+                    {"__name__": "models.minimax_h3.minimax_h3_main",
+                     "__package__": "models.minimax_h3",
+                     "probe_h3_checkpoint": lambda _path: checkpoint.copy(),
                      "_first_path": lambda path: path,
                      "convrot_quantization_info_from_file": lambda _path: {},
                      "validate_minimax_h3_singularity_checkpoint": validate_minimax_h3_singularity_checkpoint,
@@ -171,9 +230,12 @@ class SingularityIntegrationTests(unittest.TestCase):
                      "MiniMaxH3Transformer": lambda **_kwargs: transformer,
                      "get_linear_split_map": lambda *_args, **_kwargs: {"qkv": "split"},
                      "offload": offload, "partial": partial,
-                     "_strip_transformer_wrappers": lambda state, **_kwargs: state},
+                     "_strip_transformer_wrappers": lambda state, **_kwargs: state,
+                     "_lock_fp32_adaln_modules": lambda transformer, module_names: None},
                 )
-                result = load("shared.safetensors", "bf16", qkv_layout="grouped", singularity=singularity)
+                with patch.object(turbo, "safetensors_header", header):
+                    result = load("shared.safetensors", "bf16", qkv_layout="grouped", singularity=singularity)
+                header.assert_called_once_with("shared.safetensors")
                 self.assertIs(result, transformer)
                 offload.load_model_data.assert_called_once()
                 if singularity:

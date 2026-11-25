@@ -63,9 +63,13 @@ export interface ModelDef {
   h3_companion_models?: { frames?: string; references?: string }
   /** Image-suite capability flags published by the model definition. */
   supports_image_edit?: boolean
+  /** Uses concise natural-language edit instructions with ordered references. */
+  supports_instruction_image_edit?: boolean
   requires_image_reference?: boolean
   supports_image_inpaint?: boolean
   supports_image_outpaint?: boolean
+  /** Dedicated persistent-world runtime; never offered as a Studio model. */
+  world_model?: boolean
   /** Native preview decoders supported by this model, when reported by the backend. */
   preview_support?: GenerationPreviewSupport
   director?: DirectorModelCompatibility
@@ -78,6 +82,7 @@ export interface ModelDef {
   nsfw_only?: boolean
   /** Model does not support user-selectable LoRAs. */
   loras_disabled?: boolean
+  experimental_loras_available?: boolean
 }
 
 export interface Resolution {
@@ -94,6 +99,9 @@ export interface GenerateParams {
   video_length: number
   num_inference_steps: number
   guidance_scale: number
+  /** Wan 2.2 second-expert guidance defaults and user overrides. */
+  guidance2_scale?: number
+  switch_threshold?: number
   sample_solver?: string
   seed: number
   image_mode: number
@@ -118,14 +126,20 @@ export interface GenerateParams {
   /** Percentage of denoising steps to run before caching may begin. */
   skip_steps_start_step_perc?: number
   /** Per-generation attention override. Sol and Veda are H3-only experiments. */
-  override_attention?: '' | 'sol' | 'sla' | 'veda' | 'sdpa'
+  override_attention?: '' | 'sol' | 'sla' | 'veda' | 'sdpa' | 'sage2'
   guidance_phases?: number
   video_prompt_type?: string
   audio_prompt_type?: string
+  /** Include matching words from an exact source soundtrack as video prompt context. */
+  source_audio_transcript_in_prompt?: boolean
+  /** Make the exact source soundtrack transcript available to prompt enhancement. */
+  source_audio_transcript_for_enhancement?: boolean
   image_prompt_type?: string
   input_video_strength?: number
   flow_shift?: number
   audio_guide?: string
+  /** Source audio frame offset for aligned multi-clip transcript windows. */
+  audio_frame_offset?: number
   audio_scale?: number
   /** Optional LTX ID-LoRA voice identity reference. */
   voice_reference?: string
@@ -143,6 +157,11 @@ export interface GenerateParams {
   /** Maestro's friendly UI state for MiniMax H3 FL2VA control-video editing. */
   minimax_h3_control_visual_mode?: 'prompt' | 'whole' | 'inside' | 'outside'
   image_refs?: string[]
+  /** Source-video timestamps paired with ordered H3 Remake reference frames. */
+  viggle_remake_frame_times?: number[]
+  /** H3 Remake trim bounds in absolute source-video seconds. */
+  viggle_trim_start?: number
+  viggle_trim_end?: number
   frames_positions?: string
   injection_strength?: number
   settings_version?: number
@@ -155,8 +174,14 @@ export interface GenerateParams {
   _studio_image_workflow?: StudioImageWorkflow
   /** UI-only Video workflow marker retained in output sidecars. */
   _studio_video_workflow?: StudioVideoWorkflow
+  /** UI-only Studio Titles form settings restored from its output sidecar. */
+  _studio_title_settings?: Record<string, unknown>
   /** UI-only Audio workflow marker retained in output sidecars. */
   _audio_sub_mode?: AudioSubMode
+  /** Ephemeral request identity used to bind Editor AI round trips to one job. */
+  _editor_operation_id?: string
+  /** Stable client-generated identity used to recover the exact accepted submit. */
+  _client_submission_id?: string
   /** Restorable ffmpeg Mixer recipe. Volumes use the backend's 0-1 scale. */
   audio_mixer_tracks?: Array<{
     path: string
@@ -169,6 +194,8 @@ export interface GenerateParams {
   _duration_planning_mode?: 'duration' | 'windows' | 'auto'
   _viggle_edited_frame?: string
   _viggle_source_seconds?: number
+  /** Ephemeral server-verified video bounds, tied to the current source. */
+  _viggle_source_info?: { source: string; workspace: string; duration_seconds: number }
   _viggle_frame_seconds?: number
   /** Absolute source-video trim bounds; end is exclusive. */
   _viggle_trim_start?: number
@@ -185,8 +212,13 @@ export interface GenerateParams {
   audio_guide5?: string
   audio_guide6?: string
   duration_seconds?: number
+  /** Speech writing preferences; never part of the spoken text. */
+  _speech_writer_instructions?: string
+  _speech_writer_target_minutes?: number
   pause_seconds?: number
   temperature?: number
+  top_k?: number
+  top_p?: number
   model_mode?: number
   custom_settings?: Record<string, unknown>
   temporal_upsampling?: string
@@ -238,7 +270,7 @@ export interface GenerateParams {
   face_refiner?: FaceRefinerOptions
   // MiniMax H3 Ref2VA ordered Omni-reference manifest.
   minimax_h3_references?: MiniMaxH3Reference[]
-  minimax_h3_reference_detail?: 'match' | 'max'
+  minimax_h3_reference_detail?: 'match' | 'max' | 'ptd768'
   /** Experimental long-form Omni orchestration using native continuation or hard-cut clips. */
   minimax_h3_reference_sequence?: boolean
   /** Enable native multi-window continuation for H3 First / Last. Defaults on. */
@@ -251,12 +283,14 @@ export interface GenerateParams {
   minimax_h3_sequence_memory_override?: boolean
   /** Add bounded generated look/blocking references between sequence clips. */
   minimax_h3_sequence_continuity?: boolean
-  minimax_h3_text_encoder?: 'nvfp4_awq' | 'gguf_q2_k' | 'gguf_q4_k_m' | 'int8' | 'bf16'
+  minimax_h3_text_encoder?: 'nvfp4_awq' | 'gguf_q2_k' | 'gguf_q4_k_m' | 'int8' | 'bf16' | 'distilled_4b'
   minimax_h3_video_vae?: 'auto' | 'full' | 'full_int8' | 'lightvae' | 'lightvae_int8'
   /** LTX-2.5 video decoder. Fast ConvVAE is recommended; NAD is experimental. */
   ltx25_video_vae?: 'fast' | 'nad'
   /** One-click managed H3 Turbo recipe for Full or Pruned H3. */
   minimax_h3_turbo_mode?: boolean
+  /** Explicit per-generation opt-in for experimental ordinary H3 LoRAs. */
+  minimax_h3_experimental_loras?: boolean
   /** Immutable validated/candidate Turbo checkpoint selected by its manifest id. */
   minimax_h3_turbo_preset?: string
   /** Automatically expand one long H3 concept into window-local prompts. */
@@ -295,6 +329,7 @@ export interface LTXWindowPlan {
 
 export type MiniMaxH3ReferenceType = 'image' | 'video' | 'audio'
 export type MiniMaxH3AudioIntent = 'voice' | 'drive' | 'style' | 'sound'
+export type MiniMaxH3VideoAudioRole = 'ignore' | 'legacy' | 'output_only' | MiniMaxH3AudioIntent
 
 export interface MiniMaxH3Reference {
   id: string
@@ -308,6 +343,7 @@ export interface MiniMaxH3Reference {
   remove_background?: boolean
   video_intent?: 'character' | 'motion' | 'scene'
   follow_timeline?: boolean
+  video_audio_role?: MiniMaxH3VideoAudioRole
   library_character_id?: string
   character_name?: string
   refmod_path?: string
@@ -329,6 +365,8 @@ export interface FaceRefinerOptions {
   window_frames: number
   model: 'auto' | 'pruned' | 'fused'
   character_ids: string[]
+  audio_scope?: 'all' | 'largest' | 'none'
+  blend?: number
 }
 
 export interface FaceRefinerAssignment {
@@ -442,6 +480,7 @@ export interface H3WindowPlanWindow {
 }
 
 export interface H3WindowPlan {
+  draft_history_id?: string
   source_prompt: string
   signature: string
   planned_by: 'llm' | 'hybrid_repair' | 'deterministic_fallback' | 'not_needed' | 'manual'
@@ -498,6 +537,8 @@ export interface PromptEnhancementRecord {
   enhanced_prompt?: string | null
   warnings?: string[]
   error?: string | null
+  draft_history_id?: string
+  drafts?: import('../components/WriterDraftHistory').WriterDraft[]
 }
 
 export type GenerationPreviewMode = 'off' | 'rgb' | 'tiny_vae_frames' | 'tiny_vae_video'
@@ -513,7 +554,15 @@ export interface GenerationPreview {
   total_clips: number
 }
 
+export interface GenerationDetails {
+  /** Settings captured for this job, independent of the current form. */
+  params: Record<string, unknown>
+  workspace?: string
+  performance_plan?: Record<string, unknown>
+}
+
 export interface GenerationJob {
+  generationDetails?: GenerationDetails | null
   enhancement?: PromptEnhancementRecord | null
   id: string
   /** First observation is a saved queue snapshot, not a new terminal event. */
@@ -529,9 +578,13 @@ export interface GenerationJob {
   progress: number
   step: number
   totalSteps: number
+  /** Average time per completed denoising step in the active pass. */
+  secondsPerStep?: number | null
   phase: string
   message: string
   outputFiles: string[]
+  /** Non-fatal finishing failures; the original output remains available. */
+  finishingWarnings?: string[]
   error: string | null
   /** Small, job-scoped in-progress preview. Absent on older backends. */
   preview?: GenerationPreview | null
@@ -602,6 +655,76 @@ export type EditorAIRoundTripTool =
   | 'revoice'
 export type EditorAIReturnMode = 'replace' | 'alternate'
 
+export type EditorOperationStatus =
+  | 'armed'
+  | 'queued'
+  | 'running'
+  | 'result_ready'
+  | 'completed'
+  | 'failed'
+  | 'needs_review'
+  | 'cancelled'
+
+export interface EditorOperationSourceSnapshot {
+  item_id: string
+  track_id: string
+  track_type: EditorTrackType
+  asset_id: string
+  asset_name: string
+  asset_path: string
+  start: number
+  duration: number
+  source_in: number
+  speed: number
+}
+
+export interface EditorOperationRecord {
+  schema_version: 1
+  operation_id: string
+  client_submission_id: string
+  workspace: string
+  project_id: string
+  project_revision?: number
+  item_id: string
+  item_name: string
+  tool: EditorAIRoundTripTool
+  return_mode: EditorAIReturnMode
+  source_snapshot: EditorOperationSourceSnapshot
+  source_range: { start: number; end: number }
+  status: EditorOperationStatus
+  job_id: string | null
+  job_kind: string | null
+  job_status: string | null
+  output_file: string | null
+  error: string | null
+  review_reason: string | null
+  created_at: number
+  updated_at: number
+}
+
+export interface EditorOperationCreateRequest {
+  operation_id: string
+  client_submission_id: string
+  workspace: string
+  project_id: string
+  project_revision?: number
+  item_id: string
+  item_name: string
+  tool: EditorAIRoundTripTool
+  return_mode: EditorAIReturnMode
+  source_snapshot: EditorOperationSourceSnapshot
+  source_range: { start: number; end: number }
+}
+
+export interface EditorOperationTransitionRequest {
+  client_submission_id: string
+  job_id?: string
+  status: 'completed' | 'failed' | 'needs_review' | 'cancelled'
+  output_file?: string
+  error?: string
+  review_reason?: string
+}
+
 export interface EditorAsset {
   id: string
   name: string
@@ -628,6 +751,19 @@ export interface EditorTransform {
   y: number
   scale: number
   rotation: number
+}
+
+export type EditorAnimatedProperty = 'x' | 'y' | 'scale' | 'rotation' | 'opacity' | 'volume'
+export interface EditorKeyframe {
+  time: number
+  value: number
+  easing: 'linear' | 'hold' | 'ease-in' | 'ease-out' | 'ease-in-out'
+}
+export interface EditorColorSettings {
+  exposure: number
+  contrast: number
+  saturation: number
+  temperature: number
 }
 
 export interface EditorTextStyle {
@@ -672,7 +808,74 @@ export interface EditorDirectorClipSource {
   window_prompts?: string[]
 }
 
+export interface EditorKeyingSettings {
+  enabled: boolean
+  color: string
+  similarity: number
+  softness: number
+  spill: number
+}
+
+export interface EditorGraphicRectElement {
+  id: string
+  type: 'rect'
+  x: number
+  y: number
+  width: number
+  height: number
+  fill: string
+  opacity?: number
+  border_color?: string
+  border_width?: number
+  radius?: number
+}
+
+export interface EditorGraphicTextElement {
+  id: string
+  type: 'text'
+  x: number
+  y: number
+  width: number
+  height: number
+  text: string
+  font_family: string
+  font_size: number
+  color: string
+  opacity?: number
+  align?: 'left' | 'center' | 'right'
+  bold?: boolean
+}
+
+export interface EditorGraphicImageElement {
+  id: string
+  type: 'image'
+  x: number
+  y: number
+  width: number
+  height: number
+  asset_id: string
+  opacity?: number
+  fit?: 'contain' | 'cover'
+}
+
+export type EditorGraphicElement =
+  | EditorGraphicRectElement
+  | EditorGraphicTextElement
+  | EditorGraphicImageElement
+
+/** Serializable native composition stored on a text-track item. */
+export interface EditorGraphic {
+  version: 1
+  width: 1344
+  height: 768
+  elements: EditorGraphicElement[]
+}
+
+export type EditorGraphicLayout = 'lower-third' | 'feature-panel' | 'full-title'
+
 export interface EditorTimelineItem {
+  /** Correlates an automatically returned title; retained for duplicate protection. */
+  animated_title_id?: string
   id: string
   asset_id?: string
   name: string
@@ -686,10 +889,21 @@ export interface EditorTimelineItem {
   transform: EditorTransform
   muted?: boolean
   disabled?: boolean
+  /** Preserve this clip when accepting an automatic edit plan. Manual edits remain available. */
+  pinned?: boolean
   fade_in?: number
   fade_out?: number
   transition_in?: EditorTransitionType
   transition_out?: EditorTransitionType
+  /** Authored overlap with the preceding clip, used by a true crossfade. */
+  transition_overlap?: number
+  keyframes?: Partial<Record<EditorAnimatedProperty, EditorKeyframe[]>>
+  color?: EditorColorSettings
+  keying?: EditorKeyingSettings
+  /** Optional generated/readable caption attached to this clip. */
+  caption?: boolean
+  /** Legacy project text transform/rotation preserved for compatibility review. */
+  legacy_text_rotation?: { transform?: number; style?: number }
   /** Items with the same link id move, trim, split, and delete together. */
   link_group_id?: string
   /** Non-destructive source alternatives created manually or by Maestro AI. */
@@ -701,6 +915,8 @@ export interface EditorTimelineItem {
   director?: EditorDirectorClipSource
   text?: string
   style?: EditorTextStyle
+  /** Native editable composition. Absent on legacy plain text titles. */
+  graphic?: EditorGraphic
 }
 
 export interface EditorTrack {
@@ -723,13 +939,26 @@ export interface EditorCanvas {
 
 export type EditorUpscaleMethod =
   | ''
+  | 'relayvsr1'
+  | 'relayvsr1.5'
+  | 'relayvsr2'
+  | 'relayvsr2.5'
+  | 'relayvsr3'
+  | 'relayvsr3.5'
+  | 'relayvsr4'
   | 'flashvsr2'
   | 'flashvsr3'
   | 'flashvsr4'
   | 'flashvsr2pass2'
   | 'flashvsr2pass4'
+  | 'flashvsrplus2'
+  | 'flashvsrplus3'
+  | 'flashvsrplus4'
+  | 'flashvsrplus2pass2'
+  | 'flashvsrplus2pass4'
 
 export interface EditorExportSettings {
+  format?: 'mp4' | 'prores4444'
   quality: 'draft' | 'balanced' | 'high'
   codec: 'h264' | 'h265'
   encoder: 'auto' | 'software' | 'nvidia' | 'intel' | 'apple'
@@ -743,6 +972,8 @@ export interface EditorExportSettings {
 }
 
 export interface EditorExportRecord {
+  format?: 'mp4' | 'prores4444'
+  source_item_ids?: string[]
   id: string
   filename: string
   workspace: string
@@ -751,7 +982,7 @@ export interface EditorExportRecord {
   width: number
   height: number
   fps: number
-  codec: EditorExportSettings['codec']
+  codec: EditorExportSettings['codec'] | 'prores4444'
   quality: EditorExportSettings['quality']
   encoder?: EditorExportSettings['encoder']
   spatial_upsampling?: EditorUpscaleMethod
@@ -761,6 +992,10 @@ export interface EditorExportRecord {
 
 export interface EditorProject {
   schema_version: number
+  /** Saved-project compatibility notes, such as legacy text transforms. */
+  compatibility_warnings?: string[]
+  /** Server revision used to preserve edits made from another device. */
+  revision?: number
   id: string
   name: string
   workspace: string
@@ -772,6 +1007,13 @@ export interface EditorProject {
   markers: EditorMarker[]
   export: EditorExportSettings
   exports: EditorExportRecord[]
+  auto_edit_history?: Array<{
+    proposal_id: string
+    action_ids: string[]
+    base_revision: number
+    applied_at: number
+    summary: string
+  }>
 }
 
 export interface EditorProjectSummary {
@@ -813,6 +1055,7 @@ export interface EditorMediaPreview {
 }
 
 export interface EditorExportCapabilities {
+  prores4444?: boolean
   encoders: {
     software: boolean
     nvidia: boolean
@@ -824,7 +1067,7 @@ export interface EditorExportCapabilities {
 
 export type MediaFilter = 'all' | 'images' | 'videos' | 'audio' | 'avatars' | 'multiclip' | 'favorites'
 export type AspectRatio = 'auto' | '21:9' | '16:9' | '9:16' | '1:1' | '4:3' | '3:4'
-export type ResolutionPreset = 'auto' | '480p' | '540p' | '720p' | '768p' | '1080p' | '2k'
+export type ResolutionPreset = 'auto' | '480p' | '540p' | '720p' | '768p' | '1080p' | '1k' | '2k' | '4k'
 export type ScailResolutionProfile = '480p' | '512p' | '704p'
 /** Backward-compatible name for saved Recast/API callers. */
 export type RecastResolutionProfile = ScailResolutionProfile
@@ -841,6 +1084,7 @@ export type StudioVideoWorkflow =
   | 'references'
   | 'extend'
   | 'blend'
+  | 'titles'
   | 'retake'
   | 'prompt_edit'
   | 'outpaint'
@@ -942,10 +1186,14 @@ export interface ModelOptions {
   architecture: string
   guidance_max_phases: number
   lock_guidance_phases: boolean
+  default_guidance_phases?: number | null
+  default_guidance2_scale?: number | null
+  default_switch_threshold?: number | null
   sliding_window: boolean
   video_continuation?: boolean
   motion_amplitude: boolean
   flow_shift: boolean
+  moss_image_prompt_helper?: boolean
   tea_cache: boolean
   first_block_cache?: boolean
   sol_attention?: boolean
@@ -990,9 +1238,14 @@ export interface ModelOptions {
     protect_audio: boolean
   } | null
   minimax_h3_fused_turbo?: boolean
+  /** Fixed six-evaluation Pika H3 Flex recipe; continuation follows capability flags. */
+  minimax_h3_pika_flex?: boolean
+  minimax_h3_fasth3?: boolean
+  minimax_h3_fasth3_omniref?: boolean
   minimax_h3_full_checkpoint?: boolean
   minimax_h3_baked_turbo?: boolean
   loras_disabled?: boolean
+  experimental_loras_available?: boolean
   skip_steps_multiplier_choices?: [string, number][] | null
   skip_steps_multiplier_label?: string
   default_skip_steps_multiplier?: number
@@ -1026,8 +1279,8 @@ export interface ModelOptions {
     audio: number
     total: number
   } | null
-  omni_reference_detail_choices?: [string, 'match' | 'max'][] | null
-  omni_reference_detail_default?: 'match' | 'max'
+  omni_reference_detail_choices?: [string, 'match' | 'max' | 'ptd768'][] | null
+  omni_reference_detail_default?: 'match' | 'max' | 'ptd768'
   minimax_h3_text_encoder_choices?: {
     value: string
     label: string
@@ -1100,6 +1353,7 @@ export interface ModelOptions {
     values: Partial<Record<AspectRatio, string>>
   }>> | null
   resolution_preset_order?: ResolutionPreset[] | null
+  default_resolution_preset?: ResolutionPreset | null
   supports_auto_aspect?: boolean
   guide_preprocessing: ChoiceConfig | null
   guide_custom_choices: ChoiceConfig | null
@@ -1162,10 +1416,21 @@ export interface ModelOptions {
   duration_slider: { label: string; min: number; max: number; increment: number; default: number } | null
   audio_segment_max_seconds?: number | null
   duration_is_maximum?: boolean
+  /** Zero duration requests native, bounded automatic speech length. */
+  speech_auto_duration?: boolean
+  speech_longform?: boolean
+  speech_writer_controls?: boolean
   yue2_composition?: boolean
   pause_between_sentences: boolean
   temperature_enabled: boolean
-  custom_settings_def: { id: string; label: string; name: string; type: string }[] | null
+  custom_settings_def: {
+    id: string
+    label: string
+    name: string
+    type: string
+    default?: string | number | boolean
+    choices?: [string, string | number | boolean][]
+  }[] | null
   music3_structured_caption?: boolean
   music_caption_label?: string
   music_caption_help?: string
@@ -1176,7 +1441,29 @@ export interface SystemConfig {
   // Maestro release version (repo-root VERSION file), shown next to the
   // app title. Optional: older backends don't send it.
   app_version?: string
+  /** Saved process-wide MMGP package choice; switching it requires restart. */
+  memory_runtime?: 'legacy' | 'wangp9905'
+  saved_runtime?: 'legacy' | 'wangp9905'
+  active_runtime?: 'legacy' | 'wangp9905' | null
+  selected_label?: string
+  active_label?: string
+  restart_required?: boolean
+  experimental_runtime_selectable?: boolean
+  experimental_runtime_capability_reason?: string | null
+  profile0_native_available?: boolean
+  profile0_native_abi_verified?: boolean
+  profile0_native_validation_reason?: string | null
+  profile0_ram_native_available?: boolean
+  profile0_capability_reason?: string | null
+  profile0_ram_capability_reason?: string | null
+  profile0_saved_configuration_eligible?: boolean
+  fish_supported?: boolean
+  fish_limitation?: string | null
+  active_fish_supported?: boolean | null
+  active_fish_limitation?: string | null
   attention_mode: string
+  sagegp_first_step_precise?: boolean
+  inputs_chunker?: 'off' | 'auto' | 'on' | 'extreme'
   transformer_quantization: string
   vae_config: number
   compile: string
@@ -1272,6 +1559,13 @@ export interface OutputProcessingInfo {
 
 export interface OutputMetadata {
   model_details?: {
+    speech_generation?: {
+      status?: string
+      total_chunks?: number
+      completed_chunks?: number
+      incomplete?: boolean
+      warnings?: string[]
+    }
     architecture?: string
     sample_rate?: number
     channels?: number
@@ -1357,7 +1651,7 @@ export interface MultiClip {
   durationFrames?: number
 }
 
-export type SettingsTab = 'performance' | 'integrations' | 'notifications'
+export type SettingsTab = 'performance' | 'integrations' | 'notifications' | 'agent-access'
 
 export interface ServicesConfig {
   llm_model_id: string
@@ -1391,6 +1685,8 @@ export interface ServicesConfig {
    *  enhancer config; the Edit mode picker hides Inpaint. LTX Voice
    *  Reference is a separate opt-in under Video Frames → Advanced. */
   show_experimental: boolean
+  /** Separate opt-in for the experimental Worlds workspace. Default off. */
+  worlds_enabled?: boolean
   /** Storage Manager opt-in: allow removing duplicate files FROM linked
    *  installs (Recycle Bin only). Default off — informed consent. */
   storage_allow_linked_removal?: boolean
@@ -1413,6 +1709,7 @@ export interface ServicesConfig {
   /** FlashVSR (DiT super-resolution) spatial-upsampling settings.
    *  flashvsr_mode: 1=tiny, 2=full, 3=tiny-long. topk_ratio 0..4 (sparse-attn
    *  density). backend: 'auto' | 'triton_sparse' | 'sparge'. */
+  flashvsr_model?: 'v1_1' | 'plus_turbo'
   flashvsr_mode: number
   flashvsr_topk_ratio: number
   flashvsr_backend: string
@@ -1610,6 +1907,8 @@ export interface LoraRecommendedWeights {
 
 export interface LoraInfo {
   filename: string
+  /** Technical acceleration label for list filtering, not compatibility. */
+  is_acceleration?: boolean
   /** Resolved user-facing name: explicit override, site/guide metadata, or file stem. */
   display_name?: string
   /** Explicit user alias, or null when the automatic name is in use. */
@@ -1934,6 +2233,7 @@ export interface PipelineClipState {
   keyframe_filenames: string[]
   video_filename: string | null
   video_stale?: boolean
+  shot_reference_cast?: string[] | null
   tag: 'good' | 'needs_work' | null
   image_gen_time_sec: number | null
   video_gen_time_sec: number | null
@@ -1999,6 +2299,7 @@ export interface SavedPipelineState {
   generated_reference_image_filename?: string | null
   character_ref_paths?: string[]
   location_ref_paths?: string[]
+  shot_cast_options?: { id: string; label: string }[]
   auto_mode: boolean
   seamless: boolean
   image_model: string

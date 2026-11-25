@@ -215,6 +215,29 @@ class Flux3RuntimeTests(unittest.TestCase):
         self.assertEqual(callback_steps, [0])
         self.assertEqual(cancelling_dit.calls, 1)
 
+    def test_flow_map_sampler_expands_lora_multipliers_and_selects_each_step(self):
+        from shared.utils.loras_mutipliers import parse_loras_multipliers
+
+        packed = Packed(
+            data={"image": torch.zeros((1, 128))},
+            ids={"image": torch.zeros((1, 4))},
+            timesteps={"image": torch.zeros((1,), dtype=torch.bfloat16)},
+            mode_indices={"image": [(0, 1)], "image_cond": [(0, 0)], "text": [(0, 0)]},
+        )
+        _, loras_slists, error = parse_loras_multipliers(["0.25,0.75"], 1, 2, nb_phases=1)
+        self.assertEqual(error, "")
+        activate_loras = Mock()
+        set_step = Mock()
+        with patch.dict(sys.modules, {"mmgp": mmgp_stub}):
+            with patch.object(mmgp_stub.offload, "activate_loras", activate_loras, create=True), \
+                    patch.object(mmgp_stub.offload, "set_step_no_for_lora", set_step, create=True):
+                denoise_flow_map(
+                    _ConstantDiT(), packed, torch.tensor([1.0, 0.5, 0.0]), loras_slists=loras_slists,
+                )
+
+        self.assertEqual(activate_loras.call_args.args[1:], (["0"], [[0.25, 0.75]]))
+        self.assertEqual([call.args[1] for call in set_step.call_args_list], [0, 1])
+
     def test_default_flow_map_schedule_has_sixteen_steps(self):
         schedule = timesteps()
         self.assertEqual(len(schedule) - 1, DEFAULT_STEPS)
@@ -376,6 +399,34 @@ class Flux3RuntimeTests(unittest.TestCase):
         self.assertEqual(callback_calls[0][0], (-1, None, True))
         self.assertEqual(callback_calls[0][1]["override_num_inference_steps"], 6)
         self.assertEqual([call[0][0] for call in callback_calls[1:]], list(range(6)))
+
+    def test_image_generate_ignores_stale_music_model_mode_values(self):
+        for model_mode in (0, 2):
+            with self.subTest(model_mode=model_mode):
+                runtime = _runtime_for_cpu_test()
+                with patch.object(runtime_module, "encode_prompt",
+                                  return_value=(torch.zeros((1, 20480)), torch.zeros((1, 4)))) as encode:
+                    output = runtime_module.model_factory.generate(
+                        runtime, input_prompt="A red kite", sampling_steps=1,
+                        width=64, height=64, image_mode=1, model_mode=model_mode,
+                    )
+
+                self.assertEqual(tuple(output.shape), (3, 1, 64, 64))
+                self.assertEqual(len(runtime.vae.decoded_ids), 1)
+                encode.assert_called_once()
+
+    def test_video_and_masked_image_modes_are_rejected_before_runtime_work(self):
+        for image_mode in (0, 2, "0", "2"):
+            with self.subTest(image_mode=image_mode):
+                runtime = _runtime_for_cpu_test()
+                with patch.object(runtime_module, "encode_prompt") as encode:
+                    with self.assertRaisesRegex(ValueError, "Image Generate only"):
+                        runtime_module.model_factory.generate(
+                            runtime, input_prompt="A red kite", image_mode=image_mode,
+                        )
+
+                encode.assert_not_called()
+                self.assertEqual(runtime.vae.decoded_ids, [])
 
     def test_nonpositive_steps_are_rejected_before_runtime_work(self):
         runtime = _runtime_for_cpu_test()

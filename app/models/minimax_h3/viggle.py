@@ -9,7 +9,9 @@ import math
 import os
 
 ARCHITECTURE = "viggle_animate"
-REVISION = "fa7ed035f21d341439d4dd763a020fc4a2482c43"
+# The Hub consolidated its history; the old fa7ed... revision now returns 404.
+# INT8 transformer and fixed-conditioning LFS identities are unchanged.
+REVISION = "630975da14fd3c84169d6cd5092da3ce1287d137"
 REPO = "DeepBeepMeep/MiniMax-H3"
 PROMPT_FILE = "viggle_animate_fixed_prompt.safetensors"
 PROMPT_PATH = os.path.join("viggle_animate", PROMPT_FILE)
@@ -197,7 +199,7 @@ def prepare_window_references(input_frames, edited_images, history_count, frame_
     image = _tensor_to_pil(edited_images[0])
     if image is None:
         raise ValueError("The Viggle edited frame is not a readable image.")
-    image = prepare_keyframe_image(image, height, width, stretch=True)
+    image = prepare_keyframe_image(image, height, width)
     pixels = _window_pixels(video, history_count, frame_num, height, width)
     return [MiniMaxH3PreparedReference(kind="video", frames=pixels),
             MiniMaxH3PreparedReference(kind="image", image=image)]

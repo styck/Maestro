@@ -11,9 +11,15 @@ TURBO_PROFILE = "qwen21_turbo"
 TURBO_LABEL = "Qwen-Image-2.1-Turbo (8 steps)"
 REPO = "DeepBeepMeep/Qwen_image_2"
 ENCODER_FOLDER = "Qwen3-VL-8B-Instruct"
-# Complete Transformers 4.57-compatible processor export before the upstream
-# folder was removed and its legacy tokenizer files renamed in Ideogram4.
-PROCESSOR_REVISION = "55ab7995df218d8f759c6c283ef4c3be66111345"
+PROCESSOR_REPO = "DeepBeepMeep/Ideogram4"
+# The legacy files at this revision retain the Transformers 4.57-compatible
+# processor metadata used by the Qwen Image 2.1 runtime.
+PROCESSOR_REVISION = "a531af16b9cb570479356dae9e3f4a721adc3b7f"
+PROCESSOR_FILE_NAME_MAP = {
+    "config.json": "config_legacy.json",
+    "tokenizer.json": "tokenizer_legacy.json",
+    "tokenizer_config.json": "tokenizer_config_legacy.json",
+}
 
 _VIGGLE_PROFILES = {
     "viggle_v01": {
@@ -210,8 +216,9 @@ class family_handler:
                 "label": "KV Cache",
                 "type": "dropdown",
                 "default": "Disabled",
-                "choices": [("Disabled (lower VRAM)", "Disabled"), ("Enabled (faster denoising)", "Enabled")],
-                "info": "Enabled retains reference K/V during denoising when the safe memory estimate permits it. It remains disabled for scheduled LoRA changes.",
+                "choices": [("Disabled (recompute prefix)", "Disabled"), ("Enabled (16-bit cache)", "Enabled"),
+                            ("INT8 cache in VRAM", "INT8"), ("INT8 cache in RAM (lower VRAM)", "INT8_RAM")],
+                "info": "Reuse text/reference K/V between steps. INT8 reduces cache storage with a small precision tradeoff; RAM storage adds transfers. Conservative GPU/RAM guards may recompute the prefix instead. Scheduled LoRA changes disable caching. Output dimensions and references are preserved.",
             }],
             "inpaint_support": True,
             "inpaint_video_prompt_type": "VAG",
@@ -284,7 +291,7 @@ class family_handler:
             "sourceFolderList": ["qwen_image_21"],
             "fileList": [["qwen_image_21_vae.safetensors"]],
         }, {
-            "repoId": REPO,
+            "repoId": PROCESSOR_REPO,
             "revision": PROCESSOR_REVISION,
             "sourceFolderList": [ENCODER_FOLDER],
             "fileList": [
@@ -292,6 +299,7 @@ class family_handler:
                  "preprocessor_config.json", "special_tokens_map.json", "tokenizer.json",
                  "tokenizer_config.json", "video_preprocessor_config.json", "vocab.json"],
             ],
+            "fileNameMap": dict(PROCESSOR_FILE_NAME_MAP),
         }]
 
     @staticmethod

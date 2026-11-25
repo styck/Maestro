@@ -8,12 +8,14 @@ Runs on CPU by default to avoid VRAM conflicts with WanGP.
 import os
 import gc
 import time
+import copy
 import subprocess
 import threading
 import logging
 import requests
 from contextlib import contextmanager
 from typing import Optional
+from urllib.parse import urlparse
 
 from services.text_integrity import repair_text
 from promptbench.trace import traced, record_payload, record_metrics, record_response
@@ -23,7 +25,7 @@ from services.dialogue_timing import (
 )
 from services.h3_story_ledger import normalize_h3_dialogue_tags
 from services.h3_performance_audio import (
-    PERFORMANCE_AUDIO_GUIDANCE,
+    performance_audio_guidance,
     enforce_h3_performance_audio,
     has_h3_performance_audio,
 )
@@ -287,6 +289,16 @@ def _build_size_hint(info: dict) -> str:
 # size_hint is built automatically from weights_gb + mmproj_gb + KV-cache
 # estimate at module load (see post-loop below).
 MODEL_REGISTRY = {
+    "ghost-actual/Inkling-2-Mini-Uncensored-GGUF": {
+        "label": "Inkling 2 Mini Uncensored (Experimental)",
+        "gguf_file": "Inkling-2-Mini-Uncensored-Q4_K_M.gguf",
+        "mmproj_file": "mmproj-Inkling-2-Mini-Uncensored-BF16.gguf",
+        "hf_revision": "0bda4a29da46d88be396aa0d1948c0626a9ec313",
+        "weights_gb": 16.28, "mmproj_gb": 0.60, "arch": "inkling2-loop",
+        "llama_min_tag": "b12651",
+        "thinking_style": "inkling",
+        "extra_flags": ["-c", "32768", "-np", "1", "-ub", "16", "--no-op-offload"],
+    },
     "unsloth/Qwen3.5-2B-GGUF": {
         "label": "Qwen3.5 2B (Fast)",
         "gguf_file": "Qwen3.5-2B-Q4_K_S.gguf",
@@ -300,8 +312,12 @@ MODEL_REGISTRY = {
     "mradermacher/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated-i1-GGUF": {
         "label": "Qwen3.5 9B Claude Opus Abliterated Q6_K",
         "gguf_file": "Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated.i1-Q6_K.gguf",
-        "mmproj_file": "mmproj-Q8_0.gguf",
-        "weights_gb": 6.85, "mmproj_gb": 0.58, "arch": "qwen3-9b",
+        # The weighted/i1 repo omits its projector; use the same model's
+        # static-quant sibling, which publishes the Q8_0 multimodal supplement.
+        "mmproj_file": "Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated.mmproj-Q8_0.gguf",
+        "mmproj_repo": "mradermacher/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated-GGUF",
+        "mmproj_cache_aliases": ["mmproj-Q8_0.gguf"],
+        "weights_gb": 6.85, "mmproj_gb": 0.624, "arch": "qwen3-9b",
         "cache_dir_override": "Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated",
         "extra_flags": [
             "-c", "65536",
@@ -416,9 +432,10 @@ MODEL_REGISTRY = {
     "Nesuwka/gemma-4-E2B-it-heretic-ara-Q4_K_M-GGUF": {
         "label": "Gemma 4 2B Heretic Uncensored (Vision, Tiny)",
         "gguf_file": "model-q4_k_m.gguf",
-        "mmproj_file": "mmproj-gemma-4-e2b-it-f16.gguf",
+        "mmproj_file": "mmproj-gemma-4-E2B-it-BF16.gguf",
         "mmproj_repo": "ggml-org/gemma-4-E2B-it-GGUF",
-        "weights_gb": 3.4, "mmproj_gb": 1.0, "arch": "gemma4-2b",
+        "mmproj_cache_aliases": ["mmproj-gemma-4-e2b-it-f16.gguf"],
+        "weights_gb": 3.4, "mmproj_gb": 0.987, "arch": "gemma4-2b",
         "thinking_style": "gemma",
         # Gemma 4 was tuned at temp=1.0; running below that leaves it
         # more deterministic than its sweet spot. frequency/presence
@@ -561,9 +578,10 @@ MODEL_REGISTRY = {
     "paperscarecrow/Gemma-4-31B-it-abliterated-gguf": {
         "label": "Gemma 4 31B Abliterated Q4_K_M (Vision)",
         "gguf_file": "gemma-4-31b-abliterated-Q4_K_M.gguf",
-        "mmproj_file": "mmproj-gemma-4-31B-it-f16.gguf",
+        "mmproj_file": "mmproj-gemma-4-31B-it-BF16.gguf",
         "mmproj_repo": "ggml-org/gemma-4-31B-it-GGUF",  # mmproj from official repo
-        "weights_gb": 17.4, "mmproj_gb": 1.12, "arch": "gemma4-27b",
+        "mmproj_cache_aliases": ["mmproj-gemma-4-31B-it-f16.gguf"],
+        "weights_gb": 17.4, "mmproj_gb": 1.2, "arch": "gemma4-27b",
         "thinking_style": "gemma",
         "sampling_defaults": {
             "temperature": 1.0, "top_p": 0.95, "top_k": 64,
@@ -644,6 +662,7 @@ _PUBLIC_MODEL_ORDER = [
     "Abhiray/gemma-4-E4B-it-heretic-GGUF",                         # default (Recommended)
     "Jiunsong/supergemma4-26b-uncensored-gguf-v2",
     "paperscarecrow/Gemma-4-31B-it-abliterated-gguf",
+    "ghost-actual/Inkling-2-Mini-Uncensored-GGUF",
 ]
 
 
@@ -755,6 +774,47 @@ _OPENAI_CHAT_FIELDS = frozenset({
 })
 
 
+def _openai_structured_response_format(json_schema: Optional[dict]) -> Optional[dict]:
+    """Build the OpenAI-compatible strict format for supported object schemas."""
+
+    if not isinstance(json_schema, dict) or json_schema.get("type") != "object":
+        return None
+    schema = copy.deepcopy(json_schema)
+
+    def compatible(node: object) -> bool:
+        if isinstance(node, dict):
+            node.pop("uniqueItems", None)
+            node_type = node.get("type")
+            if node_type == "object" or (
+                isinstance(node_type, list) and "object" in node_type
+            ):
+                properties = node.get("properties", {})
+                if not isinstance(properties, dict):
+                    return False
+                required = node.get("required", [])
+                if (
+                    not isinstance(required, list)
+                    or set(required) != set(properties)
+                    or node.get("additionalProperties") is not False
+                ):
+                    return False
+            return all(compatible(value) for value in node.values())
+        if isinstance(node, list):
+            return all(compatible(value) for value in node)
+        return True
+
+    if not compatible(schema):
+        return None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "maestro_response",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
 def _finalize_payload(payload: dict) -> dict:
     """Translate Maestro's llama.cpp request into OpenAI-compatible form.
 
@@ -766,16 +826,32 @@ def _finalize_payload(payload: dict) -> dict:
 
     if _provider not in ("remote", "openai"):
         return record_payload(payload, model_id=_model_id, command=getattr(_process, "args", None))
+    try:
+        endpoint_host = (urlparse(str(_remote_url or "")).hostname or "").lower()
+    except (TypeError, ValueError):
+        endpoint_host = ""
+    provider_unsupported_fields = set()
+    if (
+        endpoint_host == "generativelanguage.googleapis.com"
+        or endpoint_host == "aiplatform.googleapis.com"
+        or endpoint_host.endswith(".aiplatform.googleapis.com")
+    ):
+        # Google's OpenAI-compatible Gemini endpoint does not accept these
+        # optional OpenAI sampler fields. Keep them for other compatible
+        # endpoints, which may support the controls.
+        provider_unsupported_fields.update(
+            ("frequency_penalty", "presence_penalty")
+        )
     prepared = {
         key: value
         for key, value in payload.items()
-        if key in _OPENAI_CHAT_FIELDS
+        if key in _OPENAI_CHAT_FIELDS and key not in provider_unsupported_fields
     }
     dropped = sorted(set(payload) - set(prepared))
     if dropped:
         print(
-            f"[LLM] Dropped {len(dropped)} llama.cpp-only field(s) not "
-            f"accepted by provider={_provider}: {', '.join(dropped)}"
+            f"[LLM] Dropped {len(dropped)} request field(s) not accepted "
+            f"by provider={_provider}: {', '.join(dropped)}"
         )
     prepared["model"] = _model_id
     return record_payload(prepared, model_id=_model_id)
@@ -1074,8 +1150,8 @@ def _apply_reasoning_controls(
     per-request ceiling; Maestro's existing ``max_tokens`` allowance remains
     large enough to hold both the reasoning and the requested answer.
 
-    Structured-output callers force ``enable_thinking=False`` before reaching
-    this helper, so they never receive a reasoning tier or thinking budget.
+    Structured-output callers pass ``enable_thinking=False``. Inkling's
+    template receives its zero-effort tier, while Qwen gets no tier or budget.
     """
 
     template_kwargs = dict(payload.get("chat_template_kwargs") or {})
@@ -1085,6 +1161,16 @@ def _apply_reasoning_controls(
 
     entry = _active_registry_entry()
     resolved_effort: Optional[str] = None
+    if _provider == "local" and entry.get("thinking_style") == "inkling":
+        resolved_effort = (reasoning_effort or "medium") if enable_thinking else "none"
+        payload["reasoning_effort"] = resolved_effort
+        template_kwargs["reasoning_effort"] = resolved_effort
+        if enable_thinking and thinking_budget > 0:
+            payload["thinking_budget_tokens"] = int(thinking_budget)
+        elif "max_tokens" in payload:
+            # Inkling may still reason at effort zero. Reserving space lets
+            # short structured answers finish without forcing empty thoughts.
+            payload["max_tokens"] += 192
     if enable_thinking is True and entry.get("thinking_style", "qwen") == "qwen":
         resolved_effort = str(
             reasoning_effort or entry.get("default_reasoning_effort") or ""
@@ -1231,7 +1317,7 @@ def get_status() -> dict:
     }
 
 
-def _download_gguf(repo_id: str, filename: str, cache_dir: str) -> str:
+def _download_gguf(repo_id: str, filename: str, cache_dir: str, *, revision=None) -> str:
     """Download a GGUF file from HuggingFace and return the local path."""
     local_path = os.path.join(cache_dir, filename)
     if os.path.isfile(local_path):
@@ -1244,9 +1330,26 @@ def _download_gguf(repo_id: str, filename: str, cache_dir: str) -> str:
         repo_id=repo_id,
         filename=filename,
         local_dir=cache_dir,
+        revision=revision,
     )
     print(f"[LLM] Downloaded to: {downloaded}")
     return downloaded
+
+
+def _resolve_mmproj(repo_id: str, registry_entry: dict, cache_dir: str) -> tuple[str, str]:
+    """Reuse a renamed cached projector or download the registered file."""
+    mmproj_file = registry_entry.get("mmproj_file", DEFAULT_MMPROJ_FILE)
+    mmproj_repo = registry_entry.get("mmproj_repo", repo_id)
+
+    for alias in registry_entry.get("mmproj_cache_aliases", []):
+        cached = os.path.join(cache_dir, alias)
+        if os.path.isfile(cached) and os.path.getsize(cached) > 0:
+            return os.path.normpath(cached), mmproj_repo
+
+    revision = registry_entry.get("hf_revision") if mmproj_repo == repo_id else None
+    download_options = {"revision": revision} if revision else {}
+    mmproj_path = _download_gguf(mmproj_repo, mmproj_file, cache_dir, **download_options)
+    return os.path.normpath(mmproj_path), mmproj_repo
 
 
 # Minimum llama.cpp build Maestro requires. Builds below this lack correct
@@ -1280,7 +1383,10 @@ def _positive_llama_build(value: str):
 
     import re
 
-    match = re.search(r"version:\s*b?(\d+)\b", str(value or ""), re.IGNORECASE)
+    text = str(value or "")
+    match = re.search(r"^version:.*?\(build\s+b?(\d+)\b", text, re.IGNORECASE | re.MULTILINE)
+    if not match:
+        match = re.search(r"^version:\s*b?(\d+)(?:\s|$)", text, re.IGNORECASE | re.MULTILINE)
     if not match:
         return None
     build = int(match.group(1))
@@ -1299,7 +1405,7 @@ def _llama_release_build(tag: str):
     return build if build > 0 else None
 
 
-def _llama_release_has_assets(release_info: dict, asset_specs) -> bool:
+def _llama_release_has_assets(release_info: dict, asset_specs, minimum_build=MIN_LLAMA_BUILD) -> bool:
     """Return whether a release is a new-enough binary ``bNNNN`` build.
 
     llama.cpp's stable releases are now lightweight version pointers (for
@@ -1312,7 +1418,7 @@ def _llama_release_has_assets(release_info: dict, asset_specs) -> bool:
     if not isinstance(release_info, dict):
         return False
     build = _llama_release_build(release_info.get("tag_name", ""))
-    if build is None or build < MIN_LLAMA_BUILD:
+    if build is None or build < minimum_build:
         return False
 
     assets = release_info.get("assets", [])
@@ -1480,7 +1586,7 @@ def _llama_server_build(exe_path: str):
     return None
 
 
-def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
+def _ensure_llama_server(bin_dir: str, device: str = "cpu", *, minimum_tag=None) -> None:
     """Auto-download llama-server from llama.cpp GitHub releases if missing.
 
     Picks the appropriate prebuilt binary for the current platform:
@@ -1498,7 +1604,8 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
 
     Side effect: writes binaries to bin_dir/. Idempotent — exits early
     if a new-enough exe already exists; re-downloads the latest if the
-    installed build is older than MIN_LLAMA_BUILD.
+    installed build is older than the required runtime, including any
+    higher model-specific floor.
     """
     import sys
     import json
@@ -1511,6 +1618,8 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
     is_windows = sys.platform.startswith("win")
     is_linux = sys.platform.startswith("linux")
     linux_cuda = is_linux and device == "cuda"
+    fallback_tag = minimum_tag or FALLBACK_LLAMA_TAG
+    minimum_build = _llama_release_build(minimum_tag) or MIN_LLAMA_BUILD
     exe_name = "llama-server.exe" if is_windows else "llama-server"
     exe_path = os.path.join(bin_dir, exe_name)
     exe_exists = os.path.isfile(exe_path)
@@ -1532,10 +1641,13 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
 
     known_build = reported_build or receipt_build
     needs_executable = not exe_exists or broken_libraries
-    if exe_exists and known_build is not None and known_build < MIN_LLAMA_BUILD:
+    if exe_exists and (
+        (known_build is not None and known_build < minimum_build)
+        or (known_build is None and minimum_tag is not None)
+    ):
         needs_executable = True
         print(
-            f"[LLM] llama-server build {known_build} < required {MIN_LLAMA_BUILD}; "
+            f"[LLM] llama-server build {known_build or 'unknown'} requires {minimum_build} or newer; "
             "upgrading to the latest llama.cpp release."
         )
 
@@ -1624,7 +1736,7 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
     else:
         print("[LLM] Resolving the latest compatible llama.cpp release...")
     release_info = None
-    tag = FALLBACK_LLAMA_TAG
+    tag = fallback_tag
 
     def _github_json(url: str) -> dict:
         req = Request(
@@ -1642,9 +1754,9 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
         latest_release = _github_json(
             "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
         )
-        if _llama_release_has_assets(latest_release, asset_specs):
+        if _llama_release_has_assets(latest_release, asset_specs, minimum_build):
             release_info = latest_release
-            tag = str(release_info.get("tag_name", FALLBACK_LLAMA_TAG))
+            tag = str(release_info.get("tag_name", fallback_tag))
         else:
             pointer_url = _llama_nightly_pointer_url(latest_release)
             if not pointer_url:
@@ -1658,7 +1770,7 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
             with urlopen(pointer_request, timeout=15) as response:
                 nightly_tag = response.read(64).decode("utf-8", errors="replace").strip()
             nightly_build = _llama_release_build(nightly_tag)
-            if nightly_build is None or nightly_build < MIN_LLAMA_BUILD:
+            if nightly_build is None or nightly_build < minimum_build:
                 raise RuntimeError(
                     f"nightly pointer returned incompatible tag {nightly_tag!r}"
                 )
@@ -1666,7 +1778,7 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
                 "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/"
                 f"{quote(nightly_tag, safe='')}"
             )
-            if not _llama_release_has_assets(candidate, asset_specs):
+            if not _llama_release_has_assets(candidate, asset_specs, minimum_build):
                 raise RuntimeError(
                     f"nightly release {nightly_tag} lacks the required platform assets"
                 )
@@ -1687,9 +1799,9 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
         print(
             f"[LLM] Could not resolve a compatible current llama.cpp binary ({e}); "
             "falling back to pinned tag "
-            f"{FALLBACK_LLAMA_TAG}"
+            f"{fallback_tag}"
         )
-        tag = FALLBACK_LLAMA_TAG
+        tag = fallback_tag
         release_info = None
 
     if linux_cuda:
@@ -1787,7 +1899,7 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
     print(f"[LLM] llama-server installed to {exe_path}")
 
 
-def _get_server_exe(device: str = "cpu") -> str:
+def _get_server_exe(device: str = "cpu", *, minimum_tag=None) -> str:
     """Find the llama-server executable, downloading it on first use if missing.
 
     Lazy-download pattern matches the model-weights flow: nothing is
@@ -1796,7 +1908,8 @@ def _get_server_exe(device: str = "cpu") -> str:
     subsequent loads are instant.
     """
     bin_dir = os.path.abspath(os.environ.get("MAESTRO_LLAMA_BIN", DEFAULT_BIN_DIR))
-    _ensure_llama_server(bin_dir, device=device)
+    runtime_options = {"minimum_tag": minimum_tag} if minimum_tag else {}
+    _ensure_llama_server(bin_dir, device=device, **runtime_options)
     if os.name == "nt":
         return os.path.join(bin_dir, "llama-server.exe")
     return os.path.join(bin_dir, "llama-server")
@@ -1959,7 +2072,9 @@ def load_model(
         print(f"[LLM] Loading model: {repo_id} on {device}")
 
         # Detect CPU-only/missing CUDA runtimes before downloading large weights.
-        server_exe = _get_server_exe(device=device)
+        minimum_tag = registry_entry.get("llama_min_tag")
+        runtime_options = {"minimum_tag": minimum_tag} if minimum_tag else {}
+        server_exe = _get_server_exe(device=device, **runtime_options)
         if mtp_active:
             _check_mtp_runtime_capability(server_exe)
         cuda_devices = []
@@ -1983,23 +2098,17 @@ def load_model(
         cache_dir = os.path.join(base_cache_dir, dir_override or model_stem)
         os.makedirs(cache_dir, exist_ok=True)
 
-        gguf_path = _download_gguf(repo_id, gguf_file, cache_dir)
+        revision = registry_entry.get("hf_revision")
+        download_options = {"revision": revision} if revision else {}
+        gguf_path = _download_gguf(repo_id, gguf_file, cache_dir, **download_options)
         gguf_path = os.path.normpath(gguf_path)
 
         # Try to download mmproj for vision support (optional — not all models have it)
-        mmproj_file = registry_entry.get("mmproj_file", DEFAULT_MMPROJ_FILE)
-        mmproj_repo = registry_entry.get("mmproj_repo", repo_id)  # allow mmproj from different repo
         mmproj_path = None
         try:
-            # Reuse an already downloaded projector after an upstream rename.
-            for alias in registry_entry.get("mmproj_cache_aliases", []):
-                cached = os.path.join(cache_dir, alias)
-                if os.path.isfile(cached) and os.path.getsize(cached) > 0:
-                    mmproj_path = cached
-                    break
-            if mmproj_path is None:
-                mmproj_path = _download_gguf(mmproj_repo, mmproj_file, cache_dir)
-            mmproj_path = os.path.normpath(mmproj_path)
+            mmproj_path, mmproj_repo = _resolve_mmproj(
+                repo_id, registry_entry, cache_dir
+            )
             print(f"[LLM] Vision support: mmproj loaded from {mmproj_repo}")
         except Exception as e:
             print(f"[LLM] No mmproj available (vision disabled): {e}")
@@ -2562,6 +2671,7 @@ def generate(
     presence_penalty: float = 0.0,
     stop: Optional[list[str]] = None,
     json_schema: Optional[dict] = None,
+    remote_json_schema: bool = False,
 ) -> str:
     """Generate text via llama-server's OpenAI-compatible chat endpoint.
 
@@ -2575,11 +2685,12 @@ def generate(
             --jinja chat template. If None, uses model default (thinking on).
         reasoning_effort: Optional Qwen3.8 reasoning tier. When omitted,
             registered Qwen3.8 creative calls use ``xhigh``.
-        json_schema: Optional JSON Schema dict. When set (local llama-server
-            only), the output is grammar-constrained to schema-valid JSON —
-            the sampler masks every token that would break the schema, so
-            the model physically cannot emit prose, markdown fences, or the
-            repeat-loop garbage that breaks structured planning passes.
+        json_schema: Optional JSON Schema dict. Local llama-server uses its
+            grammar extension. Remote/OpenAI providers receive strict JSON
+            Schema only when ``remote_json_schema`` is explicitly enabled.
+        remote_json_schema: Opt in to the OpenAI-compatible strict format for
+            a known remote planning call; other remote callers retain the
+            historical unconstrained behavior.
     """
     global _stream_buffer, _stream_done, _last_system_prompt, _last_user_prompt
     global _last_thinking_text, _last_generation_metrics
@@ -2593,7 +2704,7 @@ def generate(
             image_paths=image_paths, thinking_budget=thinking_budget,
             enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
             frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
-            json_schema=json_schema, stop=stop,
+            json_schema=json_schema, remote_json_schema=remote_json_schema, stop=stop,
         )
 
     if not is_loaded():
@@ -2684,16 +2795,23 @@ def generate(
     if combined_stop:
         payload["stop"] = combined_stop
 
-    # Grammar-constrained JSON output. llama-server compiles the schema to
-    # a GBNF grammar server-side ({"type": "json_object", "schema": ...} is
-    # the long-standing llama.cpp extension form). Local provider only —
-    # remote OpenAI-compatible endpoints vary in which response_format
-    # flavor they accept, so we degrade to an unconstrained call there.
+    # Use llama.cpp's native grammar form locally. Remote OpenAI-compatible
+    # endpoints receive strict JSON Schema only for explicit opt-in callers.
     if json_schema is not None:
         if _provider == "local":
             payload["response_format"] = {"type": "json_object", "schema": json_schema}
+        elif _provider in ("remote", "openai") and remote_json_schema:
+            response_format = _openai_structured_response_format(json_schema)
+            if response_format is not None:
+                payload["response_format"] = response_format
+                print(f"[LLM] Sending strict JSON Schema to provider={_provider}")
+            else:
+                print(
+                    f"[LLM] json_schema requested but provider={_provider} "
+                    "requires a compatible object-root schema; sending unconstrained"
+                )
         else:
-            print(f"[LLM] json_schema requested but provider={_provider} — sending unconstrained (grammar is local llama-server only)")
+            print(f"[LLM] json_schema requested but provider={_provider} is not opted into remote structured output")
 
     if _provider == "anthropic":
         return _generate_anthropic(messages, total_tokens, max(temperature, 0.01), top_p)
@@ -2722,8 +2840,8 @@ def generate(
     message = choice["message"]
     raw_content = message.get("content") or ""
     reasoning_content = message.get("reasoning_content") or ""
-    record_response(raw_content, reasoning_content)
     finish_reason = choice.get("finish_reason", "unknown")
+    record_response(raw_content, reasoning_content, complete=finish_reason == "stop")
     usage = data.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", "?")
     completion_tokens = usage.get("completion_tokens", "?")
@@ -2792,6 +2910,7 @@ def generate_streaming(
     presence_penalty: float = 0.0,
     json_schema: Optional[dict] = None,
     stop: Optional[list[str]] = None,
+    remote_json_schema: bool = False,
 ) -> str:
     """Generate text using SSE streaming, populating the stream buffer in real-time.
 
@@ -2802,9 +2921,11 @@ def generate_streaming(
         thinking_budget: Extra tokens reserved for model reasoning/thinking.
             Added on top of max_new_tokens so thinking doesn't eat into
             the content budget. Set to 0 to use max_new_tokens as-is.
-        json_schema: Optional JSON Schema dict — grammar-constrains the
-            output to schema-valid JSON on local llama-server. Forces
+        json_schema: Optional JSON Schema dict — uses local llama-server
+            grammar or remote strict JSON Schema for opted-in calls. Forces
             thinking OFF (see generate() for the rationale).
+        remote_json_schema: Opt in to the OpenAI-compatible strict format for
+            a known remote planning call.
     """
     global _stream_buffer, _stream_done, _last_system_prompt, _last_user_prompt, _last_thinking_text
     global _last_generation_metrics
@@ -2908,13 +3029,24 @@ def generate_streaming(
         existing = payload.get("stop") or []
         payload["stop"] = list(existing) + [t for t in stop_tokens if t not in existing]
 
-    # Grammar-constrained JSON output — local llama-server only (see the
-    # matching block in generate() for the full rationale).
+    # Structured JSON output. Local llama-server uses its native grammar;
+    # remote OpenAI-compatible endpoints receive strict JSON Schema only for
+    # compatible object-root schemas (see generate() above).
     if json_schema is not None:
         if _provider == "local":
             payload["response_format"] = {"type": "json_object", "schema": json_schema}
+        elif _provider in ("remote", "openai") and remote_json_schema:
+            response_format = _openai_structured_response_format(json_schema)
+            if response_format is not None:
+                payload["response_format"] = response_format
+                print(f"[LLM] Sending strict JSON Schema to provider={_provider}")
+            else:
+                print(
+                    f"[LLM] json_schema requested but provider={_provider} "
+                    "requires a compatible object-root schema; sending unconstrained"
+                )
         else:
-            print(f"[LLM] json_schema requested but provider={_provider} — sending unconstrained (grammar is local llama-server only)")
+            print(f"[LLM] json_schema requested but provider={_provider} is not opted into remote structured output")
 
     # Diagnostic — log every payload field except `messages` so we can
     # compare what Maestro sends to llama-server vs what LM Studio sends
@@ -3036,7 +3168,10 @@ def generate_streaming(
         raise
 
     finally:
-        record_response(raw_content, reasoning_content, complete=finish_reason not in {None, "unknown"})
+        # A streamed response is complete only when the provider stopped at
+        # a normal completion boundary. In particular, ``length`` means the
+        # writer hit its token ceiling and its retained text is only a draft.
+        record_response(raw_content, reasoning_content, complete=finish_reason == "stop")
         if "resp" in locals():
             from services.studio_enhancement import close_response
             close_response(resp)
@@ -3230,6 +3365,34 @@ def _generate_streaming_anthropic(messages: list, max_tokens: int, temperature: 
     return content.strip()
 
 
+def _enhance_dialogue_budget_instruction(prompt, budget, model_type="", window_count=1) -> str:
+    """Keep an automatic writing target from competing with an authored script."""
+    if not str(model_type or "").lower().startswith("minimax_h3"):
+        return budget.instruction()
+    lines = _extract_h3_quoted_dialogue(prompt)
+    if not lines:
+        return budget.instruction()
+    from services.dialogue_writing import spoken_word_count
+
+    count = sum(spoken_word_count(line) for line in lines)
+    duration_guidance = (
+        f"Distribute these lines chronologically across the {window_count} windows, never repeating "
+        f"a line in another window. Each window allows at most {budget.maximum} spoken words. "
+        if window_count and window_count > 1 else
+        f"The selected duration allows at most {budget.maximum} spoken words in total. "
+    )
+    return (
+        f"The user supplied {len(lines)} spoken lines containing {count} spoken words. "
+        "Preserve every supplied line verbatim, once, in its source order and beside its "
+        "requested action and speaker. Do not shorten, omit, or paraphrase a supplied line "
+        "to meet an automatic word-count target. "
+        + duration_guidance +
+        "Additional dialogue is allowed only where the brief explicitly requests an "
+        "unscripted turn and space remains after all supplied lines. Do not pad the script. "
+        "Preserve the requested action and pauses; do not invent faster delivery to make room."
+    )
+
+
 def _build_enhance_user_prompt(
     prompt,
     mode,
@@ -3247,6 +3410,8 @@ def _build_enhance_user_prompt(
     from services.adaptive_enhancement import normalize_writing_style
     planning_style = normalize_writing_style(planning_style)
     if mode == "image":
+        from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
         # The Studio split button also applies to still images. Carry the
         # choice through both guided and dedicated raw-enhancer paths.
         style_instruction = (
@@ -3260,7 +3425,8 @@ def _build_enhance_user_prompt(
         return (
             f"[{style_instruction} Preserve all explicit facts, identities, "
             "requested text, reference constraints and edit boundaries. "
-            f"Describe one still image, not a sequence.]\n\n{prompt}"
+            "Describe one still image, not a sequence. "
+            f"{IMAGE_STYLE_GUIDANCE}]\n\n{prompt}"
         )
     if planning_style == "adaptive":
         from services.adaptive_enhancement import adaptive_dialogue_expected, adaptive_dialogue_expansion_requested
@@ -3277,7 +3443,7 @@ def _build_enhance_user_prompt(
         if adaptive_dialogue_expansion_requested(prompt):
             budget = creative_dialogue_budget(prompt, window_size_seconds if window_count and window_count > 1 else duration_seconds)
             if budget:
-                context.append(budget.instruction())
+                context.append(_enhance_dialogue_budget_instruction(prompt, budget, model_type, window_count))
         elif adaptive_dialogue_expected(prompt):
             context.append("Preserve the supplied spoken lines beside their requested actions. Do not add or pad speech to fill the selected duration; develop the visual scene.")
         else:
@@ -3304,7 +3470,7 @@ def _build_enhance_user_prompt(
                 "\n[CREATIVE WRITING: Develop the requested scene and character interaction. "
                 "Preserve all explicit facts and quoted lines. Supporting dialogue may surround "
                 "those exact lines unless the user requests only them. Keep silent requests silent."
-                + (" For each window: " + budget.instruction() if budget else "") + "]"
+                + (" For each window: " + _enhance_dialogue_budget_instruction(prompt, budget, model_type, window_count) if budget else "") + "]"
             )
         if window_count and window_count > 1:
             if planning_style in {"creative", "adaptive"}:
@@ -3391,10 +3557,13 @@ def enhance_prompt(
     system_override: Optional[str] = None,
     tts_enhance_mode: Optional[str] = None,
     tts_voice_count: int = 2,
+    tts_writer_instructions: str = "",
+    tts_target_minutes: float = 0,
     lora_system_hint: str = "",
     raw_enhancer_mode: bool = False,
     reference_context: Optional[str] = None,
     planning_style: str = "faithful",
+    resolution: Optional[str] = None,
 ) -> str:
     # Repair legacy Windows/code-page damage before model-specific parsers
     # copy user-authored international text into an immutable prompt contract.
@@ -3414,8 +3583,22 @@ def enhance_prompt(
         and not is_h3_ref2va
     )
     is_h3_structured = is_h3_context_ir or is_h3_ref2va
+    if is_h3_structured:
+        # Keep offsets, admission, immutable dialogue and fallback compilation
+        # on the same normalized copy; the user's stored source stays intact.
+        prompt = normalize_h3_dialogue_tags(prompt)
     is_flux3_image = mode == "image" and (model_type or "").lower().startswith("flux3")
-    audio_driven = is_h3_ref2va and has_h3_performance_audio(reference_context)
+    from services.enhance_guides import is_minimax_h3_image_model
+    is_minimax_h3_image = mode == "image" and is_minimax_h3_image_model(model_type or "")
+    from services.enhance_guides import moss_image_enhancement_kind
+    moss_enhancement_kind = moss_image_enhancement_kind(model_type or "", mode)
+    is_moss_image_edit = moss_enhancement_kind == "edit"
+    is_moss_image = moss_enhancement_kind == "layout"
+    if is_moss_image or is_moss_image_edit or is_minimax_h3_image:
+        # These models have native image-writing guides. A dedicated raw
+        # enhancer bypasses those guides, so use the shared guided enhancer.
+        raw_enhancer_mode = False
+    audio_driven = is_h3_structured and has_h3_performance_audio(reference_context)
     needs_h3_dialogue = is_h3_structured and not audio_driven
     if needs_h3_dialogue:
         # The admission check also rejects clearly attributed, unterminated
@@ -3445,6 +3628,10 @@ def enhance_prompt(
         # Inject content guidance
         from services.director.nsfw_guidance import inject_content_guidance
         system = inject_content_guidance(system, nsfw, "enhance")
+        if mode == "image":
+            from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+            system = f"{system}\n\n{IMAGE_STYLE_GUIDANCE}"
         # Inject LoRA hints into system prompt
         if lora_system_hint:
             system = f"{system}\n\n{lora_system_hint}"
@@ -3492,10 +3679,44 @@ def enhance_prompt(
     # Dedicated per-model enhancer (e.g. Sulphur's uncensored enhancer): the
     # model is trained to enhance directly. Send the user's prompt (+ optional
     # image) with NO system prompt / guide and no thinking.
+    speech_writer_active = mode == "audio" and bool(tts_enhance_mode)
+    speech_target = None
+    speech_writer_instructions = ""
+    if speech_writer_active:
+        from services.speech_writer import (
+            bound_writer_instructions,
+            record_speech_writer_warning,
+            resolve_speech_target,
+        )
+
+        speech_target = resolve_speech_target(
+            prompt,
+            tts_target_minutes,
+            clip_duration_seconds=duration_seconds,
+        )
+        speech_writer_instructions, style_truncated = bound_writer_instructions(
+            tts_writer_instructions
+        )
+        if speech_target.capped:
+            record_speech_writer_warning(
+                "The requested speech runtime exceeded 60 minutes; the writer is capped at "
+                "approximately 7,800 words and the final runtime is only an estimate."
+            )
+        if style_truncated:
+            record_speech_writer_warning(
+                "Writer style instructions were limited to 8,000 characters."
+            )
+        # Raw fine-tuned enhancers return before the native TTS guide is
+        # selected. When the user asks for writer guidance or a sized script,
+        # route through the selected TTS model's own format contract instead.
+        if speech_writer_instructions or speech_target.words:
+            raw_enhancer_mode = False
+
     if raw_enhancer_mode:
         # The fine-tuned enhancer (a) doesn't reliably honor a "write N
-        # paragraphs" instruction and (b) likes to prepend a bogus "rendered
-        # in a 3D animation style" clause. Always run the style cleanup; and
+        # paragraphs" instruction and (b) can prepend a bogus video-style
+        # clause. Image requests retain their style wording; the legacy video
+        # cleanup must not strip an explicitly requested illustration/3D look.
         # when the user gave one line per window, enhance each window
         # independently and collapse it to a single paragraph — that makes the
         # output EXACTLY window_count paragraphs regardless of the model.
@@ -3519,7 +3740,7 @@ def enhance_prompt(
                     planning_style,
                 )
                 r = generate(prompt=w_prompt, image_paths=(image_paths if i == 0 else None), **gen_kw)
-                r = _clean_enhancer_output(r)
+                r = r.strip() if mode == "image" and r else _clean_enhancer_output(r)
                 r = " ".join(r.split()) if r else ln  # collapse to one paragraph
                 outs.append(r or ln)
             return repair_text("\n".join(outs))
@@ -3536,7 +3757,8 @@ def enhance_prompt(
         )
         print(f"[Enhance] Raw enhancer ({model_type}, images={bool(image_paths)}, windows={window_count})")
         result = generate(prompt=raw_prompt, image_paths=image_paths, **gen_kw)
-        return repair_text(_clean_enhancer_output(result) or prompt)
+        cleaned = result.strip() if mode == "image" and result else _clean_enhancer_output(result)
+        return repair_text(cleaned or prompt)
 
     adaptive_scripted_dialogue = False
     if planning_style == "adaptive" and needs_h3_dialogue:
@@ -3570,11 +3792,11 @@ def enhance_prompt(
                 "environment. Keep under 150 words. Output only the enhanced prompt."
             ),
             "image": (
-                "You are an expert photographer. Enhance the user's image prompt with "
-                "detailed descriptions of composition, lighting, colors, and mood. "
-                "The output is a STILL PHOTOGRAPH — describe static poses only, no motion verbs "
-                "(no walking, running, reaching, turning, dancing). "
-                "Keep under 150 words. Output only the enhanced prompt."
+                "You are an image prompt editor. Preserve the user's requested medium, "
+                "style, subjects, composition and exact visible text. Clarify useful "
+                "details within that style. A still image can depict an action pose. "
+                "Keep simple briefs concise and detailed briefs complete. "
+                "Output only the enhanced prompt."
             ),
             "audio": (
                 "You are an expert audio producer. Enhance the user's audio description "
@@ -3631,22 +3853,30 @@ def enhance_prompt(
                 # before falling back to the generic Qwen-style template.
                 system = model_specific_dialogue or TTS_QWEN3_DIALOGUE_PROMPT
             else:
-                # Multi-speaker (3-6): adapt the dialogue template. Both
-                # Scenema and Kugel cap at 2 voices, so this branch is for
-                # legacy TTS engines that support 3+ speakers (Qwen3-TTS et al).
-                system = (
-                    f"You are a creative dialogue writer for a text-to-speech model. "
-                    f"Write an engaging, natural conversation with exactly {voice_count} characters based on the user prompt.\n\n"
-                    f"Output rules:\n"
-                    f"- Output ONLY dialogue lines. No explanations, stage directions, or narration.\n"
-                    f"- Every line must start with a character name followed by a colon.\n"
-                    f"- Use exactly {voice_count} characters. Use names from the prompt, or invent fitting names.\n"
-                    f"- NO brackets, NO emotion tags, NO parenthetical directions.\n"
-                    f"- Write NATURAL, REALISTIC dialogue with interruptions, reactions, varied sentence lengths.\n"
-                    f"- Write a FULL conversation (20-40+ lines) unless the user specifies shorter.\n"
-                    f"- Use clear punctuation. Commas and periods create natural pauses.\n"
-                    f"- Make sure all {voice_count} characters participate meaningfully — don't let any character fade out.\n"
-                )
+                # Multi-speaker writing follows the model's own format when
+                # available (for example, Fish's speaker-reference syntax).
+                # Keep the names-and-colons fallback for engines without one.
+                if model_specific_dialogue:
+                    system = (
+                        model_specific_dialogue
+                        + f"\n\nEXACT SPEAKER COUNT: Write exactly {voice_count} distinct speakers. "
+                        "Use the speaker labels, voice references, and any tags required by this model's "
+                        "native format. Keep the same format throughout the complete dialogue."
+                    )
+                else:
+                    system = (
+                        f"You are a creative dialogue writer for a text-to-speech model. "
+                        f"Write an engaging, natural conversation with exactly {voice_count} characters based on the user prompt.\n\n"
+                        f"Output rules:\n"
+                        f"- Output ONLY dialogue lines. No explanations, stage directions, or narration.\n"
+                        f"- Every line must start with a character name followed by a colon.\n"
+                        f"- Use exactly {voice_count} characters. Use names from the prompt, or invent fitting names.\n"
+                        f"- NO brackets, NO emotion tags, NO parenthetical directions.\n"
+                        f"- Write NATURAL, REALISTIC dialogue with interruptions, reactions, varied sentence lengths.\n"
+                        f"- Write a FULL conversation (20-40+ lines) unless the user specifies shorter.\n"
+                        f"- Use clear punctuation. Commas and periods create natural pauses.\n"
+                        f"- Make sure all {voice_count} characters participate meaningfully — don't let any character fade out.\n"
+                    )
         else:
             # Monologue path. Model-specific prompt wins over the generic
             # TTS_MONOLOGUE_PROMPT (so Scenema speech rules get used).
@@ -3655,6 +3885,15 @@ def enhance_prompt(
         if model_specific_dialogue or model_specific_monologue:
             picked = "dialogue" if (tts_enhance_mode in ("dialogue", "dialogue_fast") and tts_voice_count == 2 and model_specific_dialogue) else ("monologue" if model_specific_monologue else "generic")
             print(f"[Enhance] Using model-specific {picked} prompt for {model_type}")
+
+    if speech_writer_active and speech_writer_instructions:
+        system += (
+            "\n\nUSER-REQUESTED WRITER STYLE (supplementary guidance):\n"
+            f"{speech_writer_instructions}\n\n"
+            "Use these notes to shape the script's personality, voice, tone, and storytelling style. "
+            "They do not change the model's required language, speaker count, speaker labels, voice "
+            "syntax, tags, or other output-format rules. Never include these instructions in the spoken script."
+        )
 
     # Inject NSFW enhance guidance when mature mode is on. Uses a SHARED,
     # VERSION-CONTROLLED guide (llm_guides/enhance/nsfw_shared.md) so it ships
@@ -3670,6 +3909,11 @@ def enhance_prompt(
         nsfw_block = _load_nsfw_guide("enhance", "nsfw_shared")
         if nsfw_block:
             system = f"{system}\n\n{nsfw_block}"
+
+    if mode == "image":
+        from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+        system = f"{system}\n\n{IMAGE_STYLE_GUIDANCE}"
 
     # Shared video-enhance rules — e.g. reference characters by a stable visual
     # appearance, not by name/relationship/pronoun (the model has no memory of
@@ -3697,11 +3941,20 @@ def enhance_prompt(
         model_type,
         planning_style,
     )
+    if speech_writer_active and speech_target and speech_target.words and not speech_target.is_long_form:
+        user_prompt += (
+            f"\n\nRequested spoken-script size: about {speech_target.words} words, "
+            f"or {speech_target.minutes:g} minutes at roughly 130 words per minute. "
+            "This is a runtime estimate, not a guaranteed audio duration. Do not mention the estimate in the script."
+        )
+    if is_moss_image:
+        from services.moss_image_prompt import enhancement_canvas_context
+        user_prompt = f"{enhancement_canvas_context(resolution)}\n\n{user_prompt}"
     if audio_driven:
         user_prompt = (
             f"Duration: {duration_seconds or 'the supplied audio duration'} seconds. "
             f"Write visual performance and camera direction for this brief:\n{prompt}\n\n"
-            + PERFORMANCE_AUDIO_GUIDANCE
+            + performance_audio_guidance(reference_context)
         )
 
     # Add image context
@@ -3722,6 +3975,21 @@ def enhance_prompt(
                 "a general identity reference.\n\n"
                 f"{reference_context}\n\n{user_prompt}"
             )
+        elif is_minimax_h3_image:
+            ordered_map = "\n".join(
+                f"<Picture {index + 1}> = the attached image in position {index + 1}."
+                for index in range(len(image_paths))
+            )
+            extra_context = (
+                f"\n\nReference roles and notes:\n{reference_context.strip()}"
+                if reference_context and reference_context.strip() else ""
+            )
+            user_prompt = (
+                "I have attached the ordered visual references for MiniMax H3 Image. "
+                "Keep each native <Picture N> label aligned with the image in that exact attachment position. "
+                "Use only references and roles supported by the user's request; do not invent visual details.\n\n"
+                f"Ordered reference map:\n{ordered_map}{extra_context}\n\n{user_prompt}"
+            )
         elif is_flux3_image:
             reference_map = "\n".join(
                 f"Image {index + 1} = <ref_image_{index}>"
@@ -3736,6 +4004,27 @@ def enhance_prompt(
                 "unseen image content. Do not render the reference tokens as visible lettering.\n\n"
                 f"{user_prompt}"
             )
+        elif is_moss_image_edit:
+            ordered_map = reference_context.strip() if reference_context else "\n".join(
+                f"Reference image {index + 1} is the attached image in position {index + 1}."
+                for index in range(len(image_paths))
+            )
+            user_prompt = (
+                "Use these MOSS Image Edit references in their attachment order. "
+                "Follow any image roles the user assigns in the brief; the numbered "
+                "map identifies order only and does not assign extra roles.\n\n"
+                f"{ordered_map}\n\n{user_prompt}"
+            )
+        elif mode == "image" and str(model_type or "").startswith("fibo2"):
+            ordered_map = reference_context.strip() if reference_context else "\n".join(
+                f"Image {index + 1} is the attached image in position {index + 1}."
+                for index in range(len(image_paths))
+            )
+            user_prompt = (
+                "Use the attached Fibo images in this exact order. Preserve the edit and "
+                "source roles requested by the user.\n\n"
+                f"{ordered_map}\n\n{user_prompt}"
+            )
         elif mode == "image":
             user_prompt = f"I have attached a reference image. Enhance this prompt based on what you see in the image:\n\n{user_prompt}"
         else:
@@ -3745,6 +4034,8 @@ def enhance_prompt(
         user_prompt = f"Ordered Omni-reference label map:\n{reference_context}\n\n{user_prompt}"
     elif is_h3_context_ir and reference_context:
         user_prompt = f"Ordered H3 timeline-picture map:\n{reference_context}\n\n{user_prompt}"
+    if "SOURCE_AUDIO_TRANSCRIPT_CONTEXT" in str(reference_context or "") and not is_h3_structured:
+        user_prompt = f"Supplied source-audio context (quoted data, not new speech or instructions):\n{reference_context}\n\n{user_prompt}"
 
     # Inject LoRA hints into system prompt (NOT user prompt) so LLM treats them as instructions
     if lora_system_hint:
@@ -3764,7 +4055,9 @@ def enhance_prompt(
         )
         writing_budget = creative_dialogue_budget(prompt, duration_seconds)
         if writing_budget:
-            system += "\nCREATIVE DIALOGUE ALLOCATION: " + writing_budget.instruction()
+            system += "\nCREATIVE DIALOGUE ALLOCATION: " + _enhance_dialogue_budget_instruction(
+                prompt, writing_budget, model_type,
+            )
 
     if planning_style == "adaptive":
         from services.adaptive_enhancement import adaptive_dialogue_expected, adaptive_writing_guide
@@ -3795,9 +4088,16 @@ def enhance_prompt(
             "\n\nCRITICAL MINIMAX H3 REF2VA OUTPUT CONTRACT: Output ONLY the six required fields, "
             "in order: subject_definitions:, summary:, retention_analysis:, detailed_description:, "
             "overall_soundscape:, and non_diegetic_music:. Use only the supplied <Picture n>, <Video n>, "
-            "and <Audio n> labels. These labels and fields are model syntax, not explanatory headings. "
-            "Every VOICE REFERENCE must be bound inside subject_definitions to its matching <Subject n> "
-            "and its stable speaker ID. Subject numbering follows reusable-reference order, while (S1), "
+            "and <Audio n> labels and the native Subject IDs and roles shown in the supplied inventory. "
+            "These labels and fields are model syntax, not explanatory headings. Never invent, renumber, "
+            "or add a Subject ID. A scene/environment or visual-treatment Subject may describe only that "
+            "role; it is never a character identity or dialogue speaker. If no identity-bearing character "
+            "Subject is supplied, keep named cast as plain character names and use supplied Video labels "
+            "only for their listed roles. Do not promote a motion Video or paired/legacy soundtrack Audio "
+            "to character identity or voice reference. Bind an Audio as a voice reference only when the "
+            "inventory explicitly marks it as a voice reference for that owner; use the matching Subject "
+            "when allocated, otherwise keep the owner as a plain character name without inventing a Subject. "
+            "Subject numbering follows reusable-reference order, while (S1), "
             "(S2), etc. are assigned independently by first actual vocal-event order. Spoken lines require "
             "that same event-ordered ID and <d>[Language] literal words</d>. Each line is spoken once by "
             "that character only; no other character repeats, echoes, mouths, or paraphrases it. Voice "
@@ -3806,6 +4106,26 @@ def enhance_prompt(
             "explanation, filenames, or LoRA display names. Exact creator-declared "
             "trainedWords tokens from active-LoRA guidance may appear when relevant."
         )
+        import re
+        native_subject_roles = [
+            line.strip()
+            for line in str(reference_context or "").splitlines()
+            if re.match(r"(?i)^\s*<Subject\s+\d+>\s+is\s+", line)
+        ]
+        if native_subject_roles:
+            system += "\nNATIVE SUBJECT ROLE MAP (authoritative):\n" + "\n".join(native_subject_roles)
+        cast = _h3_explicit_cast_speakers(prompt)
+        character_subjects = [
+            item for item in _parse_h3_ref2va_subject_manifest(reference_context)
+            if int(item["index"]) not in _h3_ref2va_scene_subject_ids(reference_context)
+        ]
+        if cast and not character_subjects and not audio_driven:
+            system += (
+                "\nPROMPT-NATIVE CAST: " + "; ".join(dict.fromkeys(cast.values())) + ". "
+                "Use these plain names for visible characters and dialogue. No character Subject "
+                "IDs were allocated. The scene Subject is the environment only. Motion videos "
+                "and paired soundtrack labels do not allocate character or voice identities."
+            )
     elif is_h3_context_ir:
         system += (
             "\n\nCRITICAL MINIMAX H3 OUTPUT CONTRACT: Output ONLY the structured "
@@ -3822,6 +4142,15 @@ def enhance_prompt(
             "active-LoRA guidance may appear when relevant."
         )
     elif is_flux3_image:
+        variant = (
+            "ACTIVE FLUX 3 MODEL: Klein Base is undistilled and supports classifier-free "
+            "guidance; do not describe it as the distilled checkpoint or claim its "
+            "negative-prompt conditioning is ignored. "
+            if str(model_type or "").lower().startswith("flux3_klein_base") else
+            "ACTIVE FLUX 3 MODEL: Klein is the distilled checkpoint with no separate "
+            "negative-prompt conditioning. "
+        )
+        system += "\n\n" + variant + "Maestro owns sampling and guidance settings; do not add them to the caption."
         system += (
             "\n\nFLUX 3 OUTPUT CONTRACT: Return only the final still-image caption or editing "
             "instruction. Native <ref_image_N> tokens identify attached inputs in order and are "
@@ -3833,6 +4162,35 @@ def enhance_prompt(
             "Only clarify the caption and descriptions; never change, omit or invent layout boxes. "
             "Boxes use [top,left,bottom,right], integers from 0 to 1000, and guide composition rather than exact pixel masks."
         )
+    elif is_moss_image_edit:
+        system += (
+            "\n\nMOSS IMAGE EDIT OUTPUT CONTRACT: Return one concise, natural-language "
+            "instruction for the requested edit. Honor the user's ordered image roles "
+            "and change only what they asked to change. Preserve unrequested identity, "
+            "composition, visible text, and relevant source details. Do not invent a "
+            "full scene; when a composite is requested, use only the specified elements. "
+            "Do not add image tokens, layout JSON, masks, coordinates, or explanations."
+        )
+    elif is_moss_image:
+        system += (
+            "\n\nMOSS IMAGE OUTPUT CONTRACT: A caption stays a caption. A NEW layout uses width, "
+            "height, summary, items, bbox_coord_space=abs and bbox_format=xyxy. Maestro compiles "
+            "top-left pixel boxes; do not manually center them. An EXISTING compiled layout keeps "
+            "abs_centralized/yxyx, all items, extra fields, exact lettering, comments and valid "
+            "centered-pixel boxes. JSON keys and exact text fields are required model syntax. "
+            "No reference-image tokens, pixel masks, Markdown fences or explanations."
+        )
+    elif speech_writer_active:
+        system += (
+            "\n\nCRITICAL SPEECH SCRIPT OUTPUT CONTRACT: Output only the complete requested spoken script. "
+            "Supported native performance controls belong in the script: model-native speaker labels, "
+            "delivery cues, and word/phrase tags allowed by the selected model guide are valid script syntax, "
+            "not forbidden production notes or commentary. Include them where that guide calls for them, "
+            "unless the user requests plain or untagged speech. Count only the actual spoken words toward "
+            "the requested length. Do not add explanations, Markdown fences, production commentary, "
+            "or part/section headings outside the required native syntax. "
+            "Preserve the selected model's native language, speaker, voice, and tag conventions exactly."
+        )
     else:
         system += "\n\nCRITICAL: Output ONLY the enhanced prompt text. No headers, no labels, no markdown, no explanation, no \"Enhancement Logic\", no \"Edit Prompt:\". No LoRA filenames or display names; exact creator-declared trainedWords tokens from active-LoRA guidance may appear when relevant. Just the raw prompt text."
 
@@ -3843,7 +4201,7 @@ def enhance_prompt(
             # cannot demote literal dialogue into a vague "speaks" action.
             system += f"\n\n{dialogue_requirement}"
     if audio_driven:
-        system += "\n\n" + PERFORMANCE_AUDIO_GUIDANCE
+        system += "\n\n" + performance_audio_guidance(reference_context)
 
     # Scale max tokens for multi-window video prompts
     effective_max_tokens = max_new_tokens
@@ -3851,6 +4209,10 @@ def enhance_prompt(
         # A detailed imported brief needs answer space, not thousands of
         # reasoning tokens. Keep small prompts quick and longer rewrites whole.
         effective_max_tokens = max(effective_max_tokens, min(2048, max(768, len(prompt) // 3 + 256)))
+        if is_moss_image:
+            # A brief poster request can produce a detailed layout too. This
+            # is an output ceiling, not a required length for simple captions.
+            effective_max_tokens = max(effective_max_tokens, 4096)
     if window_count and window_count > 1:
         effective_max_tokens = max(max_new_tokens, window_count * 300 + 256)
     if is_h3_ref2va:
@@ -3898,6 +4260,45 @@ def enhance_prompt(
         else:
             prompt_thinking_budget = 0
 
+    fish_performance = None
+    fish_script_format = None
+    if speech_writer_active and str(model_type or "").lower().startswith("fish_drama3"):
+        from functools import partial
+        from services.fish_script_format import FishScriptFormat
+        from services.speech_performance import direct_fish_section
+
+        fish_script_format = FishScriptFormat(
+            source_text=prompt + "\n" + speech_writer_instructions,
+        )
+        fish_performance = partial(
+            direct_fish_section,
+            brief=prompt,
+            instructions=speech_writer_instructions,
+        )
+
+    if speech_writer_active and speech_target and speech_target.is_long_form:
+        from services.speech_writer import generate_long_form_script
+
+        return repair_text(generate_long_form_script(
+            generate=generate,
+            prompt=user_prompt,
+            system_prompt=system,
+            target=speech_target,
+            max_new_tokens=effective_max_tokens,
+            temperature=temperature,
+            is_truncated=lambda: bool(_last_generation_metrics.get("truncated")),
+            finalize_section=fish_performance,
+            script_format=fish_script_format,
+        )).strip()
+
+    if speech_writer_active and speech_target and speech_target.words:
+        # A short explicit target gets enough room for its approximate word
+        # count while staying on the familiar one-call TTS enhancement path.
+        effective_max_tokens = max(
+            effective_max_tokens,
+            min(2048, max(256, int(speech_target.words * 2 + 128))),
+        )
+
     result = generate(
         prompt=user_prompt,
         system_prompt=system,
@@ -3910,15 +4311,90 @@ def enhance_prompt(
         presence_penalty=0.1,   # encourage variety
     )
     result = repair_text(result)
+    if fish_script_format and result:
+        result, converted_cues = fish_script_format.normalize_fragment(result)
+        if converted_cues:
+            from services.enhancement_diagnostics import record_advisory
 
-    # Post-process ordinary prose aggressively, but preserve H3's required field
-    # labels and media tags. The old substring-loop cleaner could truncate a
-    # valid Context-IR response at its first repeated <Picture>/<Audio> mapping.
+            record_advisory("fish_script_format", {"converted_angle_cues": len(converted_cues)})
+    if speech_writer_active and _last_generation_metrics.get("truncated"):
+        from services.speech_writer import record_speech_writer_warning
+
+        record_speech_writer_warning(
+            "The speech script reached the model's output token limit; the available draft was retained and may be incomplete."
+        )
+
+    if fish_performance and result:
+        speech_incomplete = bool(_last_generation_metrics.get("truncated"))
+        performance_calls = 0
+
+        def performance_call(*, prompt, system_prompt, max_new_tokens, temperature, **_options):
+            nonlocal performance_calls
+            from services.studio_enhancement import check_cancelled
+
+            check_cancelled()
+            if performance_calls >= 1:
+                return "", False
+            performance_calls += 1
+            output = generate(
+                prompt=prompt, system_prompt=system_prompt,
+                max_new_tokens=max_new_tokens, temperature=temperature,
+                image_paths=None, enable_thinking=False, thinking_budget=0,
+            )
+            return str(output or ""), bool(_last_generation_metrics.get("truncated"))
+
+        result = fish_performance(
+            text=result, generate=performance_call,
+            remaining_calls=lambda: 1 - performance_calls,
+            max_new_tokens=effective_max_tokens, temperature=temperature,
+            section_incomplete=speech_incomplete,
+        )
+
+    if is_moss_image:
+        from services.moss_image_prompt import finalize_enhancement_output
+        from services.studio_enhancement import check_cancelled, fidelity_retry_limit
+
+        # Keep exact display strings and comments out of the prose cleaner.
+        # A single bounded repair can fix a truncated/invalid draft; never
+        # silently clip geometry or submit the draft coordinate dialect.
+        repair_limit = min(1, fidelity_retry_limit())
+        for attempt in range(repair_limit + 1):
+            try:
+                return finalize_enhancement_output(result, resolution)
+            except ValueError as error:
+                if attempt == repair_limit:
+                    raise ValueError(
+                        f"MOSS Image enhancement could not produce a valid prompt: {error} "
+                        "Your original prompt is unchanged. Review the layout in Prompt Helper or retry enhancement."
+                    ) from error
+                check_cancelled()
+                result = repair_text(generate(
+                    prompt=user_prompt + "\n\nPREVIOUS DRAFT TO REPAIR:\n" + str(result or '')
+                    + "\n\nVALIDATION ISSUE: " + str(error),
+                    system_prompt=system + "\nRepair only this draft's JSON/schema/canvas error. "
+                    "Preserve the original brief, all visible wording and intended composition. "
+                    "Return the complete corrected caption or layout, without explanations.",
+                    max_new_tokens=effective_max_tokens,
+                    temperature=min(float(temperature), 0.35),
+                    image_paths=None,
+                    enable_thinking=False,
+                    thinking_budget=0,
+                ))
+
+    # Preserve native structure and complete spoken scripts. Repeated words or
+    # whole refrains are legitimate speech: the generic substring-loop heuristic
+    # must never discard a story's remainder on a phrase such as "I told myself".
     if result:
         # Repeated source-binding phrases in a multi-reference caption are
         # legitimate. The ordinary substring-loop heuristic can cut the
         # caption halfway through a <ref_image_N> token and drop later subjects.
-        result = _clean_enhance_output(result, preserve_structure=is_h3_structured or is_flux3_image)
+        result = _clean_enhance_output(
+            result,
+            preserve_structure=(
+                is_h3_structured or is_minimax_h3_image or is_flux3_image or is_moss_image
+                or is_moss_image_edit or speech_writer_active
+            ),
+        )
     if is_h3_context_ir and result:
         # Adaptive dialogue may compile named cues into tags. For ordinary
         # locked user dialogue, compile only when the writer already returned
@@ -3967,11 +4443,12 @@ def enhance_prompt(
         if needs_h3_dialogue
         else True
     )
-    voice_binding_is_valid = (
-        _h3_voice_binding_contract_satisfied(result, reference_context)
+    reference_contract_issues = (
+        _h3_ref2va_reference_contract_issues(result, reference_context)
         if is_h3_ref2va
-        else True
+        else []
     )
+    reference_contract_is_valid = not reference_contract_issues
     dialogue_binding_is_valid = True if audio_driven else (
         _h3_ref2va_dialogue_binding_contract_satisfied(
             prompt, result, reference_context
@@ -3989,40 +4466,60 @@ def enhance_prompt(
         structure_is_valid
         and dialogue_is_valid
         and timed_silence_is_valid
-        and voice_binding_is_valid
+        and reference_contract_is_valid
         and dialogue_binding_is_valid
     ):
         from services.studio_enhancement import check_cancelled, fidelity_retry_limit
         repair_limit = fidelity_retry_limit()
         for repair_attempt in range(repair_limit):
             check_cancelled()
-            failures = []
-            if not structure_is_valid:
-                failures.append("structure")
-            if not dialogue_is_valid:
-                failures.append("dialogue")
-            if not timed_silence_is_valid:
-                failures.append("timed silence")
-            if not voice_binding_is_valid:
-                failures.append("voice binding")
-            if not dialogue_binding_is_valid:
-                failures.append("dialogue speaker binding")
-            print(f"[Enhance] Invalid MiniMax H3 {'/'.join(failures)}; repair {repair_attempt + 1}/{repair_limit}.")
+            failures = _h3_structured_rejection_reasons(
+                result,
+                is_h3_ref2va=is_h3_ref2va,
+                structure_valid=structure_is_valid,
+                dialogue_valid=dialogue_is_valid,
+                timed_silence_valid=timed_silence_is_valid,
+                reference_issues=reference_contract_issues,
+                dialogue_binding_valid=dialogue_binding_is_valid,
+            )
+            if repair_attempt == 0:
+                _record_h3_enhancement_rejection(
+                    failures,
+                    stage="initial_validation",
+                )
+            print(f"[Enhance] Invalid MiniMax H3: {'; '.join(failures)}; repair {repair_attempt + 1}/{repair_limit}.")
             field_requirement = (
                 "Emit each of the six required field labels exactly once, in order."
                 if is_h3_ref2va
                 else "Emit each of the three required field labels exactly once, in order."
             )
+            supplied_lines = _extract_h3_quoted_dialogue(prompt) if needs_h3_dialogue else []
+            draft_lines = {_h3_dialogue_comparison_text(line) for line in _extract_h3_dialogue_blocks(result)}
+            missing_lines = [line for line in supplied_lines if _h3_dialogue_comparison_text(line) not in draft_lines]
+            restorations = ""
+            if missing_lines:
+                restorations = (
+                    "\nMISSING SUPPLIED LINES — restore each at its original source position and speaker:\n"
+                    + "\n".join(f"- {line}" for line in missing_lines)
+                )
             retry = generate(
-                prompt=user_prompt + "\n\nPREVIOUS DRAFT TO REPAIR:\n" + result,
+                prompt=(user_prompt + "\n\nPREVIOUS DRAFT TO REPAIR:\n" + result
+                        + "\n\nVALIDATION FAILURES TO FIX:\n- " + "\n- ".join(failures)
+                        + restorations
+                        + "\nReturn the complete corrected prompt, preserving all supplied spoken lines."),
                 system_prompt=(
                     system
                     + f"\n\nRETRY REQUIREMENT: Be concise. {field_requirement} "
                     "Do not repeat a subject definition or reference mapping. Never replace a requested "
                     "spoken line with the words 'speaks', 'talks', or 'dialogue'; write the actual <d> block. "
-                    "The numbered Saved character Subject map in the request is immutable: never renumber it, "
-                    "never emit <Subject N>, and never add another Subject for a repeated label. Speaker IDs "
-                    "remain independent and follow first actual vocal-event order."
+                    "The supplied native Subject IDs and roles are immutable: never renumber them, invent a "
+                    "Subject, or add another Subject for a repeated label. A scene/environment or style "
+                    "Subject is never a character or speaker. If no character Subject is supplied, retain "
+                    "named cast as plain names and use Video labels only for their listed roles. A paired or "
+                    "legacy soundtrack Audio is not a voice reference. Bind Audio as voice only when the "
+                    "inventory explicitly marks it for that owner; use a Subject if allocated, otherwise "
+                    "the plain character name. Speaker IDs remain independent and follow first actual "
+                    "vocal-event order."
                 ),
                 max_new_tokens=effective_max_tokens,
                 temperature=min(float(temperature), 0.35),
@@ -4063,11 +4560,12 @@ def enhance_prompt(
                 duration_seconds,
                 planning_style,
             )
-            retry_voice_binding_is_valid = (
-                _h3_voice_binding_contract_satisfied(retry, reference_context)
+            retry_reference_issues = (
+                _h3_ref2va_reference_contract_issues(retry, reference_context)
                 if is_h3_ref2va
-                else True
+                else []
             )
+            retry_reference_contract_is_valid = not retry_reference_issues
             retry_dialogue_binding_is_valid = True if audio_driven else (
                 _h3_ref2va_dialogue_binding_contract_satisfied(
                     prompt, retry, reference_context
@@ -4081,25 +4579,53 @@ def enhance_prompt(
                 retry_structure_is_valid
                 and retry_dialogue_is_valid
                 and retry_timed_silence_is_valid
-                and retry_voice_binding_is_valid
+                and retry_reference_contract_is_valid
                 and retry_dialogue_binding_is_valid
             ):
                 result = retry
                 break
+            retry_reasons = _h3_structured_rejection_reasons(
+                retry,
+                is_h3_ref2va=is_h3_ref2va,
+                structure_valid=retry_structure_is_valid,
+                dialogue_valid=retry_dialogue_is_valid,
+                timed_silence_valid=retry_timed_silence_is_valid,
+                reference_issues=retry_reference_issues,
+                dialogue_binding_valid=retry_dialogue_binding_is_valid,
+            )
+            _record_h3_enhancement_rejection(
+                retry_reasons,
+                stage=f"repair_{repair_attempt + 1}",
+            )
             result = retry
             structure_is_valid = retry_structure_is_valid
             dialogue_is_valid = retry_dialogue_is_valid
             timed_silence_is_valid = retry_timed_silence_is_valid
-            voice_binding_is_valid = retry_voice_binding_is_valid
+            reference_contract_issues = retry_reference_issues
+            reference_contract_is_valid = retry_reference_contract_is_valid
             dialogue_binding_is_valid = retry_dialogue_binding_is_valid
         else:
-            print("[Enhance] H3 fidelity repairs exhausted; using deterministic structured fallback.")
+            fallback_reasons = _h3_structured_rejection_reasons(
+                result,
+                is_h3_ref2va=is_h3_ref2va,
+                structure_valid=structure_is_valid,
+                dialogue_valid=dialogue_is_valid,
+                timed_silence_valid=timed_silence_is_valid,
+                reference_issues=reference_contract_issues,
+                dialogue_binding_valid=dialogue_binding_is_valid,
+            )
+            _record_h3_enhancement_rejection(fallback_reasons, stage="final_fallback")
+            print(
+                "[Enhance] H3 fidelity repairs exhausted; using deterministic structured fallback. "
+                + "; ".join(fallback_reasons)
+            )
             result = (
                 _build_h3_ref2va_tagged_fallback(
                     prompt,
                     reference_context,
                     duration_seconds=duration_seconds,
                     planning_style=planning_style,
+                    rejection_reasons=fallback_reasons,
                 )
                 if is_h3_ref2va
                 else _build_h3_context_fallback(
@@ -4182,20 +4708,43 @@ def enhance_prompt(
         result = _canonicalize_h3_ref2va_dialogue_speakers(
             result, prompt, reference_context
         )
+        final_reference_issues = _h3_ref2va_reference_contract_issues(
+            result, reference_context
+        )
+        final_structure_valid = _has_complete_h3_ref2va_structure(result)
+        final_dialogue_valid = audio_driven or _h3_dialogue_contract_satisfied(prompt, result)
+        final_dialogue_binding_valid = audio_driven or _h3_ref2va_dialogue_binding_contract_satisfied(
+            prompt, result, reference_context
+        )
         if not (
-            _has_complete_h3_ref2va_structure(result)
-            and (audio_driven or _h3_dialogue_contract_satisfied(prompt, result))
-            and _h3_voice_binding_contract_satisfied(result, reference_context)
-            and (audio_driven or _h3_ref2va_dialogue_binding_contract_satisfied(
-                prompt, result, reference_context
-            ))
+            final_structure_valid
+            and final_dialogue_valid
+            and not final_reference_issues
+            and final_dialogue_binding_valid
         ):
-            print("[Enhance] Enforcing deterministic Omni character/dialogue contract.")
+            final_rejection_reasons = _h3_structured_rejection_reasons(
+                result,
+                is_h3_ref2va=True,
+                structure_valid=final_structure_valid,
+                dialogue_valid=final_dialogue_valid,
+                timed_silence_valid=True,
+                reference_issues=final_reference_issues,
+                dialogue_binding_valid=final_dialogue_binding_valid,
+            )
+            _record_h3_enhancement_rejection(
+                final_rejection_reasons,
+                stage="final_fallback",
+            )
+            print(
+                "[Enhance] Enforcing deterministic Omni character/dialogue contract: "
+                + "; ".join(final_rejection_reasons)
+            )
             result = _build_h3_ref2va_tagged_fallback(
                 prompt,
                 reference_context,
                 duration_seconds=duration_seconds,
                 planning_style=planning_style,
+                rejection_reasons=final_rejection_reasons,
             )
     if is_h3_context_ir and image_paths:
         result = _ensure_h3_visual_grounding(
@@ -4484,6 +5033,220 @@ def _extract_h3_quoted_dialogue(text: str) -> list[str]:
     return [entry["words"] for entry in _extract_h3_source_dialogue_entries(text)]
 
 
+def _h3_explicit_cast_speakers(text: str) -> dict[int, str]:
+    """Read ``Characters: (S1) Name ...`` aliases without treating S as Subject.
+
+    User-authored cast manifests often identify a speaker separately from the
+    numbered Omni Subject map.  In particular, a scene Subject may be S1 only
+    by coincidence; this parser returns names for vocal ownership, never
+    Subject IDs.
+    """
+    import re
+
+    source = str(text or "")
+    manifest: dict[int, str] = {}
+    headings = list(re.finditer(r"(?im)^\s*characters?\s*:\s*", source))
+    for heading_index, heading in enumerate(headings):
+        end = len(source)
+        blank = re.search(r"\n\s*\n", source[heading.end():])
+        if blank:
+            end = min(end, heading.end() + blank.start())
+        next_heading = re.search(
+            r"(?im)^\s*(?:scene|setting|action|story|description|style|audio|music)\s*:",
+            source[heading.end():],
+        )
+        if next_heading:
+            end = min(end, heading.end() + next_heading.start())
+        if heading_index + 1 < len(headings):
+            end = min(end, headings[heading_index + 1].start())
+        body = source[heading.end():end]
+        markers = list(re.finditer(r"\(\s*S(\d+)\s*\)", body, re.IGNORECASE))
+        for index, marker in enumerate(markers):
+            previous_end = markers[index - 1].end() if index else 0
+            next_start = markers[index + 1].start() if index + 1 < len(markers) else len(body)
+            before = body[previous_end:marker.start()]
+            after = body[marker.end():next_start]
+
+            def clean_name(value: str) -> str:
+                value = re.sub(r"<[^>]*>", " ", value)
+                value = re.sub(r"(?i)\b(?:as\s+(?:a\s+)?)?references?\b.*$", " ", value)
+                value = re.sub(r"(?i)\b(?:video|audio)\s+\d+\b", " ", value)
+                value = re.sub(r"(?i)\b(?:is|are|with|using|from)\s*$", " ", value)
+                value = re.sub(r"\s+", " ", value).strip(" \t\r\n:;,.-–—")
+                return value
+
+            # Most manifests put the name after (Sx), while ``JIM (S3)`` is a
+            # common reverse ordering. Restrict the latter to the current
+            # punctuation-delimited entry so a preceding character cannot leak.
+            after_name = clean_name(after.split("<", 1)[0])
+            before_entry = re.split(r"[\r\n.!?;]", before)[-1]
+            before_name = clean_name(before_entry)
+            name = after_name or before_name
+            if not name or re.fullmatch(r"S\d+", name, re.IGNORECASE):
+                continue
+            speaker = int(marker.group(1))
+            previous = manifest.get(speaker)
+            if previous is None or _h3_ref2va_normalized_name(previous) == _h3_ref2va_normalized_name(name):
+                manifest[speaker] = name
+            else:
+                # A conflicting declaration is not reliable ownership proof.
+                manifest.pop(speaker, None)
+    return manifest
+
+
+def _h3_explicit_cast_section_spans(text: str) -> list[tuple[int, int]]:
+    """Return the contents of source ``Characters:`` sections."""
+    import re
+
+    source = str(text or "")
+    spans = []
+    headings = list(re.finditer(r"(?im)^\s*characters?\s*:\s*", source))
+    for index, heading in enumerate(headings):
+        end = len(source)
+        blank = re.search(r"\n\s*\n", source[heading.end():])
+        if blank:
+            end = min(end, heading.end() + blank.start())
+        next_heading = re.search(
+            r"(?im)^\s*(?:scene|setting|action|story|description|style|audio|music)\s*:",
+            source[heading.end():],
+        )
+        if next_heading:
+            end = min(end, heading.end() + next_heading.start())
+        if index + 1 < len(headings):
+            end = min(end, headings[index + 1].start())
+        spans.append((heading.end(), end))
+    return spans
+
+
+def _canonicalize_h3_source_cast_markers(text: str, cast_speakers: dict[int, str]) -> str:
+    """Render source cast IDs as names when event order changes those IDs."""
+    import re
+
+    blocks: list[str] = []
+
+    def protect_dialogue(match):
+        blocks.append(match.group(0))
+        return f"@@MAESTRO_CAST_DIALOGUE_{len(blocks) - 1}@@"
+
+    result = re.sub(r"(?is)<d\b[^>]*>.*?</d\s*>", protect_dialogue, str(text or ""))
+    for start, end in reversed(_h3_explicit_cast_section_spans(result)):
+        section = result[start:end]
+        section = re.sub(r"\(\s*S\d+\s*\)", "", section, flags=re.IGNORECASE)
+        result = result[:start] + section + result[end:]
+
+    def replace_marker(match):
+        name = cast_speakers.get(int(match.group(1)))
+        if not name:
+            return match.group(0)
+        # ``Tavi (S2)`` and ``(S2) Tavi`` already contain the actor's name.
+        # Replacing only the marker would create a new "Tavi Tavi" owner.
+        before = result[max(0, match.start() - len(name) - 3):match.start()]
+        after = result[match.end():match.end() + len(name) + 3]
+        if (re.search(rf"(?<!\w){re.escape(name)}\s*$", before, re.I)
+                or re.match(rf"\s*{re.escape(name)}(?!\w)", after, re.I)):
+            return ""
+        return name
+
+    result = re.sub(r"\(\s*S(\d+)\s*\)", replace_marker, result, flags=re.IGNORECASE)
+    for index, block in enumerate(blocks):
+        result = result.replace(f"@@MAESTRO_CAST_DIALOGUE_{index}@@", block)
+    return result
+
+
+def _h3_source_speaker_marker_match_for_dialogue(
+    source: str,
+    dialogue_start: int,
+    previous_dialogue_end: int = 0,
+) -> Optional[tuple[int, int, int]]:
+    """Find the source span for a cast marker attached to a speaker cue."""
+    import re
+    from models.minimax_h3.speakers import _SPEECH_VERB_RE
+
+    floor = max(0, int(previous_dialogue_end))
+    prefix = str(source or "")[floor:int(dialogue_start)]
+    prefix_offset = floor
+    clip = list(re.finditer(r"(?i)(?:\[\s*(?:shot|scene)\s+\d+\s*\]|(?:^|\n)\s*(?:shot|scene)\s+\d+\s*:?)", prefix))
+    if clip:
+        prefix_offset += clip[-1].end()
+        prefix = prefix[clip[-1].end():]
+    speech_verbs = list(_SPEECH_VERB_RE.finditer(prefix))
+    if speech_verbs:
+        before_verb = prefix[:speech_verbs[-1].start()]
+        markers = list(re.finditer(r"\(\s*S(\d+)\s*\)", before_verb, re.IGNORECASE))
+        if markers:
+            marker = markers[-1]
+            return prefix_offset + marker.start(), prefix_offset + marker.end(), int(marker.group(1))
+
+    # Without a speech verb, accept only a marker adjacent to the tag. This
+    # covers compact ``Name (S1) <d>`` cues while rejecting ``to (S2)``.
+    trailing = list(re.finditer(r"\(\s*S(\d+)\s*\)", prefix, re.IGNORECASE))
+    if trailing:
+        marker = trailing[-1]
+        suffix = prefix[marker.end():]
+        leading = prefix[max(0, marker.start() - 32):marker.start()]
+        if len(suffix.strip()) <= 24 and not re.search(r"\b(?:to|for|toward|towards)\s*$", leading, re.IGNORECASE):
+            return prefix_offset + marker.start(), prefix_offset + marker.end(), int(marker.group(1))
+    return None
+
+
+def _h3_source_speaker_marker_for_dialogue(
+    source: str,
+    dialogue_start: int,
+    previous_dialogue_end: int = 0,
+) -> Optional[int]:
+    """Find a cast marker attached to the speaker verb, not a speech object."""
+    match = _h3_source_speaker_marker_match_for_dialogue(
+        source, dialogue_start, previous_dialogue_end,
+    )
+    return match[2] if match else None
+
+
+def _h3_ref2va_scene_subject_ids(reference_context: Optional[str]) -> set[int]:
+    """Return native environment/style Subjects that cannot own dialogue."""
+    import re
+    return {
+        int(value)
+        for value in re.findall(
+            r"(?im)^\s*<Subject\s+(\d+)>\s+is\s+(?:the environment and location|the visual treatment)\b",
+            str(reference_context or ""),
+        )
+    }
+
+
+def _extract_h3_ref2va_audio_sections(prompt: str) -> tuple[str, dict[str, str]]:
+    """Lift prompt-native sound fields so fallback keeps them in their fields."""
+    import re
+
+    source = str(prompt or "")
+    field_names = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
+                   "overall_soundscape", "non_diegetic_music")
+    dialogue_spans = [
+        match.span()
+        for match in re.finditer(r"(?is)<d\b[^>]*>.*?</d\s*>", source)
+    ]
+    headers = [header for header in re.finditer(
+        r"(?im)^\s*(" + "|".join(field_names) + r")\s*:\s*", source,
+    ) if not any(start <= header.start() < end for start, end in dialogue_spans)]
+    requested: dict[str, list[str]] = {"overall_soundscape": [], "non_diegetic_music": []}
+    remove_spans: list[tuple[int, int]] = []
+    for index, header in enumerate(headers):
+        field = header.group(1).casefold()
+        if field not in requested:
+            continue
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(source)
+        value = source[header.end():end].strip()
+        if value and value not in requested[field]:
+            requested[field].append(value)
+        remove_spans.append((header.start(), end))
+    for start, end in reversed(remove_spans):
+        source = source[:start] + source[end:]
+    return source.strip(), {
+        field: "\n".join(values)
+        for field, values in requested.items()
+        if values
+    }
+
+
 def _extract_h3_source_dialogue_entries(
     text: str,
     reference_context: Optional[str] = None,
@@ -4576,36 +5339,122 @@ def _extract_h3_source_dialogue_entries(
     spans = filtered_spans
     spans.sort(key=lambda entry: entry["start"])
     manifest = _parse_h3_ref2va_subject_manifest(reference_context)
-    if manifest:
+    scene_subjects = _h3_ref2va_scene_subject_ids(reference_context)
+    speaker_manifest = [
+        subject for subject in manifest
+        if int(subject["index"]) not in scene_subjects
+    ]
+    cast_speakers = _h3_explicit_cast_speakers(source)
+    if cast_speakers:
         from models.minimax_h3.speakers import (
-            _ambiguous_ref2va_dialogue_error,
             _ref2va_alias_values,
             _resolve_ref2va_dialogue_owner_name,
-            _resolve_ref2va_dialogue_speaker,
+            resolve_ref2va_dialogue_owners,
         )
 
-        valid_subjects = {int(subject["index"]) for subject in manifest}
+        valid_subjects = {int(subject["index"]) for subject in speaker_manifest}
+        subject_aliases: dict[str, set[int]] = {}
+        for subject in speaker_manifest:
+            for alias in _ref2va_alias_values({"character_name": subject["name"]}):
+                subject_aliases.setdefault(alias, set()).add(int(subject["index"]))
+        cast_by_normalized_name = {
+            _h3_ref2va_normalized_name(name): name
+            for name in cast_speakers.values()
+        }
+        vocal_speakers: dict[tuple, int] = {}
+        previous_end = 0
+        for index, entry in enumerate(spans, start=1):
+            owner = entry.get("speaker") or _resolve_ref2va_dialogue_owner_name(
+                source, int(entry["start"]), int(entry["end"]),
+            )
+            cast_marker = _h3_source_speaker_marker_for_dialogue(
+                source, int(entry["start"]), previous_end,
+            )
+            normalized_owner = _h3_ref2va_normalized_name(owner or "")
+            if normalized_owner in cast_by_normalized_name:
+                owner = cast_by_normalized_name[normalized_owner]
+            elif not owner and cast_marker in cast_speakers:
+                owner = cast_speakers[int(cast_marker)]
+            elif cast_marker in cast_speakers:
+                # A prop named during a chained action is not a new speaker:
+                # ``(S2) Tavi holds the Compass and smiles and says ...``.
+                # Require both the adjacent named actor and a final ownerless
+                # "and says" clause. A named guest in "and Rook says" keeps
+                # its own ownership instead of inheriting this cast marker.
+                marker_span = _h3_source_speaker_marker_match_for_dialogue(
+                    source, int(entry["start"]), previous_end,
+                )
+                if marker_span:
+                    actor_tail = source[marker_span[1]:int(entry["start"])]
+                    cast_name = cast_speakers[int(cast_marker)]
+                    if (re.match(rf"\s*{re.escape(cast_name)}\b", actor_tail, re.I)
+                            and re.search(
+                                r"\band\s+(?:then\s+)?(?:says?|speaks?|replies|answers?|"
+                                r"asks?|whispers?|shouts?)\b[^.!?;\r\n]*$",
+                                actor_tail, re.I,
+                            )):
+                        owner = cast_name
+
+            subject = None
+            if owner:
+                owner_aliases = _ref2va_alias_values({"character_name": owner})
+                candidates = {
+                    next(iter(subject_aliases[alias]))
+                    for alias in owner_aliases
+                    if alias in subject_aliases and len(subject_aliases[alias]) == 1
+                }
+                if len(candidates) == 1:
+                    subject = next(iter(candidates))
+            if subject is None and not owner and valid_subjects:
+                # Keep the established strict ambiguity behavior for dialogue
+                # without a source-cast attribution.
+                owners = resolve_ref2va_dialogue_owners(
+                    source,
+                    [(int(entry["start"]), int(entry["end"]), entry["words"])],
+                    {
+                        alias: next(iter(subjects))
+                        for alias, subjects in subject_aliases.items()
+                        if len(subjects) == 1
+                    },
+                    valid_subjects,
+                )
+                subject, owner = owners[0]
+            if subject is None and not owner and len(valid_subjects) == 1:
+                subject = next(iter(valid_subjects))
+            if subject is not None:
+                entry["subject_id"] = subject
+            if owner:
+                entry["speaker"] = owner
+            key = ("subject", subject) if subject is not None else (
+                ("name", owner.casefold()) if owner else ("event", index)
+            )
+            entry["speaker_id"] = vocal_speakers.setdefault(
+                key, len(vocal_speakers) + 1,
+            )
+            previous_end = max(previous_end, int(entry["end"]))
+    elif speaker_manifest:
+        from models.minimax_h3.speakers import (
+            _ref2va_alias_values,
+            resolve_ref2va_dialogue_owners,
+        )
+
+        valid_subjects = {int(subject["index"]) for subject in speaker_manifest}
         alias_candidates: dict[str, set[int]] = {}
-        for subject in manifest:
+        for subject in speaker_manifest:
             for alias in _ref2va_alias_values({"character_name": subject["name"]}):
                 alias_candidates.setdefault(alias, set()).add(int(subject["index"]))
         aliases = {
             alias: next(iter(subjects))
             for alias, subjects in alias_candidates.items() if len(subjects) == 1
         }
+        owners = resolve_ref2va_dialogue_owners(
+            source,
+            [(int(entry["start"]), int(entry["end"]), entry["words"]) for entry in spans],
+            aliases,
+            valid_subjects,
+        )
         vocal_speakers: dict[tuple, int] = {}
-        for entry in spans:
-            subject = _resolve_ref2va_dialogue_speaker(
-                source, int(entry["start"]), int(entry["end"]), aliases, valid_subjects,
-            )
-            owner = _resolve_ref2va_dialogue_owner_name(
-                source, int(entry["start"]), int(entry["end"]),
-            )
-            if subject is None and not owner:
-                if len(valid_subjects) == 1:
-                    subject = next(iter(valid_subjects))
-                else:
-                    raise _ambiguous_ref2va_dialogue_error(entry["words"])
+        for entry, (subject, owner) in zip(spans, owners):
             if subject is not None:
                 entry["subject_id"] = subject
             # Guests keep their own voice; neither input order nor an (Sx)
@@ -4615,18 +5464,23 @@ def _extract_h3_source_dialogue_entries(
     else:
         from models.minimax_h3.speakers import _resolve_ref2va_dialogue_owner_name
         vocal_speakers: dict[tuple, int] = {}
+        previous_end = 0
         for index, entry in enumerate(spans, start=1):
-            prefix = source[max(0, int(entry["start"]) - 80):int(entry["start"])]
-            explicit = re.findall(r"\(S(\d+)\)", prefix, flags=re.IGNORECASE)
             owner = entry.get("speaker") or _resolve_ref2va_dialogue_owner_name(
                 source, int(entry["start"]), int(entry["end"]),
             )
             key = ("name", owner.casefold()) if owner else ("event", index)
             if owner:
                 entry["speaker"] = owner
-            entry["speaker_id"] = vocal_speakers.setdefault(
-                key, int(explicit[-1]) if explicit else max(vocal_speakers.values(), default=0) + 1,
+            actor_marker = _h3_source_speaker_marker_for_dialogue(
+                source, int(entry["start"]), previous_end,
             )
+            entry["speaker_id"] = vocal_speakers.setdefault(
+                key,
+                int(actor_marker) if actor_marker is not None
+                else max(vocal_speakers.values(), default=0) + 1,
+            )
+            previous_end = max(previous_end, int(entry["end"]))
     return spans
 
 
@@ -5258,6 +6112,17 @@ def _build_h3_dialogue_requirement(
     return ""
 
 
+def _h3_dialogue_comparison_text(value: str) -> str:
+    """Ignore layout whitespace without changing spoken words or punctuation."""
+    return " ".join(str(value or "").split())
+
+
+def _h3_dialogue_words_pattern(value: str) -> str:
+    """Match incidental line wrapping or spacing inside an exact speech span."""
+    import re
+    return r"\s+".join(re.escape(word) for word in str(value or "").split())
+
+
 def _h3_dialogue_contract_satisfied(prompt: str, result: str) -> bool:
     import re
     from services.dialogue_writing import dialogue_forbidden
@@ -5268,7 +6133,11 @@ def _h3_dialogue_contract_satisfied(prompt: str, result: str) -> bool:
     has_speaker_id = bool(re.search(r"\(S\d+\)", str(result or "")))
     if quotes:
         return has_speaker_id and all(
-            any(entry_language == language and words == line for entry_language, words in entries)
+            any(
+                entry_language == language
+                and _h3_dialogue_comparison_text(words) == _h3_dialogue_comparison_text(line)
+                for entry_language, words in entries
+            )
             for line in quotes
         )
     if dialogue_forbidden(prompt):
@@ -5753,7 +6622,9 @@ def _h3_context_speaker_binding_plan(
         return plan
     if len(result_entries) != len(source_entries):
         return None
-    if [str(entry["words"]).strip() for entry in result_entries] != expected_words:
+    if [_h3_dialogue_comparison_text(entry["words"]) for entry in result_entries] != [
+        _h3_dialogue_comparison_text(words) for words in expected_words
+    ]:
         return None
     matches = list(re.finditer(
         r"<d>\s*\[([^\]\r\n]+)\]\s*((?:(?!<d>).)*?)\s*</d>",
@@ -5823,7 +6694,7 @@ def _h3_context_speaker_binding_plan(
         language = _canonical_h3_language_tag(match.group(1) or "")
         if language != _canonical_h3_language_tag(expected.get("language") or ""):
             return None
-        if (match.group(2) or "").strip() != str(expected["words"]).strip():
+        if _h3_dialogue_comparison_text(match.group(2)) != _h3_dialogue_comparison_text(expected["words"]):
             return None
         expected_id = int(expected.get("speaker_id") or 0)
         if expected_id <= 0:
@@ -6467,11 +7338,28 @@ def _ensure_h3_visual_grounding(
 def validate_h3_source_dialogue_duration(prompt: str, duration_seconds: Optional[float]) -> None:
     """Reject impossible exact scripts before asking the writer to preserve them."""
     import math
+    import re
     from services.dialogue_timing import DIALOGUE_DEFAULT_WORDS_PER_SECOND, DIALOGUE_MAX_WORDS_PER_SECOND
     from services.dialogue_writing import spoken_word_count
     from services.h3_prompt_budget import H3PromptBudgetError
     from services.h3_dialogue_source import unclosed_h3_spoken_quote_error
 
+    prompt = normalize_h3_dialogue_tags(prompt)
+    inside_dialogue = False
+    for tag in re.finditer(r"</?d>", prompt, flags=re.IGNORECASE):
+        opening = tag.group().lower() == "<d>"
+        if opening == inside_dialogue:
+            raise H3PromptBudgetError(
+                "MiniMax H3 found an unclosed or nested dialogue tag. Use <d>spoken words</d> "
+                "for each line, with stage and sound directions outside the tags. "
+                "Your original prompt has not been changed."
+            )
+        inside_dialogue = opening
+    if inside_dialogue:
+        raise H3PromptBudgetError(
+            "MiniMax H3 found an unclosed dialogue tag. Close the spoken line with </d> "
+            "before enhancing. Your original prompt has not been changed."
+        )
     source_error = unclosed_h3_spoken_quote_error(prompt)
     if source_error:
         raise H3PromptBudgetError(source_error)
@@ -6889,8 +7777,36 @@ def _parse_h3_ref2va_subject_manifest(
             attach(item, label)
 
     # Add visual identities that were not part of a saved-character row.
+    # Native inventories also emit retention rows for motion, scene, style,
+    # and composition references. Those rows must not invent character
+    # Subjects merely because their label is a Picture or Video.
     for label, description in rows:
         if label.casefold() in claimed or label.casefold() in object_pictures or not label.startswith(("<Picture", "<Video")):
+            continue
+        if re.match(
+            r"(?i)^(?:partially_preserved|fully_preserved|weak_reference|"
+            r"partially_copy|fully_copy|retention\s*=\s*(?:reference|"
+            r"partial(?:ly)?[_ -]?preserved|full(?:y)?[_ -]?preserved|"
+            r"weak[_ -]?reference|partial|full|copy))\b",
+            description,
+        ):
+            continue
+        intent_match = re.search(
+            r"(?i)\b(?:image_intent|video_intent|intent)\s*=\s*([^;\r\n]+)",
+            description,
+        )
+        if intent_match:
+            intent = re.sub(r"[_-]+", " ", intent_match.group(1)).strip().casefold()
+            if label.startswith("<Video") and not re.search(r"\b(?:character|identity)\b", intent):
+                continue
+            if label.startswith("<Picture") and re.search(
+                r"\b(?:object|prop|composition|blocking|scene|style|motion)\b", intent,
+            ):
+                continue
+        elif label.startswith("<Video") and re.search(
+            r"(?i)\b(?:motion|camera|framing|composition|scene|environment|timing)\b",
+            description,
+        ):
             continue
         name_match = re.search(
             r"(?i)(?:reference|evidence)\s+for\s+([^;]+)", description
@@ -7141,7 +8057,7 @@ def _canonicalize_h3_ref2va_dialogue_speakers(
         speaker_id = entry.get("speaker_id")
         if not speaker_id:
             continue
-        words_pattern = re.escape(str(entry["words"])).replace(r"\ ", r"\s+")
+        words_pattern = _h3_dialogue_words_pattern(entry["words"])
         match = re.compile(
             rf"<d>\s*\[[^\]]+\]\s*{words_pattern}\s*</d>",
             flags=re.DOTALL | re.IGNORECASE,
@@ -7209,68 +8125,179 @@ def _canonicalize_h3_ref2va_dialogue_speakers(
     return text
 
 
-def _h3_ref2va_reference_contract_satisfied(
+def _h3_ref2va_reference_contract_issues(
     result: str,
     reference_context: Optional[str],
-) -> bool:
-    """Reject placeholder, duplicate, invented, or cross-wired Omni subjects."""
+) -> list[str]:
+    """Explain missing, invented, and ambiguous Omni reference bindings."""
     import re
     manifest = _parse_h3_ref2va_subject_manifest(reference_context)
+    text = str(result or "")
+    issues: list[str] = []
+
+    def add(message: str) -> None:
+        if message not in issues:
+            issues.append(message)
+
     if reference_context is not None:
         label_pattern = r"<(?:Subject|Picture|Video|Audio)\s+\d+>"
-        supplied_labels = {label.casefold() for label in re.findall(label_pattern, reference_context, re.I)}
+        supplied_labels = {
+            label.casefold()
+            for label in re.findall(label_pattern, reference_context, re.I)
+        }
         # Legacy inventories can name a saved character on its Picture row;
         # the canonical manifest assigns that character a Subject slot.
         supplied_labels.update(f"<subject {subject['index']}>" for subject in manifest)
-        actual_labels = {label.casefold() for label in re.findall(label_pattern, str(result or ""), re.I)}
-        if not actual_labels.issubset(supplied_labels):
-            return False
-    if not manifest:
-        return True
-    text = str(result or "")
+        actual_label_values = {
+            label.casefold(): label for label in re.findall(label_pattern, text, re.I)
+        }
+        invented_labels = sorted(
+            actual_label_values[key] for key in actual_label_values.keys() - supplied_labels
+        )
+        if invented_labels:
+            add("invented reference label(s): " + ", ".join(invented_labels))
+
     if re.search(r"<Subject\s+N>", text, flags=re.IGNORECASE):
-        return False
+        add("unresolved placeholder reference <Subject N>")
+
     expected = {int(subject["index"]) for subject in manifest}
     # Native queued inventories also number environment/style Subjects. They
-    # are valid references, but must never become dialogue speaker candidates.
-    expected.update(int(value) for value in re.findall(
-        r"(?m)^<Subject (\d+)> is (?:the environment and location|the visual treatment)\b",
-        str(reference_context or ""),
-    ))
+    # are valid roles, but a retention row alone must not create a character.
+    native_role_subjects = {
+        int(value)
+        for value in re.findall(
+            r"(?m)^<Subject (\d+)> is (?:the environment and location|the visual treatment)\b",
+            str(reference_context or ""),
+        )
+    }
+    expected.update(native_role_subjects)
     actual_subjects = {
-        int(value) for value in re.findall(r"<Subject\s+(\d+)>", text, flags=re.IGNORECASE)
+        int(value)
+        for value in re.findall(r"<Subject\s+(\d+)>", text, flags=re.IGNORECASE)
     }
-    actual_speakers = {
-        int(value) for value in re.findall(r"\(S(\d+)\)", text, flags=re.IGNORECASE)
-    }
-    if not expected.issubset(actual_subjects):
-        return False
-    if not actual_subjects.issubset(expected):
-        return False
+    missing_subjects = sorted(expected - actual_subjects)
+    if missing_subjects:
+        add("missing reference Subject(s): " + ", ".join(
+            f"<Subject {value}>" for value in missing_subjects
+        ))
+    invented_subjects = sorted(actual_subjects - expected)
+    if invented_subjects and reference_context is not None:
+        add("invented reference Subject(s): " + ", ".join(
+            f"<Subject {value}>" for value in invented_subjects
+        ))
+
+    # Duplicate ownership in the supplied map is ambiguous before the draft
+    # is considered; surface it instead of silently accepting either owner.
+    label_owners: dict[str, set[int]] = {}
+    for subject in manifest:
+        for label in subject["pictures"] + subject["videos"] + subject["audios"]:
+            label_owners.setdefault(label.casefold(), set()).add(int(subject["index"]))
+    for label, owners in sorted(label_owners.items()):
+        if len(owners) > 1:
+            add(
+                f"ambiguous reference binding {label}: assigned to "
+                + ", ".join(f"<Subject {value}>" for value in sorted(owners))
+            )
+
     # Guests may speak without a saved visual reference. Speaker IDs count
     # vocal participants, not referenced Subjects; only their own contiguous,
     # positive event ordering is relevant here.
-    if actual_speakers != set(range(1, len(actual_speakers) + 1)):
-        return False
+    actual_speakers = {
+        int(value) for value in re.findall(r"\(S(\d+)\)", text, flags=re.IGNORECASE)
+    }
+    if (manifest or native_role_subjects) and actual_speakers != set(
+        range(1, len(actual_speakers) + 1)
+    ):
+        actual = ", ".join(f"S{value}" for value in sorted(actual_speakers)) or "none"
+        add(
+            "invalid speaker ID sequence for referenced dialogue: "
+            f"found {actual}; expected contiguous IDs from S1"
+        )
+
+    # A role-only or empty context need not create a Subject definition block.
+    if not expected:
+        return issues
     definitions_match = re.search(
         r"(?ms)^\s*subject_definitions\s*:(.*?)(?=^\s*summary\s*:)", text
     )
     if not definitions_match:
-        return False
+        add("missing subject_definitions field for supplied reference Subjects")
+        return issues
     definitions = definitions_match.group(1)
+    definition_subjects = {
+        int(value)
+        for value in re.findall(r"<Subject\s+(\d+)>", definitions, re.I)
+    }
+    for index in sorted(expected - definition_subjects):
+        add(f"missing <Subject {index}> definition")
     for subject in manifest:
         index = int(subject["index"])
-        if f"<Subject {index}>" not in definitions:
-            return False
         for label in subject["pictures"] + subject["videos"] + subject["audios"]:
-            if label not in definitions:
-                return False
+            if label.casefold() not in definitions.casefold():
+                add(f"missing {label} binding from <Subject {index}> definitions")
         for audio_label in subject["audios"]:
-            audio_pos = definitions.find(audio_label)
+            audio_pos = definitions.casefold().find(audio_label.casefold())
             nearby = definitions[max(0, audio_pos - 320):audio_pos + 420]
-            if f"<Subject {index}>" not in nearby:
-                return False
-    return True
+            if f"<Subject {index}>".casefold() not in nearby.casefold():
+                add(f"ambiguous or detached voice reference {audio_label} for <Subject {index}>")
+    return issues
+
+
+def _h3_structured_rejection_reasons(
+    result: str,
+    *,
+    is_h3_ref2va: bool,
+    structure_valid: bool,
+    dialogue_valid: bool,
+    timed_silence_valid: bool,
+    reference_issues: list[str],
+    dialogue_binding_valid: bool,
+) -> list[str]:
+    """Build concise, actionable reasons for a rejected structured draft."""
+    import re
+    reasons: list[str] = []
+    fields = _H3_REF2VA_FIELDS if is_h3_ref2va else _H3_CONTEXT_FIELDS
+    if not structure_valid:
+        structural_reason_count = len(reasons)
+        positions = []
+        for field in fields:
+            matches = list(re.finditer(rf"(?mi)^\s*{re.escape(field)}\s*:", result or ""))
+            if not matches:
+                reasons.append(f"missing required field {field}:")
+            elif len(matches) > 1:
+                reasons.append(f"duplicate required field {field}:")
+            positions.append(matches[0].start() if matches else None)
+        present = [position for position in positions if position is not None]
+        if len(present) == len(fields) and present != sorted(present):
+            reasons.append("required fields are out of order")
+        if len(reasons) == structural_reason_count:
+            reasons.append(
+                "invalid structured field shape: one or more required field blocks are empty or malformed"
+            )
+    if not dialogue_valid:
+        reasons.append("requested dialogue is missing, changed, or duplicated")
+    if not timed_silence_valid:
+        reasons.append("required speech timing or nonverbal interval is missing")
+    reasons.extend(reference_issues)
+    if not dialogue_binding_valid:
+        reasons.append("dialogue speaker binding does not match the named reference owner")
+    return list(dict.fromkeys(reasons))
+
+
+def _record_h3_enhancement_rejection(reasons: list[str], *, stage: str) -> None:
+    """Attach a rejection explanation to the most recent local writer call."""
+    if not reasons:
+        return
+    from services.enhancement_diagnostics import record_rejection
+    record_rejection(reasons, stage=stage)
+
+
+def _h3_ref2va_reference_contract_satisfied(
+    result: str,
+    reference_context: Optional[str],
+) -> bool:
+    """Compatibility boolean wrapper for the explainable reference contract."""
+    return not _h3_ref2va_reference_contract_issues(result, reference_context)
 
 
 def _h3_ref2va_dialogue_binding_contract_satisfied(
@@ -7298,19 +8325,20 @@ def _h3_ref2va_dialogue_binding_contract_satisfied(
         # the full ordered tag sequence; the owner loop below alone would allow
         # extra, duplicated, or reordered guest lines after the required turns.
         if only_supplied_dialogue_requested(prompt) and [
-            str(entry["words"]) for entry in result_entries
-        ] != [str(entry["words"]) for entry in source_entries]:
+            _h3_dialogue_comparison_text(entry["words"]) for entry in result_entries
+        ] != [_h3_dialogue_comparison_text(entry["words"]) for entry in source_entries]:
             return False
     definitions_match = re.search(
         r"(?ms)^\s*subject_definitions\s*:(.*?)(?=^\s*summary\s*:)", text
     )
     definitions = definitions_match.group(1) if definitions_match else ""
     cursor = 0
+    result_entry_cursor = 0
     for entry in source_entries:
         speaker_id = entry.get("speaker_id")
         if not speaker_id:
             continue
-        words_pattern = re.escape(str(entry["words"])).replace(r"\ ", r"\s+")
+        words_pattern = _h3_dialogue_words_pattern(entry["words"])
         match = re.compile(
             rf"<d>\s*\[[^\]]+\]\s*{words_pattern}\s*</d>",
             flags=re.DOTALL | re.IGNORECASE,
@@ -7322,6 +8350,20 @@ def _h3_ref2va_dialogue_binding_contract_satisfied(
         if not ids or int(ids[-1]) != int(speaker_id):
             return False
         subject_id = entry.get("subject_id")
+        # A matching vocal ID and a correct header do not prove that the
+        # visible actor beside this particular line is its intended owner.
+        # Compare the resolved event too, independently of the S namespace.
+        resolved_index = next((
+            index for index in range(result_entry_cursor, len(result_entries))
+            if _h3_dialogue_comparison_text(result_entries[index]["words"])
+            == _h3_dialogue_comparison_text(entry["words"])
+        ), None)
+        if resolved_index is None:
+            return False
+        resolved_entry = result_entries[resolved_index]
+        if resolved_entry.get("subject_id") != subject_id:
+            return False
+        result_entry_cursor = resolved_index + 1
         if subject_id is not None and not re.search(
             rf"<Subject\s+{int(subject_id)}>\s*\(S{int(speaker_id)}\)",
             definitions,
@@ -7375,6 +8417,24 @@ def _compile_h3_explicit_dialogue(
     """Compile quotes and bare tags into canonical, speaker-bound H3 dialogue."""
     result = str(prompt or "")
     entries = _extract_h3_source_dialogue_entries(result, reference_context)
+    cast_speakers = _h3_explicit_cast_speakers(result)
+    if cast_speakers and entries:
+        previous_end = 0
+        event_order_differs = False
+        for entry in entries:
+            marker = _h3_source_speaker_marker_match_for_dialogue(
+                result, int(entry["start"]), previous_end,
+            )
+            if marker and marker[2] in cast_speakers and int(entry.get("speaker_id") or 0) != marker[2]:
+                event_order_differs = True
+            previous_end = max(previous_end, int(entry["end"]))
+        if event_order_differs:
+            # Cast-list S numbers are source aliases; H3 dialogue IDs follow
+            # first vocal-event order. Render those aliases as names in the
+            # fallback copy so a reordered cast cannot contradict the emitted
+            # (S1), (S2), ... voice tags. The submitted source stays untouched.
+            result = _canonicalize_h3_source_cast_markers(result, cast_speakers)
+            entries = _extract_h3_source_dialogue_entries(result, reference_context)
     for entry in reversed(entries):
         start = int(entry["start"])
         end = int(entry["end"])
@@ -7409,7 +8469,13 @@ def _compile_h3_explicit_dialogue(
             result = result[:start] + f"<d>[{entry['language']}] {entry['words']}</d>" + result[end:]
             continue
         existing = re.search(r"(?:<Subject\s+\d+>\s*)?\(S\d+\)\s*$", prefix, flags=re.IGNORECASE)
-        if existing:
+        existing_lead = prefix[:existing.start()] if existing else ""
+        recipient_marker = bool(re.search(
+            r"\b(?:to|for|toward|towards|with|at|from|of)\s*$",
+            existing_lead,
+            flags=re.IGNORECASE,
+        ))
+        if existing and not recipient_marker:
             absolute = max(0, start - 60) + existing.start()
             result = result[:absolute] + replacement + result[end:]
         else:
@@ -7528,9 +8594,22 @@ def _strip_h3_untagged_dialogue_duplicates(result: str, prompt: str) -> str:
 
 def _enforce_h3_soundscape_silence(result: str, prompt: str) -> str:
     """Keep the model from filling dialogue gaps with invented human noises."""
+    import re
+    _, explicit_audio_fields = _extract_h3_ref2va_audio_sections(prompt)
+    if "overall_soundscape" in explicit_audio_fields:
+        pattern = re.compile(
+            r"(?ms)^\s*overall_soundscape\s*:.*?(?=^\s*non_diegetic_music\s*:|\Z)",
+        )
+        match = pattern.search(str(result or ""))
+        requested_soundscape = explicit_audio_fields["overall_soundscape"].strip()
+        if not match or requested_soundscape not in match.group(0):
+            replacement = "overall_soundscape: " + requested_soundscape + "\n"
+            if match:
+                result = pattern.sub(lambda _match: replacement, str(result or ""), count=1)
+            else:
+                result = str(result or "").rstrip() + "\n" + replacement.rstrip()
     if not _h3_requests_speech(prompt):
         return result
-    import re
 
     # Preserve vocal reactions only when the source positively requests one.
     # H3 prompts often say "no voices, whispers, grunts..."; a plain keyword
@@ -7630,6 +8709,19 @@ def _enforce_h3_soundscape_silence(result: str, prompt: str) -> str:
     if not match:
         return result
     content = match.group(2).strip()
+    if "overall_soundscape" in explicit_audio_fields and not re.search(
+        r"(?i)\b(?:grunts?|gasps?|screams?|laughs?|laughter|sob\w*|cr(?:y|ies|ied|ying)|"
+        r"chuckl\w*|giggl\w*|audible\s+breathing|nonverbal\s+vocal\w*|"
+        r"chatter\w*|murmur\w*|voice\w*|speech|conversation|talk\w*)\b",
+        explicit_audio_fields["overall_soundscape"],
+    ):
+        silence_clause = (
+            "Outside the tagged dialogue, no human voices, whispers, grunts, audible breathing, "
+            "or speech-like vocalizations occur"
+        )
+        if silence_clause.casefold() not in content.casefold():
+            content = content.rstrip(" .") + ". " + silence_clause + "."
+        return result[:match.start()] + match.group(1) + " " + content + "\n" + result[match.end():]
     sentences = re.split(r"(?<=[.!?])\s+", content)
     kept = []
     for sentence in sentences:
@@ -7670,6 +8762,13 @@ def _enforce_h3_music_request(
 ) -> str:
     """Do not turn visual words such as 'cinematic' into an invented score."""
     import re
+    _, explicit_audio_fields = _extract_h3_ref2va_audio_sections(prompt)
+    if "non_diegetic_music" in explicit_audio_fields:
+        replacement = "non_diegetic_music: " + explicit_audio_fields["non_diegetic_music"].strip()
+        pattern = re.compile(r"(?ms)^\s*non_diegetic_music\s*:.*\Z")
+        if pattern.search(str(result or "")):
+            return pattern.sub(lambda _match: replacement, str(result or ""), count=1)
+        return str(result or "").rstrip() + "\n" + replacement
     requests_music = bool(
         re.search(
             r"(?i)\b(?:music|song|score|soundtrack|orchestra|orchestral|instrumental|melody|theme)\b",
@@ -7697,37 +8796,89 @@ def _build_h3_ref2va_tagged_fallback(
     *,
     duration_seconds: Optional[float] = None,
     planning_style: str = "faithful",
+    rejection_reasons: Optional[list[str]] = None,
 ) -> str:
     """Create a deterministic six-field fallback when the local LLM loops."""
+    import re
     from services.h3_prompt_budget import H3PromptBudgetError
     from services.h3_dialogue_source import unclosed_h3_spoken_quote_error
 
     source_error = unclosed_h3_spoken_quote_error(prompt)
     if source_error:
         raise H3PromptBudgetError(source_error)
+    request_prompt, explicit_audio_fields = _extract_h3_ref2va_audio_sections(prompt)
 
     from services.studio_enhancement import record_review_warning
-    record_review_warning("The AI draft did not produce a valid H3 reference prompt. Review the source-based draft before generating.")
+    if rejection_reasons:
+        reason_text = "; ".join(str(reason) for reason in rejection_reasons if str(reason).strip())
+        record_review_warning(
+            "The AI draft was rejected: " + reason_text
+            + ". Review the source-based draft before generating."
+        )
+    else:
+        record_review_warning("The AI draft did not produce a valid H3 reference prompt. Review the source-based draft before generating.")
     if has_h3_performance_audio(reference_context):
         definitions, retention = _canonical_h3_ref2va_subject_fields(reference_context, {})
-        return enforce_h3_performance_audio(
+        request = _compile_h3_explicit_dialogue(request_prompt, reference_context).strip()
+        performance_fallback = enforce_h3_performance_audio(
             f"subject_definitions: {definitions}\n"
             "summary: [reference generation + audio reuse] The requested visual performance.\n"
             f"retention_analysis: {retention}\n"
             "detailed_description: The target video maintains the requested visual style. "
-            f"[Shot 1] {prompt}\n"
-            "overall_soundscape: The supplied target soundtrack.\n"
-            "non_diegetic_music: N/A"
+            f"[Shot 1] {request}\n"
+            f"overall_soundscape: {explicit_audio_fields.get('overall_soundscape', 'The supplied target soundtrack.')}\n"
+            f"non_diegetic_music: {explicit_audio_fields.get('non_diegetic_music', 'N/A')}"
         )
+        return performance_fallback
     manifest = _parse_h3_ref2va_subject_manifest(reference_context)
     speaker_map = _h3_ref2va_subject_speaker_map(prompt, reference_context)
     subject_mapping, retention_mapping = _canonical_h3_ref2va_subject_fields(
         reference_context,
         speaker_map,
     )
-    request = _compile_h3_explicit_dialogue(prompt, reference_context)
+    request = _compile_h3_explicit_dialogue(request_prompt, reference_context)
+    request_text = request.strip()
+    if request_text and request_text[-1] not in ".!?":
+        request_text += "."
     adaptive = planning_style == "adaptive"
     requests_speech = _h3_requests_speech(prompt)
+    from services.dialogue_writing import dialogue_forbidden
+    speech_forbidden = dialogue_forbidden(prompt)
+    has_voice_reference = any(subject.get("audios") for subject in manifest)
+    context_text = str(reference_context or "")
+    motion_labels = sorted(set(re.findall(
+        r"(?mi)^\s*(<Video\s+\d+>)\s+provides\s+motion\b", context_text
+    )))
+    for label, description in _h3_ref2va_reference_rows(reference_context):
+        if label.startswith("<Video") and re.search(
+            r"(?i)\b(?:video_intent|intent)\s*=\s*motion\b|"
+            r"\b(?:motion|camera|composition)\s+reference\b",
+            description,
+        ):
+            motion_labels.append(label)
+    motion_labels = sorted(set(motion_labels), key=lambda label: int(re.search(r"\d+", label).group()))
+    motion_clause = (
+        " Use " + ", ".join(motion_labels)
+        + " as the requested motion, camera, composition, or timing reference. Preserve visible source movement and framing where requested; do not assert or invent source actions or events absent from the supplied prompt."
+        if motion_labels
+        else ""
+    )
+    has_identity_picture = any(subject.get("pictures") for subject in manifest)
+    identity_picture_clause = (
+        " Character identity pictures define appearance only; they do not transfer their original background, framing, pose, or opening still."
+        if has_identity_picture
+        else ""
+    )
+    composition_labels = sorted(set(re.findall(
+        r"(?mi)^\s*(<Picture\s+\d+>)\s+is\s+a\s+composition\s+and\s+blocking\s+reference\b",
+        context_text,
+    )), key=lambda label: int(re.search(r"\d+", label).group()))
+    composition_clause = (
+        " Use " + ", ".join(composition_labels)
+        + " for the requested composition and blocking, not as a character identity source."
+        if composition_labels
+        else ""
+    )
     timed_clause = (
         "Place each tagged line only after every action that causes or motivates it and before "
         "any consequence the source puts after it. Let the source action order determine speech "
@@ -7736,49 +8887,92 @@ def _build_h3_ref2va_tagged_fallback(
         if adaptive and requests_speech
         else (
             "Preserve every requested action and nonverbal reaction in source order; do not invent "
-            "spoken words or an absolute speech time."
+            "actions or events."
             if adaptive
             else _build_h3_timed_silence_clause(prompt, duration_seconds)
         )
     )
-    speech_boundary = (
-        (
+    paired_audio = re.search(
+        r"(?i)(<Audio\s+\d+>)\s+is\s+the\s+soundtrack\s+paired\s+with\s+<Video\s+\d+>",
+        context_text,
+    )
+    if requests_speech:
+        speech_boundary = (
             "The tagged dialogue is the only speech; add no other spoken words or speech-like "
             "vocalizations. Preserve explicitly requested nonverbal reactions."
-            if requests_speech
-            else "Add no spoken words or speech-like vocalizations. Preserve explicitly requested "
-            "nonverbal reactions."
+            if adaptive
+            else "The scripted dialogue is the only speech; all mouths remain closed before and after it."
         )
-        if adaptive
-        else "The scripted dialogue is the only speech; all mouths remain closed before and after it."
+        dialogue_boundary = (
+            " Each tagged dialogue block is spoken exactly once by its adjacent mapped speaker only; "
+            "no other subject repeats, echoes, mouths, or paraphrases another subject's line."
+        )
+    elif speech_forbidden:
+        speech_boundary = "No spoken words or speech-like vocalizations, as requested."
+        dialogue_boundary = ""
+    elif paired_audio:
+        speech_boundary = (
+            "Preserve the supplied soundtrack's vocal/nonvocal content; do not add new spoken words "
+            "or speech-like vocalizations."
+        )
+        dialogue_boundary = ""
+    else:
+        speech_boundary = (
+            "Do not add new spoken words or speech-like vocalizations. "
+            "Preserve explicitly requested nonverbal reactions."
+        )
+        dialogue_boundary = ""
+
+    sound_effect_audio = re.search(
+        r"(?i)<Audio\s+\d+>\s+(?:is|supplies)\s+(?:a\s+)?(?:reusable\s+)?sound[- ]effect\s+reference",
+        context_text,
     )
-    sound_boundary = (
-        "Outside tagged dialogue, add no spoken words or speech-like vocalizations; preserve only "
-        "explicitly requested nonverbal reactions."
-        if adaptive
-        else "Outside tagged dialogue there are no human voices, whispers, grunts, audible breathing, or speech-like vocalizations."
+    sound_requested = bool(re.search(
+        r"(?i)\b(?:sound|audio|soundtrack|music|ambience|ambiance|foley|sound effects?)\b",
+        request_prompt,
+    ))
+    if "overall_soundscape" in explicit_audio_fields:
+        soundscape = explicit_audio_fields["overall_soundscape"].strip()
+        if paired_audio:
+            soundscape += (
+                f"\nUse {paired_audio.group(1)} as a reference for the supplied soundtrack "
+                "and its audible timing."
+            )
+    elif paired_audio:
+        soundscape = (
+            f"Use {paired_audio.group(1)} as a reference for the supplied soundtrack and its audible timing."
+        )
+    elif sound_effect_audio:
+        soundscape = "Use the supplied sound-effect reference only for explicitly requested sounds."
+    elif requests_speech:
+        soundscape = "Render the requested dialogue clearly; do not add unrequested voices or generic ambience."
+    elif speech_forbidden or sound_requested:
+        soundscape = "Include only sounds explicitly requested by the prompt."
+    else:
+        soundscape = "N/A"
+
+    summary_dialogue = " and explicitly tagged dialogue" if requests_speech else ""
+    voice_clause = (
+        " Voice references supply vocal identity, timbre, emotion, and delivery only; reject source room tone, "
+        "reverberation, echo, background noise, microphone coloration, and spatial acoustics, and render "
+        "each requested voice inside the target environment."
+        if requests_speech and has_voice_reference
+        else ""
     )
     task_types = "reference generation"
-    if any(subject["audios"] for subject in manifest):
+    if has_voice_reference:
         task_types += " + audio reference"
     return (
         f"subject_definitions: {subject_mapping}\n"
         f"summary: [{task_types}] A finished video matching the requested action, identity, "
-        "setting, and explicitly tagged dialogue.\n"
+        f"setting{summary_dialogue}.\n"
         f"retention_analysis: {retention_mapping}\n"
         "detailed_description: The target video maintains the requested visual style, lighting, "
         "color, and cinematic texture. "
-        f"[Shot 1] The finished target video follows this request: {request} "
-        "Reference pictures provide identity and appearance only, never their original background, "
-        f"framing, pose, or an opening still. {speech_boundary} Each tagged dialogue block is spoken exactly once by its adjacent "
-        "mapped speaker only; no other subject repeats, echoes, mouths, or paraphrases another "
-        f"subject's line. {timed_clause}\n"
-        "overall_soundscape: Continuous scene-appropriate stereo ambience and synchronized practical "
-        "sound effects begin at the first frame and continue naturally underneath dialogue. "
-        f"{sound_boundary} Voice references supply vocal identity, timbre, emotion, and "
-        "delivery only; reject source room tone, reverberation, echo, background noise, microphone "
-        "coloration, and spatial acoustics, and render each voice inside the target environment.\n"
-        "non_diegetic_music: N/A"
+        f"[Shot 1] The finished target video follows this request: {request_text}{identity_picture_clause}"
+        f"{composition_clause}{motion_clause} {speech_boundary}{dialogue_boundary} {timed_clause}\n"
+        f"overall_soundscape: {soundscape}{voice_clause}\n"
+        f"non_diegetic_music: {explicit_audio_fields.get('non_diegetic_music', 'N/A').strip()}"
     )
 
 
@@ -8075,7 +9269,7 @@ def plan_angle_prompts(
     style_prompt: str,
     num_angles: int = 4,
 ) -> list:
-    """Generate image-edit prompts for camera angle variations of a reference photo.
+    """Generate image-edit prompts for camera angle variations of a reference image.
 
     Uses the LLM to refine each angle category into a short prompt that
     incorporates the user's style description.
@@ -8095,17 +9289,20 @@ def plan_angle_prompts(
     )
 
     system_prompt = (
-        "You are a photography director. Write short image-edit prompts that describe "
-        "how to reframe a reference photo into different camera angles. "
+        "You are an image composition director. Write short image-edit prompts that describe "
+        "how to reframe a reference image into different camera angles. "
         "Each prompt should be under 30 words and describe the framing, angle, and mood. "
         "Incorporate the user's style into each prompt. "
         "Output numbered prompts like '1. prompt text'. Output ONLY the numbered prompts."
     )
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    system_prompt += "\n\n" + IMAGE_STYLE_GUIDANCE
 
     user_prompt = (
         f"Visual style: {style_prompt}\n\n"
         f"Write {len(angles)} image-edit prompts to create these camera angle variations "
-        f"of a reference photo:\n\n{angle_list}\n\n"
+        f"of a reference image:\n\n{angle_list}\n\n"
         f"Each prompt should describe the camera angle and incorporate the visual style. Go:"
     )
 
@@ -9057,9 +10254,12 @@ def plan_clip_prompts_and_images(
 
     # ── Build system prompt per prompt_type ──────────────────────────
     photo_line = (
-        "You are given a REFERENCE PHOTO — use it to identify the people, "
+        "You are given a REFERENCE IMAGE — use it to identify the people, "
         "their clothing, and the setting.\n"
     ) if has_image else ""
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    photo_line += IMAGE_STYLE_GUIDANCE + "\n"
 
     char_rule = (
         "- NEVER use character names in image OR video prompts — neither the image "
@@ -9068,7 +10268,7 @@ def plan_clip_prompts_and_images(
         "based on what you visually see in the attached reference image. For example, "
         "write 'the woman in the white lab coat' instead of a character name.\n"
         "- Character names ARE only allowed in spoken dialogue in the video prompt.\n"
-        "- Describe people using what you SEE in the photo + Scene description."
+        "- Describe people using what you SEE in the image + Scene description."
     ) if has_image else (
         "- NEVER use character names in image OR video prompts. Instead, describe each "
         "person by their visual appearance: clothing, hair color, position.\n"
@@ -9085,7 +10285,7 @@ def plan_clip_prompts_and_images(
         "itself calls for a move. Do NOT invent new locations for visual variety — "
         "vary the camera angle, framing, distance, and lighting instead.\n"
         "- Do NOT add subjects, creatures, or objects the Scene Concept and "
-        "reference photos don't contain. Any examples in these instructions "
+        "reference images don't contain. Any examples in these instructions "
         "show FORMAT only — never copy their content into prompts.\n"
         "- Use the lyrics to inspire mood and visual metaphors, NOT literal text.\n"
         "- If a clip says 'Performer:', that person must appear.\n"
@@ -9103,13 +10303,13 @@ def plan_clip_prompts_and_images(
         if has_image:
             system_prompt = (
                 f"You are a creative music video scene designer.\n{photo_line}\n"
-                "Each clip's image prompt EDITS the reference photo to create a visually "
+                "Each clip's image prompt EDITS the reference image to create a visually "
                 "distinct starting frame. Think like a cinematographer choosing each shot — "
                 "vary camera angle, framing, or lighting when it serves the scene, but "
                 "maintain continuity when that makes more sense.\n\n"
                 "Focus your prompt on WHAT TO CHANGE — new camera angles, different framing, "
                 "new settings, repositioned characters, lighting shifts. You do NOT need to "
-                "re-describe things that stay the same as the reference photo.\n\n"
+                "re-describe things that stay the same as the reference image.\n\n"
                 "WHEN TO DESCRIBE CHARACTERS: When you change the setting to a new location, "
                 "re-describe characters by clothing/appearance so the editor knows who to place. "
                 "When the setting stays the same, you only need to describe characters whose "
@@ -9118,17 +10318,17 @@ def plan_clip_prompts_and_images(
                 "GOOD: 'change the setting to a neon-lit club, the woman in the red dress stands center stage under purple lights'\n"
                 "GOOD: 'change to an over-the-shoulder shot from behind the man in the dark jacket, looking at the stage'\n"
                 "BAD: 'Edit the provided image. Show Sarah dancing. Preserve character identity.' — uses name, meta-instructions\n"
-                "BAD: re-describing the entire reference photo when nothing changed\n\n"
+                "BAD: re-describing the entire reference image when nothing changed\n\n"
                 "RULES:\n"
                 f"{shared_rules}"
                 "- Use a mix of shot types (close-ups, wide shots, over-shoulder, etc.) "
                 "where appropriate — but continuity between consecutive clips is fine when it fits.\n"
-                "- The PERFORMER IS the person/character in the reference photo. Anchor them "
+                "- The PERFORMER IS the person/character in the reference image. Anchor them "
                 "explicitly in EVERY prompt ('the [descriptor] from the reference image') — "
                 "describing them loosely as a new character makes the image model invent a "
                 "different-looking one.\n"
-                "- NO motion blur, speed lines, or long-exposure effects — the image is a sharp "
-                "still frame; motion belongs to the video prompt.\n"
+                "- Keep the opening frame in the requested medium. Retain requested "
+                "motion lines, blur or other visual effects without narrating later transitions.\n"
                 "- Focus on WHAT TO CHANGE from the reference. Do not re-describe things that stay the same.\n"
                 "- Do NOT start with 'Edit the provided image' — just describe the changes.\n"
                 "- Do NOT use preservation meta-language ('preserve', 'maintain', 'keep unchanged').\n"
@@ -9179,19 +10379,19 @@ def plan_clip_prompts_and_images(
     else:
         # Combined "both" mode — LLM has full creative control
         image_instruction = (
-            "- I (image edit): EDITS the reference photo to create the FIRST FRAME BEFORE action begins. "
+            "- I (image edit): EDITS the reference image to create the OPENING INSTANT before later video transitions. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
             "show the room without them. Focus on WHAT TO CHANGE from reference. "
-            "Describe POSES as static states (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
-            "No motion blur, speed lines, or long-exposure effects — the frame is sharp. "
+            "Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
+            "Preserve the requested medium and any deliberate visual effects in that still frame. "
             "Anchor the performer as 'the [descriptor] from the reference image'. "
-            "NEVER use names. Actions belong ONLY in V, never in I.\n"
+            "NEVER use names. Later transitions belong in V; I may show action already underway at the opening instant.\n"
         ) if has_image else (
-            "- I (image): the FIRST FRAME BEFORE action begins — a frozen still photograph. "
+            "- I (image): the OPENING INSTANT before later video transitions — a single still frame in the requested medium. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
-            "the room is empty. Describe static poses only (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
+            "the room is empty. Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
             "Characters (by appearance, not name), positions, setting, lighting, mood.\n"
         )
         system_prompt = (
@@ -9207,7 +10407,7 @@ def plan_clip_prompts_and_images(
             "'cut to', or 'series of shots'. Character names ARE only allowed in spoken dialogue.\n"
             f"{image_instruction}"
             "- I prompts describe ONE SINGLE STATIC IMAGE — the starting frame that the "
-            "video animates FROM. No motion, no actions, no dancing. Just a frozen "
+            "video animates FROM. Do not narrate later transitions here. Just a frozen "
             "establishing shot: where everyone is, what the setting looks like.\n\n"
             "CREATIVE DIRECTION:\n"
             f"{shared_rules}"
@@ -9483,9 +10683,12 @@ def plan_short_film_prompts(
 
     # ── Build system prompt ──────────────────────────────────────
     photo_line = (
-        "You are given a REFERENCE PHOTO showing the characters. "
+        "You are given a REFERENCE IMAGE showing the characters. "
         "Use it to identify the people, their appearance, clothing, and setting.\n"
     ) if has_image else ""
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    photo_line += IMAGE_STYLE_GUIDANCE + "\n"
 
     char_rule = (
         "- NEVER use character names in image OR video prompts — neither the image "
@@ -9495,7 +10698,7 @@ def plan_short_film_prompts(
         "write 'the woman in the white lab coat' instead of 'Dr Ava', or "
         "'the man in the blue shirt' instead of 'Mr Johnson'.\n"
         "- Character names ARE only allowed in spoken dialogue in the video prompt.\n"
-        "- Describe characters using what you SEE in the photo + the character descriptions."
+        "- Describe characters using what you SEE in the image + the character descriptions."
     ) if has_image else (
         "- NEVER use character names in image OR video prompts. Instead, describe each "
         "person by their visual appearance: clothing, hair color, position. "
@@ -9509,12 +10712,12 @@ def plan_short_film_prompts(
             system_prompt = (
                 f"You are a cinematic scene designer for a short film.\n{photo_line}\n"
                 f"{char_context}"
-                "Each shot's image prompt EDITS the reference photo to create a starting "
+                "Each shot's image prompt EDITS the reference image to create a starting "
                 "frame. Think like a cinematographer — vary camera angle, framing, or lighting "
                 "when it serves the scene, but maintain continuity when that makes more sense.\n\n"
                 "Focus your prompt on WHAT TO CHANGE — new camera angles, different framing, "
                 "new settings, repositioned characters, lighting shifts. You do NOT need to "
-                "re-describe things that stay the same as the reference photo.\n\n"
+                "re-describe things that stay the same as the reference image.\n\n"
                 "WHEN TO DESCRIBE CHARACTERS: When you change the setting to a new location, "
                 "re-describe characters by clothing/appearance so the editor knows who to place. "
                 "When the setting stays the same, you only need to describe characters whose "
@@ -9524,7 +10727,7 @@ def plan_short_film_prompts(
                 "- 'change the setting to a dark alley with rain. The woman in the white coat stands against a wall.'\n"
                 "- 'change to an over-the-shoulder shot from behind the man, looking across the room'\n\n"
                 "BAD EXAMPLES (never write prompts like this):\n"
-                "- 'change to a bright living room. Woman in pink sits on couch. Man sits next to her.' — re-describes what's already in the reference photo\n"
+                "- 'change to a bright living room. Woman in pink sits on couch. Man sits next to her.' — re-describes what's already in the reference image\n"
                 "- 'Edit the provided image. Show Dr Ava standing.' — uses name, meta-instruction\n\n"
                 "RULES:\n"
                 "- Use a mix of shot types (close-ups, wide shots, over-shoulder, etc.) where "
@@ -9586,19 +10789,19 @@ def plan_short_film_prompts(
     else:
         # Combined "both" mode
         image_instruction = (
-            "- I (image edit): EDITS the reference photo to create the FIRST FRAME BEFORE action begins. "
+            "- I (image edit): EDITS the reference image to create the OPENING INSTANT before later video transitions. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
             "show the room without them. Focus on WHAT TO CHANGE from reference. "
-            "Describe POSES as static states (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
-            "No motion blur, speed lines, or long-exposure effects — the frame is sharp. "
+            "Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
+            "Preserve the requested medium and any deliberate visual effects in that still frame. "
             "Anchor the performer as 'the [descriptor] from the reference image'. "
-            "NEVER use names. Actions belong ONLY in V, never in I.\n"
+            "NEVER use names. Later transitions belong in V; I may show action already underway at the opening instant.\n"
         ) if has_image else (
-            "- I (image): the FIRST FRAME BEFORE action begins — a frozen still photograph. "
+            "- I (image): the OPENING INSTANT before later video transitions — a single still frame in the requested medium. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
-            "the room is empty. Describe static poses only (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
+            "the room is empty. Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
             "Characters (by appearance, not name), positions, setting, lighting, mood.\n"
         )
         system_prompt = (
@@ -9616,7 +10819,7 @@ def plan_short_film_prompts(
             "Character names ARE only allowed in spoken dialogue.\n"
             f"{image_instruction}"
             "- I prompts describe ONE SINGLE STATIC IMAGE — the starting frame that "
-            "the video animates FROM. No motion, no actions, no gestures. Just a frozen "
+            "the video animates FROM. Do not narrate later transitions here. Just a frozen "
             "establishing shot: where everyone is, what the setting looks like.\n\n"
             "CINEMATIC DIRECTION:\n"
             "- Match camera complexity to the content. If someone is speaking directly "
@@ -9802,9 +11005,12 @@ def plan_short_film_from_story(
             char_context = "Characters:\n" + "\n".join(char_lines) + "\n\n"
 
     photo_line = (
-        "You are given a REFERENCE PHOTO showing the characters. "
+        "You are given a REFERENCE IMAGE showing the characters. "
         "Use it to identify the people, their appearance, clothing, and setting.\n"
     ) if has_image else ""
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    photo_line += IMAGE_STYLE_GUIDANCE + "\n"
 
     char_rule = (
         "- NEVER use character names in image_prompt OR video_prompt — neither the "
@@ -9813,7 +11019,7 @@ def plan_short_film_from_story(
         "in frame, based on what you visually see in the attached reference image. "
         "For example, write 'the woman in the white lab coat' instead of a character name.\n"
         "- Character names ARE only allowed in spoken dialogue within the video_prompt.\n"
-        "- Describe characters using what you SEE in the photo + the character descriptions."
+        "- Describe characters using what you SEE in the image + the character descriptions."
     ) if has_image else (
         "- NEVER use character names in image_prompt OR video_prompt. Instead, describe "
         "each person by their visual appearance: clothing, hair color, position.\n"
@@ -9838,18 +11044,18 @@ def plan_short_film_from_story(
 
     # ── System prompt: scene planner + prompt writer ──────────────
     image_instruction = (
-        "- image_prompt: EDITS the reference photo to create the FIRST FRAME BEFORE action begins. "
+        "- image_prompt: EDITS the reference image to create the OPENING INSTANT before later video transitions. "
         "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
         "show the room without them. Focus on WHAT TO CHANGE from reference. "
-        "Describe POSES as static states (standing, seated, leaning). "
-        "No motion verbs (walking, running, reaching, heaving, turning). "
-        "Actions belong ONLY in video_prompt, never in image_prompt. "
+        "Describe the opening-frame pose and scene state. "
+        "Keep later transitions in the video prompt. "
+        "Later transitions belong in video_prompt; image_prompt may show action already underway. "
         "NEVER use character names or meta-instructions.\n"
     ) if has_image else (
-        "- image_prompt: the FIRST FRAME BEFORE action begins — a frozen still photograph. "
+        "- image_prompt: the OPENING INSTANT before later video transitions — a single still frame in the requested medium. "
         "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
-        "the room is empty. Describe static poses only (standing, seated, leaning). "
-        "No motion verbs (walking, running, reaching, heaving, turning). "
+        "the room is empty. Describe the opening-frame pose and scene state. "
+        "Keep later transitions in the video prompt. "
         "Characters (by appearance, NOT by name), positions, setting, lighting, mood.\n"
     )
 
@@ -9914,15 +11120,15 @@ def plan_short_film_from_story(
         "- Let the story concept guide you — don't force cinematic complexity onto simple content.\n\n"
         f"{image_instruction}\n"
         "IMAGE PROMPT GUIDE (how to write image_prompt values):\n"
-        "The image_prompt EDITS the reference photo to create a starting frame for each "
+        "The image_prompt EDITS the reference image to create a starting frame for each "
         "scene. Match your approach to the camera style above — vary angle and framing "
         "when the story calls for it, maintain continuity when it doesn't.\n\n"
-        "The image editor starts with the reference photo and applies your changes. "
+        "The image editor starts with the reference image and applies your changes. "
         "Focus your prompt on WHAT TO CHANGE — new camera angles, different framing, "
         "new settings, repositioned characters, lighting shifts. You do NOT need to "
-        "re-describe things that stay the same as the reference photo.\n\n"
+        "re-describe things that stay the same as the reference image.\n\n"
         "IMPORTANT — what each prompt does:\n"
-        "- image_prompt = the FIRST FRAME BEFORE action begins. Describe the shot setup: camera "
+        "- image_prompt = the OPENING INSTANT before later video transitions. Describe the shot setup: camera "
         "angle, framing, setting, lighting, character positions.\n"
         "- video_prompt = all motion, action, dialogue, gestures, camera movement\n\n"
         "WHEN TO DESCRIBE CHARACTERS: When you change the setting to a new location, "
@@ -9959,9 +11165,9 @@ def plan_short_film_from_story(
         "- Character names ARE only allowed in spoken dialogue in the video_prompt\n"
         "- Do NOT start with 'Edit the provided image'\n"
         "- Do NOT use meta-language ('preserve', 'maintain', 'keep unchanged')\n"
-        "- image_prompt = STILL PHOTOGRAPH. No motion verbs whatsoever: no walking, "
-        "running, reaching, heaving, turning, gesturing, raising, dancing. "
-        "Describe static poses only (standing, seated, leaning). All action belongs in video_prompt.\n"
+        "- image_prompt shows one opening frame in the requested medium. "
+        "Preserve the opening pose, including action already underway when requested. "
+        "Keep later transitions and subsequent actions in video_prompt.\n"
         "- Carry forward cumulative visual state changes: if a character got wet, "
         "injured, or changed clothes earlier, mention that difference.\n"
         f"{char_rule}\n"

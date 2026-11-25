@@ -117,6 +117,153 @@ class MusicNarrativeTests(unittest.TestCase):
         boarding = contract_for("Show the sailor boarding the boat.")["events"][0]
         self.assertIn("boat", boarding["target_aliases"])
 
+    def test_finite_spins_are_actions_but_with_spins_is_a_choreography_noun(self):
+        finite = contract_for("The dancer spins on the beat.")
+        self.assertEqual([event["text"] for event in finite["events"]], [
+            "spins on the beat",
+        ])
+        self.assertIn("dancer", finite["events"][0]["actor_aliases"])
+
+        nominal_source = (
+            "The dancer dances with spins, footwork and floor moves, then "
+            "finishes in the starting pose."
+        )
+        nominal = contract_for(nominal_source)
+        self.assertEqual(nominal["source"], nominal_source)
+        self.assertEqual(nominal["events"], [])
+
+    def test_requester_intent_does_not_own_requested_action(self):
+        for intent in ("want", "need", "would like"):
+            source = f"I {intent} the woman to walk across the room."
+            with self.subTest(intent=intent):
+                events = contract_for(source)["events"]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["text"], "walk across the room")
+                self.assertEqual(events[0]["actor_aliases"], ["woman"])
+
+        first_person = contract_for("I walk across the room.")["events"]
+        self.assertEqual(len(first_person), 1)
+        self.assertIn("i", first_person[0]["actor_aliases"])
+
+    def test_neutral_looping_dance_brief_keeps_choreography_in_source(self):
+        source = (
+            "I want a looping animated music video of a woman who starts in a "
+            "low crouch, dances energetically with spins, footwork and floor "
+            "moves, then finishes in the same pose so the clip loops smoothly."
+        )
+        contract = contract_for(source)
+        self.assertEqual(contract["revision"], 5)
+        self.assertEqual(contract["source"], source)
+        self.assertIn("spins, footwork and floor moves", contract["source"])
+        self.assertEqual(contract["events"], [])
+
+    def test_native_h3_metadata_and_sound_fields_do_not_become_story_events(self):
+        source = (
+            "subject_definitions: The sailor boards a boat and wears a navy coat; "
+            "preserve identity and wardrobe. "
+            "summary: A sailor boards a small boat, then the boat sails across the bay. "
+            "retention_analysis: Keep actions running sequentially from0 through11; "
+            "preserve the opening pose and wardrobe. "
+            "direction_and_description: Create a twelve-beat outline running "
+            "sequentially from 0 through 11. Each beat specifies shot size, movement, "
+            "and intended framing. Opening: establish the harbor before the story. "
+            "overall_soundscape: Waves and wind swell softly. "
+            "on_diegetic_music: A guitarist plays beside the water. "
+            "non_diegetic_music: Let the score rise during the ending."
+        )
+        contract = contract_for(source)
+        events = contract["events"]
+
+        self.assertEqual(contract["revision"], 5)
+        self.assertEqual([event["text"] for event in events], [
+            "boards a small boat", "sails across the bay",
+        ])
+        self.assertEqual([event["kind"] for event in events], ["boarding", "action"])
+        self.assertIn("sailor", events[0]["actor_aliases"])
+        self.assertIn("boat", events[0]["target_aliases"])
+        self.assertIn("boat", events[1]["actor_aliases"])
+
+    def test_schema_examples_are_ignored_but_real_json_beats_are_extracted(self):
+        example_source = (
+            'Use a JSON beats example like '
+            '{"beats": [{"action": "A sailor opens the hatch."}]}. '
+            "Show the sailor boarding the boat."
+        )
+        self.assertEqual(
+            [event["text"] for event in contract_for(example_source)["events"]],
+            ["boarding the boat"],
+        )
+
+        actual_beats = (
+            '{"beats": ['
+            '{"action": "A sailor boards a skiff."}, '
+            '{"visual_beat": "The boat sails east."}'
+            ']}'
+        )
+        events = contract_for(actual_beats)["events"]
+        self.assertEqual([event["text"] for event in events], [
+            "boards a skiff", "sails east",
+        ])
+
+        beat_with_unrelated_nested_metadata = (
+            '{"beats": [{"visual_beat": "A courier opens the gate.", '
+            '"metadata": {"type": "object", "properties": {"label": {"type": "string"}}}}]}'
+        )
+        self.assertEqual(
+            [event["text"] for event in contract_for(beat_with_unrelated_nested_metadata)["events"]],
+            ["opens the gate"],
+        )
+
+        directed_field = contract_for(
+            "direction_and_description: Show the sailor boarding the boat."
+        )
+        self.assertEqual([event["text"] for event in directed_field["events"]], [
+            "boarding the boat",
+        ])
+
+    def test_native_identity_definitions_remain_context_for_collective_combat(self):
+        source = (
+            "subject_definitions: <Subject 1> is Astra, a commander in silver armor. "
+            "<Subject 2> is Regent, her rival in a dark coat. "
+            "detailed_description: They fight using their respective powers."
+        )
+        events = contract_for(source)["events"]
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "combat")
+        self.assertEqual(events[0]["participant_names"], ["Astra", "Regent"])
+        self.assertEqual(len(events[0]["participant_alias_groups"]), 2)
+
+    def test_nested_json_metadata_and_schemas_do_not_add_events(self):
+        source = (
+            '{"beats": [{"visual_beat": "A courier opens the gate.", '
+            '"metadata": {"description": "The courier runs past a sample camera."}, '
+            '"overall_soundscape": {"description": "Waves and wind."}}], '
+            '"response_schema": {"type": "object", "properties": {'
+            '"beats": {"description": "A sailor boards the sample boat."}}}}'
+        )
+        self.assertEqual(
+            [event["text"] for event in contract_for(source)["events"]],
+            ["opens the gate"],
+        )
+
+    def test_camera_format_words_do_not_hide_adjacent_story_actions(self):
+        sources = (
+            "Show the sailor boarding the boat with a wide shot size and intended framing.",
+            "The courier opens the door; specify the shot size and intended framing.",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                events = contract_for(source)["events"]
+                self.assertEqual(len(events), 1)
+                self.assertIn(events[0]["kind"], {"boarding", "action"})
+
+        repeated_camera_metadata = (
+            "Specify shot size, movement, and intended framing, then specify "
+            "shot size, movement, and intended framing."
+        )
+        self.assertEqual(contract_for(repeated_camera_metadata)["events"], [])
+
     def test_explicit_action_references_do_not_create_milestones(self):
         for source in (
             "Show the boarding action before sailing.",
@@ -172,6 +319,18 @@ class MusicNarrativeTests(unittest.TestCase):
                     self.assertEqual(events[0]["kind"], "attack")
                 else:
                     self.assertEqual(events, [])
+
+    def test_framing_directives_leave_the_visible_prop_action_and_actor_intact(self):
+        contract = contract_for(
+            'Do not use Text in the Images besides two shots in which '
+            'Character X proudly presents a document titled "Run. Close the Door." '
+            'Use one shot where Character X stamps the word abgelehnt onto the paper.'
+        )
+        events = contract["events"]
+        self.assertEqual([event["kind"] for event in events], ["action", "action"])
+        self.assertEqual(events[0]["text"], 'presents a document titled "Run. Close the Door."')
+        self.assertEqual(events[1]["text"], "stamps the word abgelehnt onto the paper")
+        self.assertTrue(all("character x" in event["actor_aliases"] for event in events))
 
     def test_physical_shooting_and_throwing_remain_narrative_events(self):
         contract = contract_for(
@@ -401,6 +560,137 @@ class MusicNarrativeTests(unittest.TestCase):
             contract=contract, allocation=allocation, index=0,
         )
         self.assertIsNotNone(issue)
+
+    def test_drop_inflections_keep_actor_object_and_origin_with_from_out_of_equivalence(self):
+        source = (
+            "The wizard is the star. He is dropping magical music notes "
+            "from his Badbag."
+        )
+        contract = contract_for(source)
+        event = contract["events"][0]
+        allocation = [{"event_id": "M1", "clip_index": 0}]
+
+        self.assertEqual(event["text"], "dropping magical music notes from his Badbag")
+        self.assertIn("wizard", event["actor_aliases"])
+        for prompt in (
+            "The wizard is dropping magical music notes from his Badbag.",
+            "The wizard drops magical music notes from his Badbag.",
+            "The wizard dropped magical music notes out of his Badbag.",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(music_narrative_row_issue(
+                    {"source_event_ids": ["M1"], "video_prompt": prompt},
+                    contract=contract, allocation=allocation, index=0,
+                ))
+
+        rejected_prompts = (
+            "The dancer drops magical music notes out of his Badbag.",
+            "The wizard drops golden coins out of his Badbag.",
+            "The wizard drops magical music notes out of his satchel.",
+            "The wizard drops pebbles out of his Badbag decorated with magical music notes.",
+            "The wizard drops magical music notes out of his satchel decorated with a picture of Badbag.",
+            "The wizard drops magical music notes into his Badbag.",
+            "The wizard drops magical music notes onto his Badbag.",
+            "The wizard does not drop magical music notes out of his Badbag.",
+            "The caption mentions the wizard dropping magical music notes from his Badbag.",
+            'A sign reads, "The wizard drops magical music notes out of his Badbag."',
+            "The wizard plans to drop magical music notes out of his Badbag.",
+        )
+        for prompt in rejected_prompts:
+            with self.subTest(prompt=prompt):
+                self.assertIsNotNone(music_narrative_row_issue(
+                    {"source_event_ids": ["M1"], "video_prompt": prompt},
+                    contract=contract, allocation=allocation, index=0,
+                ))
+
+        reverse_source = contract_for(
+            "The wizard is the star. He is dropping magical music notes "
+            "out of his Badbag."
+        )
+        self.assertIsNone(music_narrative_row_issue(
+            {
+                "source_event_ids": ["M1"],
+                "video_prompt": "The wizard drops magical music notes from his Badbag.",
+            },
+            contract=reverse_source,
+            allocation=allocation,
+            index=0,
+        ))
+        for prompt in (
+            "The wizard drops magical music notes into his Badbag.",
+            "The wizard drops magical music notes onto his Badbag.",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNotNone(music_narrative_row_issue(
+                    {"source_event_ids": ["M1"], "video_prompt": prompt},
+                    contract=reverse_source, allocation=allocation, index=0,
+                ))
+
+    def test_drop_pronoun_antecedent_is_immediate_and_conservative(self):
+        ambiguous_sources = (
+            "The wizard hands the dancer a lantern. He is dropping magical music notes from his Badbag.",
+            "The wizard and the dancer are stars. He is dropping magical music notes from his Badbag.",
+            "The wizard is staring at the dancer. He is dropping magical music notes from his Badbag.",
+            "The wizard is talking about the dancer. He is dropping magical music notes from his Badbag.",
+            "The wizard is guiding Mira. He is dropping magical music notes from his Badbag.",
+            "The wizard is a guide for Mira. He is dropping magical music notes from his Badbag.",
+            "The wizard is the dancer's friend. He is dropping magical music notes from his Badbag.",
+            'The line says "The wizard is the star." He is dropping magical music notes from his Badbag.',
+            "Show the wizard on stage. He is dropping magical music notes from his Badbag.",
+            "He is dropping magical music notes from his Badbag.",
+        )
+        for source in ambiguous_sources:
+            with self.subTest(source=source):
+                event = contract_for(source)["events"][-1]
+                self.assertNotIn("actor_aliases", event)
+
+        switched_subject = contract_for(
+            "The wizard is the star. The dancer is the rival. "
+            "He is dropping magical music notes from his Badbag."
+        )["events"][0]
+        self.assertIn("dancer", switched_subject["actor_aliases"])
+        self.assertNotIn("wizard", switched_subject["actor_aliases"])
+
+        local_subject = contract_for(
+            "The wizard is the star. He watches the dancer dropping magical music notes from his Badbag."
+        )["events"][0]
+        self.assertIn("dancer", local_subject["actor_aliases"])
+        self.assertNotIn("wizard", local_subject["actor_aliases"])
+
+        explicit_local_subject = contract_for(
+            "The wizard is the star. The dancer drops magical music notes from her Badbag."
+        )["events"][0]
+        self.assertIn("dancer", explicit_local_subject["actor_aliases"])
+
+        local_pronoun_precedence = contract_for(
+            "The wizard is the star. The dancer enters, then he drops magical music notes from his Badbag."
+        )["events"][-1]
+        self.assertIn("dancer", local_pronoun_precedence["actor_aliases"])
+        self.assertNotIn("wizard", local_pronoun_precedence["actor_aliases"])
+
+    def test_drop_equivalence_does_not_cover_a_future_source_event(self):
+        contract = contract_for(
+            "The wizard is the star. He is dropping magical music notes from his Badbag. "
+            "The wizard opens the door."
+        )
+        allocation = [
+            {"event_id": "M1", "clip_index": 0},
+            {"event_id": "M2", "clip_index": 2},
+        ]
+        issue = music_narrative_row_issue(
+            {
+                "source_event_ids": ["M1"],
+                "video_prompt": (
+                    "The wizard drops magical music notes out of his Badbag, "
+                    "then opens the door."
+                ),
+            },
+            contract=contract,
+            allocation=allocation,
+            index=0,
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("future music narrative event M2", issue)
 
     def test_nonfantasy_boarding_and_sailing_are_narrative_actions(self):
         contract = contract_for("A passenger boards a boat, then sails across the bay.")

@@ -465,6 +465,7 @@ class TestFusedH3LoraRuntime(unittest.TestCase):
 
         model = MiniMaxH3Model.__new__(MiniMaxH3Model)
         model._fused_turbo = True
+        model.dwd_steps = None
         model.model_def = {}
         model.omni_reference = False
         model._turbo_lora_active = True
@@ -511,6 +512,7 @@ class TestFusedH3LoraRuntime(unittest.TestCase):
         pipeline._fused_turbo = True
         pipeline._turbo_lora_active = False
         pipeline._pdd_lora_active = False
+        pipeline.ptd_refasymopd = False
         lora_a = torch.tensor([[1.0, 0.0, -1.0, 0.5]])
         lora_b = torch.tensor([[0.25], [-0.75]])
         inputs = torch.tensor([[1.0, 2.0, 4.0, 8.0]])

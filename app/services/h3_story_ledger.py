@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from models.minimax_h3.speakers import is_h3_production_label
 from services.h3_performance_audio import (
-    PERFORMANCE_AUDIO_GUIDANCE,
+    performance_audio_guidance,
     discover_h3_requested_static_holds,
     has_h3_performance_audio,
     performance_audio_window_guidance,
@@ -98,7 +98,7 @@ from services.director.long_form_story import (
 )
 
 
-H3_STORY_LEDGER_VERSION = 121
+H3_STORY_LEDGER_VERSION = 123
 
 
 _H3_WINDOW_BOOKKEEPING_RE = re.compile(
@@ -455,18 +455,75 @@ _STYLE_WORD_RE = re.compile(
     flags=re.IGNORECASE,
 )
 def normalize_h3_dialogue_tags(value: Any) -> str:
-    """Repair harmless whitespace in user-authored ``<d>`` tags.
+    """Normalize ``<d>`` tags and repair one unambiguous terminal duplicate.
 
     Mobile keyboards and pasted prompts commonly produce ``< d>`` or
     ``< / d >``.  MiniMax understands only the canonical spelling, and the
     story ledger must recognize the line before it removes dialogue from the
     visual event stream.  Normalize only the tag delimiters; spoken words are
-    left byte-for-byte unchanged.
+    left byte-for-byte unchanged. A final repeated opener is treated as the
+    closing delimiter only when the preceding tag stream is balanced, the two
+    openers share one plain-text line, and the duplicate is followed only by
+    EOF or blank-separated native audio fields.
     """
 
     text = str(value or "")
     text = re.sub(r"<\s*d\s*>", "<d>", text, flags=re.IGNORECASE)
-    return re.sub(r"<\s*/\s*d\s*>", "</d>", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/\s*d\s*>", "</d>", text, flags=re.IGNORECASE)
+
+    tags = list(re.finditer(r"</?d>", text, flags=re.IGNORECASE))
+    if len(tags) < 2:
+        return text
+
+    first, duplicate = tags[-2:]
+    if first.group(0).casefold() != "<d>" or duplicate.group(0).casefold() != "<d>":
+        return text
+
+    # The prefix must be a sequence of complete, non-nested dialogue blocks.
+    depth = 0
+    for tag in tags[:-2]:
+        if tag.group(0).casefold() == "<d>":
+            if depth:
+                return text
+            depth = 1
+        else:
+            if not depth:
+                return text
+            depth = 0
+    if depth:
+        return text
+
+    body = text[first.end():duplicate.start()]
+    if not body.strip() or any(char in body for char in "\r\n<>"):
+        return text
+
+    suffix = text[duplicate.end():]
+    if suffix.strip():
+        # Audio fields can follow the last authored line in a prompt, but only
+        # after a blank line and only when every remaining nonempty line is a
+        # native H3 audio field. Any later markup keeps the case ambiguous.
+        separator = re.match(r"\r?\n[ \t]*\r?\n", suffix)
+        if separator is None:
+            return text
+        field_text = suffix[separator.end():]
+        if re.search(r"<[^>]*>", field_text):
+            return text
+        field_names = []
+        for line in field_text.splitlines():
+            if not line.strip():
+                continue
+            field = re.fullmatch(
+                r"[ \t]*(overall_soundscape|non_diegetic_music)\s*:.*",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if field is None:
+                return text
+            field_names.append(field.group(1).casefold())
+        if not field_names or len(field_names) > 2 or len(set(field_names)) != len(field_names):
+            return text
+
+    return text[:duplicate.start()] + "</d>" + text[duplicate.end():]
 
 
 def _is_style_only_fragment(value: str) -> bool:
@@ -2143,6 +2200,181 @@ def _reference_h3_cast_names(value: Any) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _h3_picture_bindings(source: Any, reference_context: Any = "") -> dict[str, str]:
+    """Resolve explicit Picture references to one unambiguous cast identity."""
+
+    source_names: dict[str, list[str]] = {}
+    source_picture = re.compile(
+        r"(?P<name>[A-Z][A-Za-z0-9_'’\-]*(?:[ \t]+[A-Z][A-Za-z0-9_'’\-]*){0,3})"
+        r"[ \t]*(?i:<picture\s+(?P<picture>\d+)>)",
+    )
+    for match in source_picture.finditer(str(source or "")):
+        name = sanitize_h3_prompt_text(match.group("name")).strip(" ,;:.-")
+        if name:
+            source_names.setdefault(match.group("picture"), []).append(name)
+
+    source_bindings: dict[str, str] = {}
+    for picture, labels in source_names.items():
+        unique_labels = list(dict.fromkeys(labels))
+        canonical = max(unique_labels, key=lambda value: (len(_plain_h3_name_parts(value)), len(value)))
+        aliases = {
+            _normalize_key(canonical),
+            *(_normalize_key(alias) for alias in _h3_cast_aliases(canonical, [canonical])),
+        }
+        if all(_normalize_key(label) in aliases for label in unique_labels):
+            source_bindings[picture] = canonical
+
+    reference_names: dict[str, list[str]] = {}
+    for match in re.finditer(
+        r"<Subject\s+\d+>\s+is\s+(?P<name>[^<\r\n]+?)\s+from\s+<Picture\s+(?P<picture>\d+)>",
+        str(reference_context or ""),
+        flags=re.IGNORECASE,
+    ):
+        name = sanitize_h3_prompt_text(match.group("name")).strip(" ,;:.-")
+        if name:
+            reference_names.setdefault(match.group("picture"), []).append(name)
+
+    bindings: dict[str, str] = {}
+    for picture, names in reference_names.items():
+        unique_names = list(dict.fromkeys(names))
+        if len(unique_names) != 1:
+            continue
+        reference_name = unique_names[0]
+        source_name = source_bindings.get(picture)
+        if source_name and _resolve_h3_cast_name(source_name, [reference_name]) != reference_name:
+            # A source label and the attached identity disagree. Keep this
+            # Picture unmapped rather than silently selecting either person.
+            continue
+        bindings[picture] = reference_name
+    for picture, name in source_bindings.items():
+        if picture not in reference_names:
+            bindings[picture] = name
+    return bindings
+
+
+def _resolve_h3_scene_cut_dialogue_speaker(
+    source: str,
+    quote_start: int,
+    speaker: Any,
+    reference_context: Any = "",
+) -> str:
+    """Resolve a pronoun or simple plural typo only within an explicit cut scene."""
+
+    transitions = list(re.finditer(
+        r"\b(?:scene|camera|shot)\s+cuts?\s+(?:back\s+)?to\b",
+        source[:max(0, int(quote_start))],
+        flags=re.IGNORECASE,
+    ))
+    if not transitions:
+        return ""
+    local_start = transitions[-1].start()
+    local = source[local_start:max(0, int(quote_start))]
+    picture_mentions = list(re.finditer(r"<picture\s+(\d+)>", local, flags=re.IGNORECASE))
+    pictures = list(dict.fromkeys(match.group(1) for match in picture_mentions))
+    if len(pictures) != 1:
+        return ""
+
+    bindings = _h3_picture_bindings(source, reference_context)
+    target = bindings.get(pictures[0], "")
+    if not target:
+        return ""
+
+    picture_mention = picture_mentions[-1]
+    label_match = re.search(
+        r"(?P<label>[A-Z][A-Za-z0-9_'’\-]*(?:[ \t]+[A-Z][A-Za-z0-9_'’\-]*){0,3})[ \t]*$",
+        local[:picture_mention.start()],
+    )
+    if not label_match:
+        return ""
+    label_owner = _resolve_h3_cast_name(label_match.group("label"), [target])
+    if label_owner != target:
+        return ""
+
+    clean_speaker = sanitize_h3_prompt_text(speaker).strip(" ,;:.-")
+    if clean_speaker.casefold() in {"he", "she", "they"}:
+        # A scene can introduce another person after its establishing Picture
+        # tag. In that case a later pronoun is no longer bound uniquely to the
+        # tagged interview subject, even when the original cut named one person.
+        local_cue = local[picture_mention.end():]
+        bound_names = list(dict.fromkeys(bindings.values()))
+        for other_name in bound_names:
+            if _normalize_key(other_name) == _normalize_key(target):
+                continue
+            if any(
+                re.search(
+                    rf"(?<![\w]){re.escape(alias)}(?![\w])",
+                    local_cue,
+                    flags=re.IGNORECASE,
+                )
+                for alias in _h3_cast_aliases(other_name, bound_names)
+                if alias
+            ):
+                return ""
+        if re.search(
+            r"\b(?:another|a|an|the|second|different|other)\s+"
+            r"(?:[A-Za-z][A-Za-z'’-]*\s+){0,2}"
+            r"(?:person|man|woman|interviewer|reporter|host|guest|stranger)\b",
+            local_cue,
+            flags=re.IGNORECASE,
+        ):
+            return ""
+        interview_binding = re.search(
+            rf"\binterview\b[^.!?\r\n]*\bwith\b[^.!?\r\n]*<picture\s+{re.escape(pictures[0])}>",
+            local,
+            flags=re.IGNORECASE,
+        )
+        return target if interview_binding else ""
+
+    # A single trailing 's' is accepted only when the corrected stem resolves
+    # to this same explicitly tagged identity (e.g. `Michaels` -> `Michael`).
+    if clean_speaker.casefold().endswith("s") and len(clean_speaker) > 3:
+        corrected = _resolve_h3_cast_name(clean_speaker[:-1], [target])
+        if corrected == target:
+            return target
+    return ""
+
+
+def _canonicalize_h3_source_dialogue_cues(
+    prompt: Any,
+    reference_context: Any = "",
+) -> str:
+    """Fix proven speaker cues in the planning copy without editing quoted words."""
+
+    # extract_locked_dialogue normalizes tags before calculating source offsets.
+    # Work against that same string so cue edits cannot be shifted by `< d>`
+    # normalization and land inside quoted dialogue or a neighboring clause.
+    source = normalize_h3_dialogue_tags(str(prompt or ""))
+    raw_dialogue = extract_locked_dialogue(
+        source,
+        resolve_reference_speakers=False,
+    )
+    if not raw_dialogue or not reference_context and not _h3_picture_bindings(source):
+        return source
+    resolved_dialogue = extract_locked_dialogue(source, reference_context=reference_context)
+    edits: list[tuple[int, int, str]] = []
+    for raw, resolved in zip(raw_dialogue, resolved_dialogue):
+        old_speaker = sanitize_h3_prompt_text(raw.get("speaker"))
+        new_speaker = sanitize_h3_prompt_text(resolved.get("speaker"))
+        if not old_speaker or not new_speaker or old_speaker.casefold() == new_speaker.casefold():
+            continue
+        quote_start = int(raw.get("source_offset") or 0)
+        previous_boundary = max(
+            source.rfind(mark, 0, quote_start)
+            for mark in (".", "!", "?", "\r", "\n")
+        )
+        cue_start = previous_boundary + 1
+        cue = source[cue_start:quote_start]
+        candidates = list(re.finditer(rf"(?<![\w]){re.escape(old_speaker)}(?![\w])", cue, flags=re.IGNORECASE))
+        cue_match = next((match for match in reversed(candidates)
+                          if _SPEECH_VERB.search(cue[match.end():])), None)
+        if cue_match is None:
+            continue
+        edits.append((cue_start + cue_match.start(), cue_start + cue_match.end(), new_speaker))
+    for start, end, replacement in reversed(edits):
+        source = source[:start] + replacement + source[end:]
+    return source
+
+
 def _source_requests_multiple_cast_instances(prompt: Any, name: Any) -> bool:
     """Allow explicitly requested twins, clones, copies, or multiple versions."""
 
@@ -2168,7 +2400,12 @@ def _source_requests_multiple_cast_instances(prompt: Any, name: Any) -> bool:
     ))
 
 
-def _derive_h3_cast_names(source: str, proper_names: list[str]) -> list[str]:
+def _derive_h3_cast_names(
+    source: str,
+    proper_names: list[str],
+    *,
+    reference_context: Any = "",
+) -> list[str]:
     """Separate named principals from works, products, and named locations."""
 
     profile_names = [item["name"] for item in explicit_character_profiles(source)] + [
@@ -2179,7 +2416,7 @@ def _derive_h3_cast_names(source: str, proper_names: list[str]) -> list[str]:
     ]
     spoken_names = [
         sanitize_h3_prompt_text(item.get("speaker"))
-        for item in extract_locked_dialogue(source)
+        for item in extract_locked_dialogue(source, reference_context=reference_context)
         if sanitize_h3_prompt_text(item.get("speaker")) not in {"", "Speaker"}
     ]
     # Explicit cast definitions plus a closed-cast instruction are stronger
@@ -2419,15 +2656,24 @@ def _active_h3_cast_names(names: list[str], value: Any) -> list[str]:
     return active
 
 
-def extract_h3_source_intent(prompt: str) -> dict[str, Any]:
+def extract_h3_source_intent(
+    prompt: str,
+    *,
+    reference_context: Any = "",
+) -> dict[str, Any]:
     """Extract immutable camera, pacing, style, and vocal requirements.
 
     These facts are application-owned. They must survive even when the local
     planning LLM returns malformed JSON or exhausts its response budget.
     """
 
-    raw_source = normalize_h3_dialogue_tags(prompt)
-    locked_dialogue = extract_locked_dialogue(raw_source)
+    raw_source = normalize_h3_dialogue_tags(
+        _canonicalize_h3_source_dialogue_cues(prompt, reference_context)
+    )
+    locked_dialogue = extract_locked_dialogue(
+        raw_source,
+        reference_context=reference_context,
+    )
     source = sanitize_h3_prompt_text(raw_source)
     raw_directive_source = video_direction_source(_without_locked_dialogue(
         raw_source,
@@ -2539,7 +2785,11 @@ def extract_h3_source_intent(prompt: str) -> dict[str, Any]:
             continue
         if name not in proper_names:
             proper_names.append(name)
-    cast_names = _derive_h3_cast_names(raw_source, proper_names)
+    cast_names = _derive_h3_cast_names(
+        raw_source,
+        proper_names,
+        reference_context=reference_context,
+    )
     cast_cardinality = _h3_cast_cardinality_contract(raw_source, cast_names)
     blocking_contract = _infer_h3_blocking_contract(raw_source, cast_names)
 
@@ -2634,7 +2884,11 @@ def extract_h3_source_intent(prompt: str) -> dict[str, Any]:
     if _FAST_ACTION_RE.search(directive_source):
         ambient_parts.append("speed-dependent rushing air")
     video_source = video_direction_source(raw_source)
-    video_dialogue = locked_dialogue if video_source == raw_source else extract_locked_dialogue(video_source)
+    video_dialogue = (
+        locked_dialogue
+        if video_source == raw_source
+        else extract_locked_dialogue(video_source, reference_context=reference_context)
+    )
     directive_spans = _h3_persistent_instruction_spans(video_source)
     opening_only_directions: list[str] = []
     for start, end, text in directive_spans:
@@ -3132,7 +3386,12 @@ def _explicit_speech_action_order(prompt: str) -> dict[str, dict[str, str]]:
     return order
 
 
-def extract_locked_dialogue(prompt: str) -> list[dict[str, Any]]:
+def extract_locked_dialogue(
+    prompt: str,
+    *,
+    reference_context: Any = "",
+    resolve_reference_speakers: bool = True,
+) -> list[dict[str, Any]]:
     """Extract tagged, quoted, or screenplay-form dialogue before rewriting."""
 
     from models.minimax_h3.speakers import h3_action_beat_speaker, is_h3_spoken_quote
@@ -3244,6 +3503,17 @@ def extract_locked_dialogue(prompt: str) -> list[dict[str, Any]]:
             continue
         if label and not screenplay:
             speaker = label.group(1)
+        resolved_speaker = (
+            _resolve_h3_scene_cut_dialogue_speaker(
+                source,
+                start,
+                speaker,
+                reference_context,
+            )
+            if resolve_reference_speakers else ""
+        )
+        if resolved_speaker:
+            speaker = resolved_speaker
         speech_context = source[max(context_start, start - 240):start]
         off_camera = bool(span.get("off_camera")) or bool(re.search(
             r"\b(?:off[- ]camera|offscreen|off[- ]screen|pov\s+(?:off[- ]camera\s+)?voice)\b",
@@ -7043,8 +7313,8 @@ def _prepare_render_dialogue_schedule(
             base > 1
             and is_pure_speech_event(dialogue_id)
             and (
-                word_count > budgets[base - 1]
-                or base_word_totals[base] > budgets[base - 1]
+                word_count > budgets[base - 2]
+                or base_word_totals[base] > budgets[base - 2]
             )
         )
         start = max(last_segment, base - 1 if can_begin_previous else base)
@@ -7730,6 +8000,7 @@ def _deterministic_ledger(
     reference_context: str,
     source_events_override: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    prompt = _canonicalize_h3_source_dialogue_cues(prompt, reference_context)
     source_events = (
         list(source_events_override)
         if source_events_override is not None
@@ -7743,7 +8014,7 @@ def _deterministic_ledger(
         executable_ids = set(executable_h3_source_event_ids(source_events, source_relationships))
         source_events = [event for event in source_events if event["event_id"] in executable_ids]
     fragments = [item["text"] for item in source_events]
-    intent = extract_h3_source_intent(prompt)
+    intent = extract_h3_source_intent(prompt, reference_context=reference_context)
     intent["audio_driven"] = has_h3_performance_audio(reference_context)
     if intent["audio_driven"]:
         locked_dialogue = []
@@ -9031,6 +9302,33 @@ def _camera_event_card_schema(segment_number: int, assigned_beats: list[dict[str
     })
 
 
+def _project_schema_fields(value: Any, schema: dict[str, Any]) -> Any:
+    """Drop only recognized provider bookkeeping, preserving semantic extras."""
+
+    schema_type = schema.get("type")
+    if schema_type == "object" and isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return value
+        projected = {}
+        for key, item in value.items():
+            normalized_key = str(key).casefold()
+            if normalized_key in {"provider_note", "provider_trace", "provider_metadata"}:
+                continue
+            child_schema = properties.get(key)
+            projected[key] = (
+                _project_schema_fields(item, child_schema)
+                if isinstance(child_schema, dict) else item
+            )
+        return projected
+    if schema_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, dict):
+            return value
+        return [_project_schema_fields(item, item_schema) for item in value]
+    return value
+
+
 def _expand_camera_event_cards(
     segment: dict[str, Any], *, assigned_beats: list[dict[str, Any]],
     segment_number: int, duration: float,
@@ -9043,6 +9341,21 @@ def _expand_camera_event_cards(
     copy and count identifiers. Do not invent a card if a provider ignores the
     schema: incomplete writing still needs repair/review.
     """
+
+    # Some providers append benign bookkeeping fields despite the structured
+    # schema. Ignore those fields, while leaving every required value and
+    # source-ordered event assignment subject to the same checks below.
+    source_proof = segment.get("_source_camera_proof") if isinstance(segment, dict) else None
+    segment = _project_schema_fields(
+        segment, _camera_event_card_schema(segment_number, assigned_beats),
+    )
+    if not isinstance(segment, dict):
+        raise ValueError("Camera draft must be an object.")
+    if source_proof is not None:
+        # This opaque compiler evidence is attached after the provider draft is
+        # schema-projected. Keep it through event-card compilation so exact
+        # source actions remain trusted during validation.
+        segment["_source_camera_proof"] = source_proof
 
     events = segment.get("event_cards")
     expected_keys = [f"event_{i}" for i in range(1, len(assigned_beats) + 1)]
@@ -13230,6 +13543,7 @@ def plan_h3_story_segments(
     llm_generate: Callable[..., str] | None = None,
     lora_system_hint: str = "",
     resume: dict | None = None,
+    source_audio_context_windows: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a compact ledger and expand one validated local segment at a time."""
 
@@ -13252,6 +13566,7 @@ def plan_h3_story_segments(
             image_reference_roles=image_reference_roles,
             nsfw=nsfw, llm_generate=generate,
             fidelity_retries=retry_limit,
+            source_audio_context_windows=source_audio_context_windows,
         )
         return _render_h3_story_segments(
             context, generate=generate, resume=resume,
@@ -13274,9 +13589,11 @@ def _prepare_h3_story_context(
     llm_generate: Callable[..., str] | None,
     image_reference_roles: list[dict[str, Any]] | None = None,
     fidelity_retries: int = 1,
+    source_audio_context_windows: list[str] | None = None,
 ) -> dict[str, Any]:
     from services import llm_service
 
+    prompt = _canonicalize_h3_source_dialogue_cues(prompt, reference_context)
     generate = llm_generate or llm_service.generate
     durations = [max(0.1, float(value)) for value in segment_durations]
     segment_count = len(durations)
@@ -13284,7 +13601,10 @@ def _prepare_h3_story_context(
         raise ValueError("H3 story planning requires at least one segment.")
     audio_driven = has_h3_performance_audio(reference_context)
     performance_clock = performance_audio_window_guidance(reference_context, durations)
-    locked_dialogue = [] if audio_driven else extract_locked_dialogue(prompt)
+    locked_dialogue = [] if audio_driven else extract_locked_dialogue(
+        prompt,
+        reference_context=reference_context,
+    )
     # Callers historically detected only quotation marks.  Treat any
     # canonical dialogue form, including ``CHARACTER: line`` screenplay rows,
     # as mandatory even when an older caller passes ``expect_dialogue=False``.
@@ -13308,7 +13628,10 @@ def _prepare_h3_story_context(
         if (projected := project_h3_requested_static_tail(reference_context, durations, request))
     ]
     has_authored_timing = bool(authored_timed_brief(prompt)["events"])
-    source_intent = extract_h3_source_intent(prompt)
+    source_intent = extract_h3_source_intent(
+        prompt,
+        reference_context=reference_context,
+    )
     reference_context = canonicalize_h3_reference_names(reference_context, source_intent["cast_names"])
     source_cast_names = _merge_h3_cast_names(
         list(source_intent.get("cast_names") or []),
@@ -13330,12 +13653,17 @@ def _prepare_h3_story_context(
     planning_diagnostics: list[str] = []
     planning_notes: list[str] = []
     if not start_frame_supplied and image_reference_roles:
+        original_reference_context = reference_context
         from services.h3_reference_scope import prepare_scoped_reference_context
         scoped = prepare_scoped_reference_context(
             generate, prompt, reference_context, image_paths, image_reference_roles,
         )
         if scoped["scoped"]:
             reference_context = scoped["context"]
+            if source_audio_context_windows and "SOURCE_AUDIO_TRANSCRIPT_CONTEXT" not in reference_context:
+                marker = original_reference_context.find("SOURCE_AUDIO_TRANSCRIPT_CONTEXT")
+                if marker >= 0:
+                    reference_context += "\n\n" + original_reference_context[marker:]
             image_paths = scoped["image_paths"]
             if scoped.get("warning"):
                 planning_warnings.append(scoped["warning"])
@@ -13612,8 +13940,8 @@ def _prepare_h3_story_context(
         from services.adaptive_enhancement import adaptive_writing_guide
         ledger_guide += "\n\n" + adaptive_writing_guide(prompt)
     if audio_driven:
-        ledger_guide += "\n\n" + PERFORMANCE_AUDIO_GUIDANCE
-        ledger_prompt += "\n\n" + PERFORMANCE_AUDIO_GUIDANCE
+        ledger_guide += "\n\n" + performance_audio_guidance(reference_context)
+        ledger_prompt += "\n\n" + performance_audio_guidance(reference_context)
         if performance_clock:
             ledger_prompt += "\n\nEXACT AUDIO / VISUAL WINDOW CLOCK:\n" + "\n".join(performance_clock)
     ledger_schema = (
@@ -14141,6 +14469,7 @@ def _prepare_h3_story_context(
         )
     return {
         "action_first": action_first,
+        "source_audio_context_windows": list(source_audio_context_windows or []),
         "allow_generated_dialogue": allow_generated_dialogue,
         "camera_coverage": camera_coverage,
         "catalog": catalog,
@@ -14216,7 +14545,9 @@ def _render_h3_story_segments(
         from services.adaptive_enhancement import adaptive_writing_guide
         segment_guide += "\n\n" + adaptive_writing_guide(prompt)
     if audio_driven:
-        segment_guide += "\n\n" + PERFORMANCE_AUDIO_GUIDANCE
+        segment_guide += "\n\n" + performance_audio_guidance(
+            "SOURCE_AUDIO_TRANSCRIPT_CONTEXT" if context.get("source_audio_context_windows") else "",
+        )
     cast_names = list(source_intent.get("cast_names") or [])
     dialogue_by_id = {
         str(item.get("dialogue_id") or "").upper(): item
@@ -14853,7 +15184,12 @@ def _render_h3_story_segments(
                 + (f"Required visible ending: {ledger.get('required_final_outcome')}." if segment_number == segment_count else "")
             )
         if audio_driven:
-            segment_prompt += "\n\n" + PERFORMANCE_AUDIO_GUIDANCE
+            segment_prompt += "\n\n" + performance_audio_guidance(
+                "SOURCE_AUDIO_TRANSCRIPT_CONTEXT" if context.get("source_audio_context_windows") else "",
+            )
+            audio_context_windows = context.get("source_audio_context_windows") or []
+            if index < len(audio_context_windows):
+                segment_prompt += "\n\nMATCHING SOURCE AUDIO CONTEXT:\n" + audio_context_windows[index]
             performance_clock = context.get("performance_audio_clock") or []
             if index < len(performance_clock):
                 segment_prompt += "\n\n" + performance_clock[index]
@@ -15062,6 +15398,13 @@ def _render_h3_story_segments(
         def canonicalize_camera_draft(draft):
             if source_camera is not None:
                 try:
+                    if isinstance(draft, dict):
+                        draft = _project_schema_fields(draft, schema)
+                        raw_segment_number = draft.get("segment")
+                        if (isinstance(raw_segment_number, str)
+                                and re.fullmatch(r"[1-9]\d*", raw_segment_number.strip())
+                                and int(raw_segment_number.strip()) == segment_number):
+                            draft["segment"] = segment_number
                     draft = _h3_source_camera_optics_only(draft, cast_names)
                     draft = source_camera.bind(draft)
                 except ValueError as error:
@@ -15076,6 +15419,42 @@ def _render_h3_story_segments(
                     and segment_number < segment_count
                 ),
             )
+
+        def note_camera_repair_failure(error: Exception) -> None:
+            reason = f"Focused camera repair failed ({type(error).__name__}): {error}"
+            planning_diagnostics.append(
+                f"Window {segment_number}: {reason} The last parsed camera draft "
+                "remains available for source-scoped recovery."
+            )
+            try:
+                from services.enhancement_diagnostics import record_rejection
+
+                record_rejection(
+                    [reason],
+                    stage=f"H3 window {segment_number} camera repair",
+                )
+            except Exception:
+                pass
+
+        def record_camera_validation_rejection(errors: list[str]) -> None:
+            # The separate source-coverage reviewer can confirm only lexical
+            # paraphrase omissions. Record hard contract failures immediately,
+            # while the camera response is still the active diagnostic draft.
+            hard_errors = [
+                error for error in errors
+                if not re.match(r"^\S+ shot action omits required source step:", error)
+            ]
+            if not hard_errors:
+                return
+            try:
+                from services.enhancement_diagnostics import record_rejection
+
+                record_rejection(
+                    hard_errors,
+                    stage=f"H3 window {segment_number} camera repair",
+                )
+            except Exception:
+                pass
 
         try:
             raw = generate(
@@ -15104,6 +15483,7 @@ def _render_h3_story_segments(
                 dialogue_catalog=catalog,
                 accepted_segments=segments,
             )
+            record_camera_validation_rejection(segment_errors)
             from services.h3_camera_fidelity import (
                 CameraReviewBudget, clear_confirmed_coverage_errors,
                 review_missing_camera_actions,
@@ -15194,42 +15574,53 @@ def _render_h3_story_segments(
                 from services.llm_sampling import caller_sampling
                 from promptbench.experiments import camera_repair_sampling_enabled
                 camera_repair_attempts += 1
-                with caller_sampling(camera_repair_sampling_enabled()):
-                    raw = generate(
-                        prompt=(
-                            repair_prompt
-                            + "\n\nPREVIOUS REJECTED SEGMENT JSON:\n"
-                            + rejected
-                            + "\n\nREPAIR ONLY THIS SEGMENT. Correct these violations:\n- "
-                            + "\n- ".join(feedback)
-                            + "\nReturn the complete event_cards object required by the schema. Maestro supplies the clock and ownership. "
-                            "Correct the named cards and preserve the other cards. "
-                            "Do not add, repeat, recap, or preview any event."
-                        ),
-                        system_prompt=camera_guide,
-                        max_new_tokens=min(8192, segment_token_budget * 2),
-                        temperature=0.08,
-                        top_p=0.78,
-                        image_paths=camera_images,
-                        enable_thinking=False,
-                        frequency_penalty=0.0,
-                        presence_penalty=0.0,
-                        json_schema=repair_schema,
-                    )
-                segment = _parse_json_object(raw, allow_repair=False)
-                if repair_keys:
-                    patches = segment.get("event_cards") if isinstance(segment, dict) else None
-                    if not isinstance(patches, dict) or any(key not in patches for key in repair_keys):
-                        raise ValueError("camera repair omitted a requested event card")
-                    # Ignore unrequested cards/metadata even if a remote
-                    # writer does not honor the restricted output schema.
-                    camera_draft["event_cards"].update({key: patches[key] for key in repair_keys})
-                    segment = camera_draft
-                else:
-                    # A later retry must see the newest rejected draft, not
-                    # the original response that began this repair sequence.
-                    camera_draft = deepcopy(segment)
-                segment = canonicalize_camera_draft(segment)
+                try:
+                    with caller_sampling(camera_repair_sampling_enabled()):
+                        raw = generate(
+                            prompt=(
+                                repair_prompt
+                                + "\n\nPREVIOUS REJECTED SEGMENT JSON:\n"
+                                + rejected
+                                + "\n\nREPAIR ONLY THIS SEGMENT. Correct these violations:\n- "
+                                + "\n- ".join(feedback)
+                                + "\nReturn the complete event_cards object required by the schema. Maestro supplies the clock and ownership. "
+                                "Correct the named cards and preserve the other cards. "
+                                "Do not add, repeat, recap, or preview any event."
+                            ),
+                            system_prompt=camera_guide,
+                            max_new_tokens=min(8192, segment_token_budget * 2),
+                            temperature=0.08,
+                            top_p=0.78,
+                            image_paths=camera_images,
+                            enable_thinking=False,
+                            frequency_penalty=0.0,
+                            presence_penalty=0.0,
+                            json_schema=repair_schema,
+                        )
+                    repaired_draft = _parse_json_object(raw, allow_repair=False)
+                    if not isinstance(repaired_draft, dict):
+                        raise ValueError("camera repair returned invalid JSON")
+                    if repair_keys:
+                        patches = repaired_draft.get("event_cards")
+                        if not isinstance(patches, dict) or any(key not in patches for key in repair_keys):
+                            raise ValueError("camera repair omitted a requested event card")
+                        # Ignore unrequested cards/metadata even if a remote
+                        # writer does not honor the restricted output schema.
+                        repaired_draft = deepcopy(camera_draft)
+                        repaired_draft["event_cards"].update(
+                            {key: patches[key] for key in repair_keys}
+                        )
+                    repaired_segment = canonicalize_camera_draft(repaired_draft)
+                except InterruptedError:
+                    raise
+                except Exception as error:
+                    note_camera_repair_failure(error)
+                    break
+                # A later retry must see the newest parsed draft, but a broken
+                # repair response must leave the last usable camera writing
+                # available to event-scoped recovery below.
+                camera_draft = deepcopy(repaired_draft)
+                segment = repaired_segment
                 segment_errors = segment_violations(
                     prompt,
                     segment,
@@ -15239,6 +15630,7 @@ def _render_h3_story_segments(
                     dialogue_catalog=catalog,
                     accepted_segments=segments,
                 )
+                record_camera_validation_rejection(segment_errors)
                 # A focused repair may leave other, already-reviewed cards
                 # untouched. Reuse their evidence only while it still matches.
                 segment_errors = clear_confirmed_coverage_errors(
@@ -15303,6 +15695,16 @@ def _render_h3_story_segments(
         except InterruptedError:
             raise
         except Exception as error:
+            if not segment_errors:
+                try:
+                    from services.enhancement_diagnostics import record_rejection
+
+                    record_rejection(
+                        [f"Camera draft was unusable ({type(error).__name__}): {error}"],
+                        stage=f"H3 window {segment_number} camera repair",
+                    )
+                except Exception:
+                    pass
             print(f"[MiniMax H3] Segment {segment_number} fallback: {error}")
             review_windows.add(segment_number)
             planned_by = "deterministic_fallback"

@@ -9,7 +9,7 @@ import { characterDisplayName } from '../../lib/characters'
 import { CharacterToolbarItem, SidebarDialog } from './SidebarPanels'
 import { MediaAddTile, MediaInputCard } from './MediaInputCard'
 import { GalleryInput } from '../shared/GalleryInput'
-import type { MiniMaxH3AudioIntent, MiniMaxH3Reference, MiniMaxH3ReferenceType, ModelOptions, SavedOmniCharacter } from '../../types'
+import type { MiniMaxH3AudioIntent, MiniMaxH3Reference, MiniMaxH3ReferenceType, MiniMaxH3VideoAudioRole, ModelOptions, SavedOmniCharacter } from '../../types'
 
 const IMAGE_RE = /\.(png|jpe?g|webp|bmp|tiff?)$/i
 const VIDEO_RE = /\.(mp4|mov|mkv|webm|avi|m4v)$/i
@@ -21,6 +21,46 @@ const AUDIO_INTENT_HELP: Record<MiniMaxH3AudioIntent, string> = {
   drive: 'Preserves the exact soundtrack and sets total duration to its full length.',
   style: 'Follows the source timeline across windows; later windows receive silence once the clip ends. H3 borrows its sound or music style.',
   sound: 'Each window gets the same short sample. Describe the effect and when it happens in your prompt. H3 generates matching sound; it does not play or loop the exact waveform or set total duration.',
+}
+const VIDEO_INTENT_HELP = {
+  character: 'Preserve this character’s identity and appearance while generating your new scene and actions. For new dialogue in their voice, also choose Voice reference below.',
+  motion: 'Guide movement, camera, composition, or timing. This does not assign the people in this video as character identities.',
+  scene: 'Preserve the environment, lighting, and scene continuity without using incidental people as character identities.',
+}
+const VIDEO_AUDIO_ROLE_HELP: Record<MiniMaxH3VideoAudioRole, string> = {
+  ignore: 'Use the video for visual guidance and ignore its soundtrack.',
+  legacy: 'Generative audio guidance. H3 may change the source sounds or add new audio; the original waveform is not preserved.',
+  output_only: 'Copies the source soundtrack onto the finished video after H3 generates the picture.',
+  drive: 'Preserves this soundtrack and uses it to guide the performance, including mouth movement. It can also set the output duration.',
+  voice: 'Reuse vocal identity and delivery for new dialogue without copying the source words or timing.',
+  style: 'Borrow sound, music, rhythm, or texture across the source timeline; later windows are silent after it ends.',
+  sound: 'Reuse this clip as sound-effect timbre guidance in each window; generation places the effect from the prompt.',
+}
+
+function effectiveVideoAudioRole(reference: MiniMaxH3Reference): MiniMaxH3VideoAudioRole {
+  return reference.video_audio_role ?? (reference.include_audio === false ? 'ignore' : 'legacy')
+}
+
+function hasOutputOnlySoundtrackConflict(references: MiniMaxH3Reference[]): boolean {
+  const outputOnly = references.filter(reference => reference.type === 'video'
+    && effectiveVideoAudioRole(reference) === 'output_only')
+  return outputOnly.length > 1 || (outputOnly.length === 1 && references.some(reference => (
+    (reference.type === 'audio' && reference.audio_intent === 'drive')
+    || (reference.type === 'video' && effectiveVideoAudioRole(reference) === 'drive')
+  )))
+}
+
+function referenceCounts(references: MiniMaxH3Reference[]) {
+  const counts = {image: 0, video: 0, audio: 0, total: references.length}
+  for (const reference of references) {
+    counts[reference.type] += 1
+    if (reference.type === 'video') {
+      const role = effectiveVideoAudioRole(reference)
+      if (['drive', 'voice', 'style', 'sound'].includes(role)) counts.audio += 1
+      if (['voice', 'style', 'sound'].includes(role)) counts.total += 1
+    }
+  }
+  return counts
 }
 
 function mediaType(file: File): MiniMaxH3ReferenceType | null {
@@ -47,7 +87,11 @@ function referenceLabels(references: MiniMaxH3Reference[]): string[] {
   let audios = 0
   return references.map(reference => {
     const labels: string[] = []
-    if (reference.type === 'audio' || (reference.type === 'video' && (reference.has_audio || reference.audio_path) && reference.include_audio !== false)) {
+    const videoRole = reference.type === 'video' ? effectiveVideoAudioRole(reference) : null
+    if (reference.type === 'audio' || (reference.type === 'video' && (
+      videoRole === 'voice' || videoRole === 'style' || videoRole === 'sound'
+      || (videoRole === 'legacy' && (reference.has_audio || reference.audio_path) && reference.include_audio !== false)
+    ))) {
       labels.push(`Audio ${++audios}`)
     }
     if (reference.type === 'image') labels.push(`Picture ${++pictures}`)
@@ -165,10 +209,30 @@ export function OmniReferenceSection({
   const references = scope === 'director'
     ? directorReferences
     : (params.minimax_h3_references ?? EMPTY_REFERENCES)
+  useEffect(() => {
+    const choices = modelOptions?.omni_reference_detail_choices
+    const defaultDetail = modelOptions?.omni_reference_detail_default
+    if (!choices?.length || !defaultDetail) return
+    const currentDetail = scope === 'director'
+      ? directorDetail
+      : params.minimax_h3_reference_detail
+    const supported = choices.some(([, value]) => value === currentDetail)
+    if (supported || (currentDetail == null && defaultDetail !== 'ptd768')) return
+    if (scope === 'director') setDirectorDetail(defaultDetail)
+    else setParam('minimax_h3_reference_detail', defaultDetail)
+  }, [
+    scope,
+    modelOptions,
+    directorDetail,
+    params.minimax_h3_reference_detail,
+    setDirectorDetail,
+    setParam,
+  ])
   const limits = modelOptions?.omni_reference_limits ?? {
     image: 9, video: 3, audio: 3, total: 12,
   }
   const labels = referenceLabels(references)
+  const budget = referenceCounts(references)
 
   useEffect(() => {
     const needsVoiceLock = references.some(reference => (
@@ -203,18 +267,14 @@ export function OmniReferenceSection({
     setError('')
     try {
       const next = [...references]
-      const counts = {
-        image: next.filter(item => item.type === 'image').length,
-        video: next.filter(item => item.type === 'video').length,
-        audio: next.filter(item => item.type === 'audio').length,
-      }
+      const counts = referenceCounts(next)
       for (const file of files) {
         const type = mediaType(file)
         if (!type) {
           setError(`${file.name} is not a supported image, video, or audio file.`)
           continue
         }
-        if (next.length >= limits.total || counts[type] >= limits[type]) {
+        if (counts.total >= limits.total || counts[type] >= limits[type]) {
           setError(`Reference limit reached (${limits.image} images, ${limits.video} videos, ${limits.audio} audio; ${limits.total} total).`)
           break
         }
@@ -231,10 +291,12 @@ export function OmniReferenceSection({
           has_audio: type === 'video' ? Boolean('has_audio' in uploaded && uploaded.has_audio) : type === 'audio',
           include_audio: type === 'video' ? Boolean('has_audio' in uploaded && uploaded.has_audio) : undefined,
           audio_intent: type === 'audio' ? 'voice' : undefined,
+          video_intent: type === 'video' ? 'motion' : undefined,
           follow_timeline: type === 'video' ? true : undefined,
           role: '',
         })
         counts[type] += 1
+        counts.total += 1
       }
       update(next)
       return next.length > references.length
@@ -257,12 +319,18 @@ export function OmniReferenceSection({
     setError('')
     try {
       const uploaded = reference.type === 'audio' ? await api.uploadAudio(file) : await api.uploadImage(file)
+      const hasAudio = reference.type === 'video'
+        ? Boolean('has_audio' in uploaded && uploaded.has_audio)
+        : reference.type === 'audio'
       update(currentReferences().map(item => item.id === reference.id ? {
         ...item, path: uploaded.path, filename: file.name, url: uploaded.url,
         duration_seconds: uploaded.duration_seconds ?? null,
         source_duration_seconds: undefined,
         effective_duration_seconds: undefined,
-        has_audio: reference.type === 'video' ? Boolean('has_audio' in uploaded && uploaded.has_audio) : reference.type === 'audio',
+        has_audio: hasAudio,
+        video_audio_role: item.video_audio_role === 'output_only' && !hasAudio && !item.audio_path
+          ? 'ignore'
+          : item.video_audio_role,
       } : item))
     } catch (error) { setError(error instanceof Error ? error.message : 'Could not replace reference.') }
     finally { setUploading(false) }
@@ -308,14 +376,9 @@ export function OmniReferenceSection({
       })
     }
     if (additions.length === 0) return
-    const counts = {
-      image: current.filter(item => item.type === 'image').length,
-      video: current.filter(item => item.type === 'video').length,
-      audio: current.filter(item => item.type === 'audio').length,
-    }
-    for (const addition of additions) counts[addition.type] += 1
+    const counts = referenceCounts([...current, ...additions])
     if (
-      current.length + additions.length > limits.total
+      counts.total > limits.total
       || counts.image > limits.image
       || counts.video > limits.video
       || counts.audio > limits.audio
@@ -381,14 +444,7 @@ export function OmniReferenceSection({
     }
   }
 
-  const setAudioIntent = (index: number, intent: MiniMaxH3AudioIntent) => {
-    const reference = references[index]
-    patchReference(index, { audio_intent: intent })
-
-    // Voice and style references are reusable conditioning, not timelines.
-    // An exact music/performance driver, however, defines the output length.
-    if (intent !== 'drive') return
-    const audioDuration = Number(reference?.duration_seconds)
+  const applyDriveDuration = (audioDuration: number) => {
     if (!Number.isFinite(audioDuration) || audioDuration <= 0) return
 
     if (scope === 'director') {
@@ -410,6 +466,44 @@ export function OmniReferenceSection({
     setDurationSeconds(audioDuration)
   }
 
+  const setAudioIntent = (index: number, intent: MiniMaxH3AudioIntent) => {
+    const reference = references[index]
+    const next = references.map((item, position) => position === index ? {...item, audio_intent: intent} : item)
+    if (hasOutputOnlySoundtrackConflict(next)) {
+      setError('Choose one output soundtrack. An output-only track and a performance timeline cannot be selected together.')
+      return
+    }
+    setError('')
+    patchReference(index, { audio_intent: intent })
+    if (intent === 'drive') applyDriveDuration(Number(reference?.duration_seconds))
+  }
+
+  const setVideoAudioRole = (index: number, role: MiniMaxH3VideoAudioRole) => {
+    const reference = references[index]
+    const next = references.map((item, position) => position === index ? {...item, video_audio_role: role} : item)
+    if (hasOutputOnlySoundtrackConflict(next)) {
+      setError('Choose one output soundtrack. Clear the other output-only track or performance timeline first.')
+      return
+    }
+    const counts = referenceCounts(next)
+    if (counts.total > limits.total || counts.audio > limits.audio) {
+      setError('This soundtrack role needs an audio reference slot. Remove another reference or choose Ignore source audio.')
+      return
+    }
+    setError('')
+    patchReference(index, {
+      video_audio_role: role,
+      // Keep the persisted legacy field consistent for older readers while
+      // making the explicit role the source of truth for new requests.
+      include_audio: role === 'legacy',
+    })
+    if (role === 'drive') {
+      // Attached audio has its own measured duration. Never substitute the
+      // video's visual duration for an embedded soundtrack's duration.
+      applyDriveDuration(Number(reference?.audio_duration_seconds))
+    }
+  }
+
   const attachAudio = async (referenceId: string, file: File | undefined) => {
     if (!file || disabled || uploading) return
     const type = mediaType(file)
@@ -427,7 +521,7 @@ export function OmniReferenceSection({
         audio_path: uploaded.path,
         audio_filename: file.name,
         audio_duration_seconds: uploaded.duration_seconds ?? null,
-        include_audio: true,
+        include_audio: !reference.video_audio_role || reference.video_audio_role === 'legacy',
       } : reference))
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : 'Soundtrack upload failed.')
@@ -455,15 +549,18 @@ export function OmniReferenceSection({
     : (params.minimax_h3_reference_detail
       ?? modelOptions?.omni_reference_detail_default
       ?? 'match')
+  const detailHelp = detail === 'ptd768'
+    ? 'PTD RefAsymOPD fixes reference preparation to a 768px short edge as part of its eight-hop recipe.'
+    : 'Match output preserves the selected output-sized preparation and avoids reference upscaling. High detail follows the official Ref2VA PDD 2048px-short-edge recipe, but can use substantially more memory and time.'
 
-  const setDetail = (next: 'match' | 'max') => {
+  const setDetail = (next: 'match' | 'max' | 'ptd768') => {
     if (scope === 'director') setDirectorDetail(next)
     else setParam('minimax_h3_reference_detail', next)
   }
 
   const activeItems = groupActiveReferences(references)
-  const canAddMore = references.length < limits.total && (['image', 'video', 'audio'] as const)
-    .some(type => references.filter(reference => reference.type === type).length < limits[type])
+  const canAddMore = budget.total < limits.total && (['image', 'video', 'audio'] as const)
+    .some(type => budget[type] < limits[type])
   // Keep all three thumbnails in their row. The selected editor participates
   // in normal document flow, so it never overlays the prompt or other inputs.
   const referenceRows = Array.from({ length: Math.ceil((activeItems.length + Number(canAddMore)) / 3) }, (_, row) => activeItems.slice(row * 3, row * 3 + 3))
@@ -546,6 +643,21 @@ export function OmniReferenceSection({
             <option value="voice">Voice reference</option><option value="drive">Music / performance timeline</option><option value="style">Music / sound style only</option><option value="sound">Sound effect reference</option>
           </select>
         </label>}
+        {reference.type === 'video' && <label className="min-w-[165px] flex-1 space-y-1 text-[11px] text-text-muted">
+          <span>Type</span>
+          <select aria-label={`${labels[index]} type`} value={reference.video_intent ?? 'motion'} disabled={disabled || !!reference.refmod_path}
+            onChange={event => patchReference(index, {
+              video_intent: event.target.value as MiniMaxH3Reference['video_intent'],
+              follow_timeline: event.target.value !== 'character',
+            })} className={fieldClass}>
+            <option value="character">Character / identity</option>
+            <option value="motion">Motion / camera</option>
+            <option value="scene">Scene</option>
+          </select>
+        </label>}
+        {reference.type === 'video' && <p className="basis-full min-w-0 text-[11px] leading-relaxed text-text-muted">
+          {VIDEO_INTENT_HELP[reference.video_intent ?? 'motion']}
+        </p>}
         {reference.type === 'audio' && <p className="basis-full min-w-0 text-[11px] leading-relaxed text-text-muted">
           {AUDIO_INTENT_HELP[reference.audio_intent ?? 'voice']}
         </p>}
@@ -560,11 +672,23 @@ export function OmniReferenceSection({
           onChange={event => patchReference(index, { remove_background: event.target.checked })} className="h-3.5 w-3.5 accent-accent-blue" />
         {reference.image_intent === 'object' ? 'Isolate object background' : 'Isolate subject background'}
       </label>}
-      {reference.type === 'video' && (reference.has_audio || reference.audio_path) && <label className="flex min-h-8 cursor-pointer items-center gap-2 text-[11px] text-text-secondary">
-        <input type="checkbox" disabled={disabled} checked={reference.include_audio !== false}
-          onChange={event => patchReference(index, { include_audio: event.target.checked })} className="h-3.5 w-3.5 accent-accent-blue" />
-        Include soundtrack
-      </label>}
+      {reference.type === 'video' && (reference.has_audio || reference.audio_path) && <div className="space-y-1">
+        <label className="min-w-[190px] space-y-1 text-[11px] text-text-muted">
+          <span>Soundtrack role</span>
+          <select aria-label={`${labels[index]} soundtrack role`} value={effectiveVideoAudioRole(reference)} disabled={disabled}
+            onChange={event => setVideoAudioRole(index, event.target.value as MiniMaxH3VideoAudioRole)}
+            title={VIDEO_AUDIO_ROLE_HELP[effectiveVideoAudioRole(reference)]} className={fieldClass}>
+            <option value="ignore">Ignore source audio</option>
+            <option value="legacy">Audio reference (generative)</option>
+            {scope === 'studio' && <option value="output_only">Keep source audio (output only)</option>}
+            <option value="drive">Preserve soundtrack / performance timeline</option>
+            <option value="voice">Voice reference</option>
+            <option value="style">Music / sound style</option>
+            <option value="sound">Sound effect</option>
+          </select>
+        </label>
+        <p className="text-[10px] leading-relaxed text-text-muted">{VIDEO_AUDIO_ROLE_HELP[effectiveVideoAudioRole(reference)]}</p>
+      </div>}
       {reference.type === 'video' && !reference.refmod_path && <div className="space-y-1">
         <label className="flex min-h-8 cursor-pointer items-center gap-2 text-[11px] text-text-secondary">
           <input type="checkbox" disabled={disabled}
@@ -574,7 +698,7 @@ export function OmniReferenceSection({
           Follow window timeline
         </label>
         <p className="text-[10px] leading-relaxed text-text-muted">
-          Each window uses the matching part of this video and its soundtrack. Turn off to reuse the same sample. Past the end, the final frame is held and audio is silent.
+          Each window uses the matching part of this video. Turn off to reuse the same visual sample. Past the end, its final frame is held. The soundtrack role separately controls audio timing and reuse.
           {scope === 'studio' && ' Auto duration follows the longest timeline video, unless a music / performance timeline sets the length. Choose a time or window count to keep a manual runtime.'}
         </p>
       </div>}
@@ -595,7 +719,15 @@ export function OmniReferenceSection({
               onChange={event => { void attachAudio(reference.id, event.target.files?.[0]); event.currentTarget.value = '' }} />
           </label>
           {reference.audio_path && <button type="button" disabled={disabled} title="Remove attached soundtrack"
-            onClick={() => patchReference(index, { audio_path: undefined, audio_filename: undefined, audio_duration_seconds: undefined, include_audio: reference.has_audio === true })}
+            onClick={() => patchReference(index, {
+              audio_path: undefined,
+              audio_filename: undefined,
+              audio_duration_seconds: undefined,
+              video_audio_role: reference.video_audio_role === 'output_only' && !reference.has_audio
+                ? 'ignore'
+                : reference.video_audio_role,
+              include_audio: reference.has_audio === true && effectiveVideoAudioRole(reference) === 'legacy',
+            })}
             className="flex min-h-8 min-w-0 items-center gap-1 text-text-muted hover:text-indicator-error">
             <X size={12} className="shrink-0" /><span className="truncate">{reference.audio_filename || 'Attached audio'}</span>
           </button>}
@@ -611,7 +743,7 @@ export function OmniReferenceSection({
         getImages={() => references.filter(ref => ref.type === 'image').map(ref => ({url: ref.url || api.getFileUrl(ref.filename), name: ref.character_name || ref.filename}))}
         onFile={file => addFiles([file])}
         disabledReason={disabled ? 'References are currently locked.' : uploading ? 'Uploading a reference…'
-          : references.length >= limits.total || references.filter(item => item.type === kind).length >= limits[kind]
+          : budget.total >= limits.total || budget[kind] >= limits[kind]
             ? `${kind === 'image' ? 'Image' : kind === 'video' ? 'Video' : 'Audio'} reference limit reached.` : undefined} />)}
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
@@ -627,7 +759,7 @@ export function OmniReferenceSection({
             <Info size={12} />
           </span>
         </div>
-        <span className="text-[9px] text-text-muted">{references.length}/{limits.total}</span>
+        <span className="text-[9px] text-text-muted">{budget.total}/{limits.total}</span>
       </div>
 
       <CharacterToolbarItem>
@@ -807,8 +939,8 @@ export function OmniReferenceSection({
           <select
             value={detail}
             disabled={disabled}
-            onChange={event => setDetail(event.target.value as 'match' | 'max')}
-            title="Match output preserves the selected output-sized preparation and avoids reference upscaling. High detail follows the official Ref2VA PDD 2048px-short-edge recipe, but can use substantially more memory and time."
+            onChange={event => setDetail(event.target.value as 'match' | 'max' | 'ptd768')}
+            title={detailHelp}
             className="bg-bg-tertiary border border-border rounded px-2 py-1 text-[9px] text-text-secondary focus:outline-none focus:border-accent-blue"
           >
             {(modelOptions?.omni_reference_detail_choices ?? [

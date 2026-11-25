@@ -383,19 +383,22 @@ export function ModelDetail({ model, onBack, kind = 'lora' }: Props) {
                   </p>
                   {h3Inspection?.supported && (
                     <p className="text-[10px] text-text-muted">
-                      {architectures.length > 1 ? 'Adds Frames and References models sharing one checkpoint.' : 'Adds a Frames model for this FL2VA checkpoint.'}
+                      {architectures.length > 1 ? 'Adds Frames and References models sharing one checkpoint.'
+                        : architectures.length === 1 ? 'Adds a Frames model for this FL2VA checkpoint.'
+                          : 'Choose the checkpoint basis to identify supported modes.'}
                       {' '}Matching installed weights are verified and reused.
                     </p>
                   )}
                   {(h3Inspection?.profile?.needs_selection?.includes('native_workflow') || h3NativeWorkflow !== 'auto') && (
                     <label className="block text-[11px] text-text-secondary">
-                      Native workflow (as listed by the creator)
+                      Checkpoint basis (as listed by the creator)
                       <select value={h3NativeWorkflow} onChange={event => setH3NativeWorkflow(event.target.value)}
                         className="mt-1 w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm">
                         <option value="auto">Detect from checkpoint metadata</option>
-                        <option value="fl2va">Frames / first-last frames (FL2VA)</option>
-                        <option value="ref2va">References / hybrid (Ref2VA)</option>
+                        <option value="fl2va">FL2VA — first/last-frame base</option>
+                        <option value="ref2va">Ref2VA / hybrid — Frames + References</option>
                       </select>
+                      <span className="block mt-1 text-text-muted">Use the creator's base model to select compatible LoRAs. Ref2VA and verified reference-capable hybrids enable both modes with one download.</span>
                     </label>
                   )}
                   {(h3Inspection?.profile?.needs_selection?.includes('qkv_layout') || h3QkvLayout !== 'auto') && (
@@ -407,7 +410,7 @@ export function ModelDetail({ model, onBack, kind = 'lora' }: Props) {
                         <option value="grouped">Grouped Q / K / V (Comfy exports)</option>
                         <option value="interleaved">Head-interleaved (native H3 exports)</option>
                       </select>
-                      <span className="block mt-1 text-text-muted">This GGUF file omits row-order metadata. Follow the creator's conversion instructions; the wrong order can produce noise.</span>
+                      <span className="block mt-1 text-text-muted">This checkpoint omits row-order metadata. Follow the creator's conversion instructions; the wrong order can produce noise.</span>
                     </label>
                   )}
                   {(h3Inspection?.profile?.needs_selection?.some(choice => choice === 'sampling_profile' || choice === 'sampling_recipe') || h3SamplingProfile !== 'auto') && (

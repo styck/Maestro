@@ -2660,6 +2660,58 @@ def _mapped_ref2va_subject(role: str, subjects: Sequence[Any]) -> int | None:
     return matches[0] if matches else None
 
 
+def _mapped_ref2va_reference_subject(
+    reference: Mapping[str, Any], subjects: Sequence[Any],
+) -> int | None:
+    """Resolve an identity picture through its role and canonical name fields.
+
+    Reference cards can use a generic relation such as ``character`` for
+    ``role`` while carrying the visible identity in ``label`` or ``name``.
+    Prefer a role that already maps, then use those canonical names as a
+    fallback. If explicit fields identify different cast members, fail closed
+    instead of silently choosing one.
+    """
+
+    role = _trim_sentence(_field(reference, "role", ""))
+    role_match = _mapped_ref2va_subject(role, subjects) if role else None
+    if (
+        str(_field(reference, "type", "") or "").strip().casefold() != "image"
+        or str(_field(reference, "image_intent", "identity") or "identity")
+        .strip()
+        .casefold()
+        != "identity"
+    ):
+        return role_match
+
+    role_key = _h3_anchor_key(role)
+    name_matches: dict[str, int] = {}
+    for key in ("character_name", "label", "name"):
+        name = _trim_sentence(_field(reference, key, ""))
+        if not name or _h3_anchor_key(name) == role_key:
+            continue
+        matched = _mapped_ref2va_subject(name, subjects)
+        if matched is not None:
+            name_matches[name] = matched
+
+    distinct_name_matches = set(name_matches.values())
+    if len(distinct_name_matches) > 1:
+        raise H3DialogueContractError(
+            "Reference identity carries conflicting canonical names that map "
+            "to multiple visible subjects."
+        )
+    name_match = next(iter(distinct_name_matches), None)
+    if (
+        role_match is not None
+        and name_match is not None
+        and role_match != name_match
+    ):
+        raise H3DialogueContractError(
+            f"Reference identity role '{role}' and canonical name "
+            f"'{next(iter(name_matches))}' map to different visible subjects."
+        )
+    return role_match if role_match is not None else name_match
+
+
 def _ref2va_cast_from_source(
     prompt: str, subjects: Sequence[Any],
 ) -> tuple[list[Any], dict[int, str]]:
@@ -2836,8 +2888,9 @@ def _reference_relationships(
     next_subject_no = len(subjects or []) + 1
     registry = registry if isinstance(registry, Mapping) else {}
 
-    def mapped_subject(role: str) -> tuple[int, str, str] | None:
-        matched_index = _mapped_ref2va_subject(role, subjects or [])
+    def mapped_subject_index(
+        matched_index: int | None,
+    ) -> tuple[int, str, str] | None:
         if matched_index is None:
             return None
         subject = (subjects or [])[matched_index]
@@ -2852,6 +2905,11 @@ def _reference_relationships(
         entry = _speaker_registry_entry(registry, character_id or subject_name)
         return matched_index + 1, subject_name, entry[0] if entry else ""
 
+    def mapped_subject(role: str) -> tuple[int, str, str] | None:
+        return mapped_subject_index(
+            _mapped_ref2va_subject(role, subjects or [])
+        )
+
     def add_task_type(value: str) -> None:
         if value not in task_types:
             task_types.append(value)
@@ -2859,11 +2917,20 @@ def _reference_relationships(
     for reference in references or []:
         kind = str(reference.get("type") or "").strip().lower()
         role = _trim_sentence(reference.get("role", "")) or f"the supplied {kind} reference"
-        subject_match = (
-            mapped_subject(role)
-            if kind != "image" or str(reference.get("image_intent") or "identity").lower() == "identity"
-            else None
-        )
+        intent = str(reference.get("image_intent") or "identity").lower()
+        if kind == "image":
+            subject_match = (
+                mapped_subject_index(
+                    _mapped_ref2va_reference_subject(
+                        reference,
+                        subjects or [],
+                    )
+                )
+                if intent == "identity"
+                else None
+            )
+        else:
+            subject_match = mapped_subject(role)
         mapped_role = (
             f"<Subject {subject_match[0]}> ({subject_match[1]})"
             if subject_match else role
@@ -2871,7 +2938,6 @@ def _reference_relationships(
         if kind == "image":
             picture_no += 1
             label = f"<Picture {picture_no}>"
-            intent = str(reference.get("image_intent") or "identity").lower()
             if intent == "object":
                 from models.minimax_h3.reference_manifest import object_reference_prompt_contract
 
@@ -3213,6 +3279,7 @@ def compile_h3_official_prompt(
     speaker_registry: Mapping[str, Any] | None = None,
     project_context: str = "",
     context_anchors: Sequence[str] | None = None,
+    visual_style: str = "",
     opening_blocking: str = "",
     closing_blocking: str = "",
     audio_plan: Mapping[str, Any] | None = None,
@@ -3302,6 +3369,25 @@ def compile_h3_official_prompt(
         audio_policy=audio_policy,
         has_driving_audio=has_driving_audio,
     )
+    style_text = _normalized_space(str(visual_style or "")).rstrip(" .")
+    if style_text:
+        style_direction = (
+            "Visual style across the entire frame: "
+            f"{style_text}. Apply this style consistently to every subject, "
+            "the environment and background, and all linework, shading, "
+            "color treatment, and rendering."
+        )
+        if _normalized_space(style_direction).casefold() not in _normalized_space(body).casefold():
+            # Ref2VA treats prose before its first shot marker as the visual-
+            # style opening. Give this explicit direction that same placement
+            # while keeping it out of the immutable source prompt. Other H3
+            # modes retain it as an introduction to their complete timeline.
+            if mode == "ref2va" and not re.search(
+                r"\[Shot\s+1\]", body, flags=re.IGNORECASE,
+            ):
+                body = f"{style_direction} [Shot 1] {body}".strip()
+            else:
+                body = f"{style_direction} {body}".strip()
     speech_forbidden = (
         _audio_policy_flag(audio_policy, "generated_speech_allowed") is False
         or (
@@ -3678,7 +3764,10 @@ def validate_h3_prompt_contract(
             if str(reference.get("image_intent") or "identity").lower() != "identity":
                 continue
             try:
-                mapped = _mapped_ref2va_subject(str(reference.get("role") or ""), subjects or [])
+                mapped = _mapped_ref2va_reference_subject(
+                    reference,
+                    subjects or [],
+                )
             except H3DialogueContractError as exc:
                 errors.append(str(exc))
                 continue
@@ -4005,6 +4094,13 @@ def compile_h3_clip_plans(
             speaker_registry=registry,
             project_context=plan.get("_director_project_context", ""),
             context_anchors=context_anchors,
+            # Reviewed prompt text is authoritative after a user edit; stale
+            # planner metadata must not reimpose the earlier art direction.
+            visual_style=(
+                ""
+                if plan.get("_director_prompt_user_edited")
+                else plan.get("_director_visual_style", "")
+            ),
             opening_blocking=plan.get("_director_opening_blocking", ""),
             closing_blocking=plan.get("_director_closing_blocking", ""),
             audio_plan=plan.get("_director_audio_plan") or {},
@@ -4030,6 +4126,8 @@ def compile_h3_clip_plans(
             has_driving_audio=transcript_only[index],
         )
         if errors:
+            from services.enhancement_diagnostics import record_rejection
+            record_rejection(errors, stage=f"Director H3 shot {index + 1}")
             raise H3DialogueContractError(
                 f"Shot {index + 1}: " + "; ".join(errors)
             )

@@ -1,12 +1,17 @@
 const {
   runtimeProfile,
-} = require("./launcher_profile")
+} = require("./scripts/pinokio/launcher_profile")
 
 module.exports = async (kernel) => {
   const runtime = runtimeProfile(kernel)
   const samReadyMarker = "app/services/sam/env/.maestro-sam-ready"
+  // Pinokio can keep the old update steps for the run that pulls this fix.
+  // Retry an already-current legacy checkout until its fixed update finishes.
+  const requirementsReady = runtime.requirementsMarker
+    ? `exists('${runtime.requirementsMarker}')`
+    : "true"
   const alreadyCurrentAndReady =
-    `{{/already up[- ]to[- ]date/i.test(input.stdout) && exists('${runtime.marker}') && exists('${runtime.flashMarker}') && exists('ui/dist/index.html') && exists('ui/dist/assets') && (!exists('app/services/sam/env') || exists('${samReadyMarker}')) ? 'uptodate' : 'build'}}`
+    `{{/already up[- ]to[- ]date/i.test(input.stdout) && exists('${runtime.marker}') && exists('${runtime.flashMarker}') && ${requirementsReady} && exists('ui/dist/index.html') && exists('ui/dist/assets') && (!exists('app/services/sam/env') || exists('${samReadyMarker}')) ? 'uptodate' : 'build'}}`
   return {
     run: [{
     // Pull the latest launcher + app code (single monorepo, so this one
@@ -53,6 +58,16 @@ module.exports = async (kernel) => {
       message: "uv pip install pywebpush==2.3.0"
     }
   }, {
+    // Reconcile the independent CPU-only Agent Access environment on the
+    // fast path too, without touching the selected model runtime.
+    method: "shell.run",
+    params: {
+      venv: "env-agent",
+      venv_python: "3.11",
+      path: "app",
+      message: "uv pip install -r requirements-agent-access.txt"
+    }
+  }, {
     // Before halting, self-heal the seed-vc component if it's missing
     // (GPL-3.0, cloned from its own repo — see install.js): a failed earlier
     // clone shouldn't leave voice features broken until the next code update.
@@ -85,7 +100,17 @@ module.exports = async (kernel) => {
       venv: runtime.env,
       venv_python: runtime.python,
       path: "app",
-      message: "uv pip install -r requirements.txt"
+      message: "uv pip install -r requirements.txt --index-strategy unsafe-best-match"
+    }
+  }, {
+    // Keep the control plane's CPU-only dependencies out of every CUDA model
+    // environment; the sidecar starts separately from the selected engine.
+    method: "shell.run",
+    params: {
+      venv: "env-agent",
+      venv_python: "3.11",
+      path: "app",
+      message: "uv pip install -r requirements-agent-access.txt"
     }
   }, {
     // Existing installs may have the main runtime marker but still contain a
@@ -108,7 +133,7 @@ module.exports = async (kernel) => {
     // Saves ~60-120s + ~3 GB of redundant downloads on routine updates.
     //
     // Each hardware profile owns its marker. Bumping the marker in
-    // launcher_profile.js makes this gate reinstall that profile on Update;
+    // scripts/pinokio/launcher_profile.js makes this gate reinstall that profile on Update;
     // old markers remain harmless until Reset removes the environment.
     //
     // Recovery path: if torch ever ends up in a broken state (e.g. CPU
@@ -135,7 +160,7 @@ module.exports = async (kernel) => {
       venv: runtime.env,
       venv_python: runtime.python,
       path: "app",
-      message: ["python scripts/install_gguf_kernels.py", "python scripts/install_wgp_kernels.py"]
+      message: ["python scripts/install_gguf_kernels.py", "python scripts/install_wgp_kernels.py", "python scripts/install_sagegp.py"]
     }
   }, {
     when: "{{exists('ui/package.json')}}",
@@ -165,6 +190,13 @@ module.exports = async (kernel) => {
     method: "script.start",
     params: {
       uri: "sam_install.js"
+    }
+  }, {
+    when: Boolean(runtime.requirementsMarker),
+    method: "fs.write",
+    params: {
+      path: runtime.requirementsMarker,
+      text: "Legacy runtime setup completed.\n"
     }
     }]
   }

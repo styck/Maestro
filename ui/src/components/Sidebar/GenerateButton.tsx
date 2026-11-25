@@ -2,14 +2,118 @@ import { useState } from 'react'
 import { AlertTriangle, ListPlus, Loader2, Play } from 'lucide-react'
 import { getModelVisibilityScope, isModelEnabledInScope } from '../../lib/modelVisibility'
 import { isLongCatAvatarModel } from '../../lib/avatarWorkflow'
+import { viggleSourceReady } from '../../lib/viggle'
 import {
   studioAvatarInputError,
+  studioRemakeInputError,
   modelSupportsImageWorkflow,
   modelSupportsStudioVideoMediaIntent,
   useStore,
 } from '../../stores/useStore'
 
-export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
+export interface GenerateButtonSubmission {
+  onGenerate: () => Promise<void>
+  onQueue: () => Promise<void>
+  /** Disable only Generate. */
+  disabled?: boolean
+  busy?: boolean
+  disabledReason?: string
+  /** Disable only Add to Queue. */
+  queueDisabled?: boolean
+  queueDisabledReason?: string
+}
+
+interface GenerateButtonProps {
+  stretch?: boolean
+  submission?: GenerateButtonSubmission
+}
+
+interface GenerateButtonPresentationProps {
+  stretch: boolean
+  blockedLabel?: string
+  blockedTitle?: string
+  pendingAction: 'generate' | 'queue' | null
+  busy: boolean
+  generateDisabled: boolean
+  generateDisabledReason?: string
+  queueDisabled: boolean
+  queueDisabledReason?: string
+  onGenerate: () => void
+  onQueue: () => void
+}
+
+/** Shared split-button markup for ordinary Studio generation and controlled flows. */
+function GenerateButtonPresentation({
+  stretch,
+  blockedLabel,
+  blockedTitle,
+  pendingAction,
+  busy,
+  generateDisabled,
+  generateDisabledReason,
+  queueDisabled,
+  queueDisabledReason,
+  onGenerate,
+  onQueue,
+}: GenerateButtonPresentationProps) {
+  if (blockedLabel) {
+    return (
+      <div className={`studio-generate-actions grid ${stretch ? 'w-full min-h-11' : 'w-[132px]'} shrink-0 grid-cols-[2fr_1fr] overflow-hidden rounded-xl bg-amber-500/20 text-indicator-warning`}>
+        <button
+          type="button"
+          disabled
+          title={blockedTitle}
+          className="flex min-w-0 cursor-not-allowed items-center justify-center gap-1.5 whitespace-nowrap px-2 py-2 text-xs font-medium"
+        >
+          <AlertTriangle size={13} className="shrink-0" />
+          <span className="truncate">{blockedLabel}</span>
+        </button>
+        <button
+          type="button"
+          disabled
+          title={blockedTitle || `${blockedLabel} before adding this generation to the queue.`}
+          aria-label="Add to queue unavailable"
+          className="flex cursor-not-allowed items-center justify-center border-l border-current/15"
+        >
+          <ListPlus size={14} />
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className={`studio-generate-actions grid ${stretch ? 'w-full min-h-11' : 'w-[132px]'} shrink-0 grid-cols-[2fr_1fr] overflow-hidden rounded-xl font-medium text-white shadow-accent-glow transition-all ${
+      busy ? 'bg-bg-active text-text-muted' : 'bg-cta'
+    }`}>
+      <button
+        type="button"
+        onClick={onGenerate}
+        disabled={busy || generateDisabled}
+        title={generateDisabledReason || 'Generate now'}
+        className="flex items-center justify-center gap-1.5 whitespace-nowrap px-2 py-2 text-xs transition-colors hover:bg-white/10 disabled:cursor-wait disabled:hover:bg-transparent"
+      >
+        {pendingAction === 'generate' || (busy && pendingAction === null)
+          ? <Loader2 size={13} className="animate-spin" />
+          : <Play size={13} fill="currentColor" />}
+        Generate
+      </button>
+      <button
+        type="button"
+        onClick={onQueue}
+        disabled={busy || queueDisabled}
+        title={queueDisabledReason || 'Hold current Studio settings in the queue without starting generation'}
+        aria-label="Add current Studio settings to the queue"
+        className="flex items-center justify-center border-l border-white/20 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:border-text-muted/20 disabled:opacity-40 disabled:hover:bg-transparent"
+      >
+        {pendingAction === 'queue'
+          ? <Loader2 size={14} className="animate-spin" />
+          : <ListPlus size={14} />}
+      </button>
+    </div>
+  )
+}
+
+export function GenerateButton({ stretch = false, submission }: GenerateButtonProps) {
   const startGeneration = useStore(s => s.startGeneration)
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const [pendingAction, setPendingAction] = useState<'generate' | 'queue' | null>(null)
@@ -22,9 +126,11 @@ export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
   const studioVideoEffectiveCreateRoute = useStore(s => s.studioVideoEffectiveCreateRoute)
   const currentModel = useStore(s => s.models.find(model => model.model_type === s.params.model_type))
   const modelOptions = useStore(s => s.modelOptions)
+  const controlsPending = useStore(s => s.modelsLoading || !!s.modelsLoadError)
   const needsEnabledModel = useStore(s => s.generationMode !== 'tools'
     && !(s.generationMode === 'audio' && ['mixer', 'revoice'].includes(s.audioSubMode))
-    && ((!s.servicesConfig?.nsfw_mode && s.models.find(model => model.model_type === s.params.model_type)?.nsfw_only === true)
+    && (s.models.find(model => model.model_type === s.params.model_type)?.world_model === true
+      || (!s.servicesConfig?.nsfw_mode && s.models.find(model => model.model_type === s.params.model_type)?.nsfw_only === true)
       || !isModelEnabledInScope(s.params.model_type, s.enabledModels, s.modelVisibilityOverrides, getModelVisibilityScope(s))))
   const imageMode = useStore(s => Number(s.params.image_mode || 0))
   const isPrimaryCreate = generationMode === 'video'
@@ -71,6 +177,9 @@ export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
   const viggleMissing = useStore(s => s.generationMode === 'video' && s.studioVideoWorkflow === 'animate'
     && (!s.params.video_guide || !(s.params.viggle_character ? s.params.viggle_character.reference_path : s.params._viggle_edited_frame)
       || (s.params.audio_prompt_type === 'A' && !s.params.audio_guide)))
+  const viggleSourcePending = useStore(s => s.generationMode === 'video' && s.studioVideoWorkflow === 'animate'
+    && !!s.params.video_guide && !viggleSourceReady(s.params, s.activeWorkspace))
+  const remakeInputError = useStore(studioRemakeInputError)
   const createWorkflow = studioVideoWorkflow === 'references' ? 'references'
     : studioVideoWorkflow === 'avatar' ? 'avatar' : 'frames'
   const studioMediaIntent = {
@@ -130,20 +239,33 @@ export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
     && Object.values(imagePadding).every(value => value === 0)
   const incompatibleImageModel = generationMode === 'image'
     && !modelSupportsImageWorkflow(currentModel, imageWorkflow, imageRefs.length > 0)
-  const blocked = needsEnabledModel || viggleMissing || needsCreateModel || needsWorkflowModel || !!avatarInputError
+  const studioBlocked = controlsPending || needsEnabledModel || viggleMissing || viggleSourcePending || needsCreateModel || needsWorkflowModel || !!avatarInputError || !!remakeInputError
     || needsGuidance || needsImage || needsReference || needsOutpaintSource || needsOutpaintArea
     || needsImageGenerateSource || needsImageWorkflowSource || needsImageMask
     || needsImageOutpaintArea || incompatibleImageModel
-  const queueSupported = generationMode !== 'avatar'
+  const studioQueueSupported = generationMode !== 'avatar'
     && !(generationMode === 'video' && imageMode === 4)
 
+  const controlledBusy = Boolean(submission?.busy)
+  const blocked = submission
+    ? !controlledBusy && Boolean(submission.disabled && submission.queueDisabled)
+    : studioBlocked
+  const queueSupported = submission ? true : studioQueueSupported
+  const queueDisabled = Boolean(submission?.queueDisabled) || !queueSupported
+  const generateDisabled = Boolean(submission?.disabled)
+  const busy = pendingAction !== null || controlledBusy
+
   const submit = async (action: 'generate' | 'queue') => {
-    if (blocked || pendingAction || (action === 'queue' && !queueSupported)) return
+    if (blocked || busy || (action === 'generate' && generateDisabled) || (action === 'queue' && queueDisabled)) return
     setPendingAction(action)
     const previousJobs = new Set(useStore.getState().jobs.map(job => job.id))
     try {
-      await startGeneration(action === 'queue' ? 'queue' : 'now')
-      if (action === 'generate' && useStore.getState().jobs.some(job =>
+      if (submission) {
+        await (action === 'queue' ? submission.onQueue() : submission.onGenerate())
+      } else {
+        await startGeneration(action === 'queue' ? 'queue' : 'now')
+      }
+      if (!submission && action === 'generate' && useStore.getState().jobs.some(job =>
         !previousJobs.has(job.id) && ['queued', 'running', 'completed'].includes(job.status))) {
         setSidebarOpen(false)
       }
@@ -152,11 +274,18 @@ export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
     }
   }
 
-  if (blocked) {
-    const label = needsEnabledModel ? 'Need model' : viggleMissing ? 'Need inputs' : needsCreateModel || needsWorkflowModel
+  let blockedLabel: string | undefined
+  let blockedTitle: string | undefined
+  if (submission && blocked) {
+    blockedLabel = 'Need inputs'
+    blockedTitle = submission.disabledReason || 'Complete the required title settings before generating.'
+  } else if (!submission && blocked) {
+    blockedLabel = controlsPending ? 'Loading…' : needsEnabledModel ? 'Need model' : viggleMissing ? 'Need inputs' : viggleSourcePending ? 'Check video' : needsCreateModel || needsWorkflowModel
       ? 'Need model'
       : avatarInputError
         ? avatarInputError.startsWith('Choose') ? 'Choose speakers' : 'Need inputs'
+      : remakeInputError
+        ? 'Need inputs'
       : needsGuidance
         ? 'Need frame'
       : needsImage
@@ -174,12 +303,14 @@ export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
       : needsOutpaintSource
         ? 'Need source'
         : 'Choose canvas'
-    const title = needsEnabledModel
+    blockedTitle = controlsPending ? 'Waiting for model controls. Use Retry above if Maestro has restarted.' : needsEnabledModel
       ? 'Enable or select a model for this mode using Manage models.'
       : needsOutpaintArea
       ? 'Choose a larger output aspect or resize the source to create an area for Outpaint to generate.'
       : avatarInputError
         ? avatarInputError
+      : remakeInputError
+        ? remakeInputError
       : needsWorkflowModel
         ? 'Choose a video model for this workflow. LongCat Avatar uses the Avatar workflow.'
       : needsCreateModel
@@ -196,62 +327,22 @@ export function GenerateButton({ stretch = false }: { stretch?: boolean }) {
         : needsImageOutpaintArea
           ? 'Expand at least one side of the source canvas.'
         : undefined
-    return (
-      <div className={`grid ${stretch ? 'w-full min-h-11' : 'w-[132px]'} shrink-0 grid-cols-[2fr_1fr] overflow-hidden rounded-xl bg-amber-500/20 text-indicator-warning`}>
-        <button
-          type="button"
-          disabled
-          title={title}
-          className="flex cursor-not-allowed items-center justify-center gap-1.5 whitespace-nowrap px-2 py-2 text-xs font-medium"
-        >
-          <AlertTriangle size={13} />
-          {label}
-        </button>
-        <button
-          type="button"
-          disabled
-          title={title || `${label} before adding this generation to the queue.`}
-          aria-label="Add to queue unavailable"
-          className="flex cursor-not-allowed items-center justify-center border-l border-current/15"
-        >
-          <ListPlus size={14} />
-        </button>
-      </div>
-    )
   }
 
-  const pending = pendingAction !== null
-
   return (
-    <div className={`grid ${stretch ? 'w-full min-h-11' : 'w-[132px]'} shrink-0 grid-cols-[2fr_1fr] overflow-hidden rounded-xl font-medium text-white shadow-accent-glow transition-all ${
-      pending ? 'bg-bg-active text-text-muted' : 'bg-cta'
-    }`}>
-      <button
-        type="button"
-        onClick={() => void submit('generate')}
-        disabled={pending}
-        title="Generate now"
-        className="flex items-center justify-center gap-1.5 whitespace-nowrap px-2 py-2 text-xs transition-colors hover:bg-white/10 disabled:cursor-wait disabled:hover:bg-transparent"
-      >
-        {pendingAction === 'generate'
-          ? <Loader2 size={13} className="animate-spin" />
-          : <Play size={13} fill="currentColor" />}
-        Generate
-      </button>
-      <button
-        type="button"
-        onClick={() => void submit('queue')}
-        disabled={pending || !queueSupported}
-        title={queueSupported
-          ? 'Hold current Studio settings in the queue without starting generation'
-          : 'Add to Queue is not available for specialized Transform and Blend workflows yet'}
-        aria-label="Add current Studio settings to the queue"
-        className="flex items-center justify-center border-l border-white/20 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:border-text-muted/20 disabled:opacity-40 disabled:hover:bg-transparent"
-      >
-        {pendingAction === 'queue'
-          ? <Loader2 size={14} className="animate-spin" />
-          : <ListPlus size={14} />}
-      </button>
-    </div>
+    <GenerateButtonPresentation
+      stretch={stretch}
+      blockedLabel={blockedLabel}
+      blockedTitle={blockedTitle}
+      pendingAction={pendingAction}
+      busy={busy}
+      generateDisabled={generateDisabled}
+      generateDisabledReason={submission?.disabled ? submission.disabledReason : undefined}
+      queueDisabled={queueDisabled}
+      queueDisabledReason={submission?.queueDisabledReason || (!queueSupported
+        ? 'Add to Queue is not available for specialized Transform and Blend workflows yet' : undefined)}
+      onGenerate={() => void submit('generate')}
+      onQueue={() => void submit('queue')}
+    />
   )
 }

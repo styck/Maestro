@@ -1,29 +1,16 @@
-IMAGE PROMPT (image_prompt) — the VERY FIRST FRAME, BEFORE any action begins. One STILL PHOTOGRAPH, zero motion.
-Show the INITIAL STATE: if clothing will be removed, it's still on. If someone enters, the room is empty.
-The video_prompt handles all transitions. The image_prompt shows where the scene STARTS, not where it ends.
+DIRECTOR IMAGE PROMPT (image_prompt) — the opening image for a planned scene.
+Describe the visible opening state before the planned video action advances. This is a temporal constraint; it does not choose the image's medium or style.
 
 FORMAT:
-"create new scene, [detailed environment]. [subject/objects in frame] [static pose/position]. [lighting, atmosphere, composition]."
+"create new scene, [environment]. [subject or character] [opening position or pose]. [requested style and any useful lighting details]."
 
 RULES:
-- Always start with "create new scene, [detailed environment]."
-- Describe the full frame: environment, setting, lighting, atmosphere, and composition.
-- Describe any people by VISIBLE appearance only (clothing, hair, position) — never by name.
-- Do NOT invent people or characters that the Scene Concept does not include.
-- Do NOT invent clothing or wardrobe details beyond the Scene Concept.
-- Describe POSES as static states: "standing with arms crossed", "seated at desk", "leaning against railing".
-- Describe EXPRESSIONS as states: "stern expression", "wide grin" — NOT "expression changes to".
-- NO motion verbs (walking, running, reaching, turning, heaving, dancing, gesturing).
-- NO motion-photography effects: no motion blur, speed lines, long exposure, camera
-  shake. The still frame is SHARP — motion belongs to the video.
-- No character names. Describe a frozen moment — a photograph, not a video frame.
-
-STYLE:
-- Match the visual medium and art style named in the Scene Concept.
-- If the Scene Concept specifies a stylized medium (hand-drawn, anime, oil painting,
-  pixel art, etc.), NAME that medium explicitly; otherwise stay photorealistic/cinematic.
-- Keep each prompt self-contained — the image model has no memory of other scenes.
-
-EXAMPLES (format only — never copy their subjects, objects, or settings into your prompts):
-- "create new scene, empty throne room in black marble. A single gold crown rests on a dark table in the foreground, floor-to-ceiling glass behind shows a night city skyline. Cold moonlight, long shadows."
-- "create new scene, rainy neon alley at night. Wet asphalt reflects pink and blue signage, steam rising from a grate. Cinematic wide shot, shallow depth of field."
+- Start with "create new scene, [detailed environment]."
+- Describe the scene's requested opening composition, subjects, relationships, and visible details.
+- Keep the image at the start of the planned scene. Do not depict a later action or outcome as already complete.
+- A still image may depict a requested action pose or visual effect at one instant. Do not turn the prompt into a sequence; do not ban action words, motion lines, blur, or other effects when the brief requests them.
+- Use only subjects and details from the user's concept and supplied references. Additional labeled references may identify characters, objects, locations, or style only according to the roles the user assigned. Do not invent missing references, clothing, or source-image constraints.
+- Follow the user's requested medium, visual style, and lighting. Do not default to photography or photorealism, copy reference lighting, or impose lens specifications, grading, or other aesthetic choices.
+- If no style or lighting is specified, keep the choice open or add only scene-appropriate detail that does not impose a medium.
+- Do not use character names when the Director's downstream image model requires visual descriptions.
+- Output one image prompt. Do not describe the future video action or add commentary.

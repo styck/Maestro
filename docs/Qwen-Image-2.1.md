@@ -69,12 +69,31 @@ authors have limited validation for masks, RGBA, many references and 2K output.
 See the [Viggle model card](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo).
 
 **Memory:** reference KV caching is opt-in in Advanced. Maestro still checks its
-memory budget and recomputes conditioning when caching would exceed it. VAE
-tiling now follows GPU capacity with wider overlap, replacing the former fixed
-384-pixel tiles. This addresses a plausible source of seams reported in
-[#153](https://github.com/Blizaine/Maestro/issues/153), but the report supplied no
-sample or settings, so visual confirmation is still needed. Speed and memory
-depend on resolution, references, precision and hardware.
+memory budget and recomputes conditioning when caching would exceed it.
+Numbered denoising steps and final VAE decoding have separate working sets;
+low VRAM use while streaming transformer weights does not establish that a
+large decoder tile will fit.
+
+The image decoder omits unused temporal feature caches, moves finished tiles
+to CPU, and blends their reliable interiors in FP32 before quantizing once.
+Tiles are full-sized against image edges, avoiding narrow last-row/column
+tiles. Full selects up to 1024px tiles; Medium and Aggressive retain at least
+512px of decoder context with 256px overlap, so the lower-memory setting no
+longer trades that context for 256px tiles. Images within one tile decode in
+one pass. Larger overlap can add decode work; it does not repeat denoising.
+These changes target the thin tile-boundary lines reported with Qwen 2.1;
+they do not remove lines already present in a reference image.
+
+CPU regressions cover exact single-image cache parity, RGBA/batched output,
+edge coverage and simulated padding seams. A decoder-only comparison using
+the same encoded 1088×1920 portrait latent reduced Full's peak allocated VRAM
+on a 4090 from 6.85GiB to 3.26GiB and reduced its worst 64px-window difference
+from an untiled reference. This is a decoder measurement, not a claim that
+every resolution, reference count or complete render fits an 8GB GPU.
+An isolated decoder check on the 8GB RTX 5070 Laptop GPU with the VMM
+allocator also completed Full at that size: 3.26GiB peak allocated,
+4.22GiB reserved, and 6.4 seconds. This check used a private candidate copy;
+it did not replace or restart the installed app or rerun denoising.
 
 The model uses the **Qwen Research License** (non-commercial research/evaluation).
 Commercial use requires a separate license from Qwen. Read the
@@ -93,5 +112,17 @@ Inpainting uses `image_mode: 2`, `image_guide`, `image_mask`, `video_prompt_type
 "VAG"` (or `VAGI` with references), and `model_mode: 0` for masked denoising or
 2/3/4/5 for LanPaint. Turbo uses `sample_solver: "viggle_v01"`, `"viggle_v02"`,
 or `"viggle_v021"`. Cache control is
-`custom_settings: {"qwen21_kv_cache": "Enabled"}`; omit it to use the low-memory
-default.
+`custom_settings: {"qwen21_kv_cache": "Enabled"}` for 16-bit storage, `"INT8"`
+for quantized VRAM storage, or `"INT8_RAM"` for quantized CPU-RAM storage.
+Omit it or select `"Disabled"` to keep the low-memory default. Caches are
+request-local and disabled when LoRA weights change across steps. Both CFG
+branches have separate caches. Memory guards may recompute the full prefix
+instead; they retain every reference and the requested output dimensions.
+
+The INT8 layout uses 32-channel groups and FP32 scales. With 128-channel heads,
+storage is 56.25% of the 16-bit K/V cache, with a small precision tradeoff.
+This does not halve total model or job memory. The portable path materializes
+one cached layer before the existing attention call, and RAM mode adds CPU/GPU
+transfers. The native staged Sage cache kernels are not included. GPU speed and
+visual fidelity need matched local testing; caching can be slower for a short
+prefix, especially from RAM.
